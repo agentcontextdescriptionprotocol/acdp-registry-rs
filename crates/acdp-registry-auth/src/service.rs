@@ -214,6 +214,19 @@ impl AuthService {
             },
         };
         let token = self.signer.sign(&claims)?;
+        // SEC-01 (post-798cb34): record the issued jti so the revocation
+        // endpoint can authorize "this is my token" lookups. Failing
+        // here would issue an unrevocable token, which we treat as a
+        // security failure — fail the request instead so the caller can
+        // retry against a healthy backend.
+        if let Some(rev) = &self.revocations {
+            rev.record_issued(RevocationRecord {
+                jti: claims.jti.clone(),
+                agent_did: claims.sub.clone(),
+                expires_at: exp,
+            })
+            .await?;
+        }
         tracing::info!(jti = %claims.jti, exp = exp.timestamp(), "token issued");
         Ok(TokenResponse {
             token,

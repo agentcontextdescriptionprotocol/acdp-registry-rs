@@ -297,6 +297,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_put_duplicate_nonce_returns_challenge_replay() {
+        // BUG-04: the SQLite store used to surface the unique-constraint
+        // violation as the generic `AuthError::Storage`, diverging from
+        // `InMemoryChallengeStore::put` which returns `ChallengeReplay`.
+        // After the fix the DB and in-memory variants behave identically.
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE auth_challenges (
+                nonce TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let store = SqliteChallengeStore::new(pool);
+        let rec = ChallengeRecord {
+            nonce: "dup".into(),
+            agent_id: "did:web:agent.example".into(),
+            expires_at: Utc::now() + chrono::Duration::seconds(60),
+        };
+        store.put(rec.clone()).await.unwrap();
+        let err = store.put(rec).await.unwrap_err();
+        assert!(
+            matches!(err, AuthError::ChallengeReplay(_)),
+            "expected ChallengeReplay, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn sqlite_take_is_atomic_under_contention() {
         // Regression test: previously SqliteChallengeStore::take used
         // SELECT-then-DELETE inside a DEFERRED transaction. Two concurrent

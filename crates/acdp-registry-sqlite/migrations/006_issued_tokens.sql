@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS issued_tokens (
     jti        TEXT PRIMARY KEY,
     agent_did  TEXT NOT NULL,
     expires_at TEXT NOT NULL,
-    revoked    INTEGER NOT NULL DEFAULT 1
+    -- 0 = active (recorded at issue time), 1 = revoked.
+    revoked    INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_issued_tokens_exp ON issued_tokens(expires_at);

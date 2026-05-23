@@ -137,7 +137,10 @@ fn http_status_for_acdp(err: &AcdpError) -> u16 {
         AcdpError::NotFound(_) => 404,
         AcdpError::DuplicatePublish(_) | AcdpError::SupersededTarget { .. } => 409,
         AcdpError::RateLimited(_) => 429,
-        AcdpError::KeyResolutionUnreachable(_) => 502,
+        // 502 is the right status for both "upstream is unreachable" and
+        // "upstream returned garbage" — the registry itself is healthy,
+        // the gateway hop failed. Matches `KeyResolutionUnreachable`.
+        AcdpError::KeyResolutionUnreachable(_) | AcdpError::CrossRegistryResolutionFailed(_) => 502,
         _ => 500,
     }
 }
