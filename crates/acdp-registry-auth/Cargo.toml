@@ -1,0 +1,29 @@
+[package]
+name        = "acdp-registry-auth"
+version     = { workspace = true }
+edition     = { workspace = true }
+rust-version = { workspace = true }
+license     = { workspace = true }
+repository  = { workspace = true }
+description = "DID challenge-response + JWT auth for acdp-registry-rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+acdp                = { workspace = true }
+acdp-registry-types = { path = "../acdp-registry-types", version = "0.1.0", default-features = false }
+async-trait    = { workspace = true }
+base64         = { workspace = true }
+chrono         = { workspace = true }
+jsonwebtoken   = { workspace = true }
+rand           = { workspace = true }
+serde          = { workspace = true }
+serde_json     = { workspace = true }
+sha2           = { workspace = true }
+thiserror      = { workspace = true }
+tokio          = { workspace = true }
+tracing        = { workspace = true }
+uuid           = { workspace = true }
+sqlx           = { workspace = true }
+http           = "1"

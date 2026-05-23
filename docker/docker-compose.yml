@@ -1,0 +1,37 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: acdp
+      POSTGRES_PASSWORD: acdp
+      POSTGRES_DB: acdp_registry
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U acdp"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  registry:
+    build:
+      # Build context is the parent dir so the Dockerfile can pull in
+      # both acdp-rs and acdp-registry-rs sibling repos.
+      context: ../..
+      dockerfile: acdp-registry-rs/docker/Dockerfile
+      args:
+        STORAGE_FEATURE: storage-pg
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ACDP_REGISTRY_CONFIG: /app/config.toml
+      ACDP_REGISTRY_STORAGE__POSTGRES_URL: postgres://acdp:acdp@postgres:5432/acdp_registry
+      RUST_LOG: info,acdp=info,acdp_registry=info
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./config.docker.toml:/app/config.toml:ro
+
+volumes:
+  pgdata: {}
