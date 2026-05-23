@@ -54,6 +54,8 @@ impl RegistryConfig {
                     "acdp-registry-discovery".into(),
                 ],
                 tls: TlsConfig::default(),
+                cross_registry_resolution: true,
+                cors: CorsConfig::default(),
             },
             storage: StorageConfig {
                 backend: StorageBackend::Sqlite,
@@ -86,10 +88,28 @@ pub struct RegistrySection {
     /// (intended for use behind a TLS-terminating proxy).
     #[serde(default)]
     pub tls: TlsConfig,
+    /// Resolve `ctx_id`s whose authority differs from this registry by
+    /// forwarding to the foreign registry (RFC-ACDP-0006 §4.1). When false,
+    /// foreign `ctx_id`s return 404. Defaults to true.
+    #[serde(default = "default_true")]
+    pub cross_registry_resolution: bool,
+    /// CORS configuration. Defaults to no allowed origins (CORS disabled).
+    #[serde(default)]
+    pub cors: CorsConfig,
 }
 
 fn default_bind() -> String {
     "0.0.0.0".into()
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CorsConfig {
+    /// Allowed origins. When empty (the default) the registry sends no
+    /// CORS headers — third-party origins cannot make cross-origin
+    /// requests using a visitor's stored bearer token.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -141,7 +161,11 @@ pub struct AuthConfig {
     /// Clock-skew leeway (seconds) applied to JWT `exp` validation.
     #[serde(default = "default_token_leeway")]
     pub token_leeway_seconds: u64,
-    #[serde(default = "default_true")]
+    /// Allow anonymous reads of `public`-visibility contexts. Defaults to
+    /// `false` — CLAUDE.md: "Anonymous public reads are off by default for
+    /// new registries unless the config explicitly opts in." Operators who
+    /// want world-readable public contexts MUST set this to true.
+    #[serde(default)]
     pub anonymous_public_reads: bool,
 }
 
@@ -170,7 +194,7 @@ impl Default for AuthConfig {
             token_ttl_seconds: default_token_ttl(),
             challenge_ttl_seconds: default_challenge_ttl(),
             token_leeway_seconds: default_token_leeway(),
-            anonymous_public_reads: true,
+            anonymous_public_reads: false,
         }
     }
 }

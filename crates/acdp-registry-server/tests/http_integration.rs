@@ -63,6 +63,13 @@ fn caps() -> CapabilitiesDocument {
 }
 
 fn config(playground: bool) -> RegistryConfig {
+    // Tests expect anonymous reads to surface published public contexts.
+    // The new shipped default for `anonymous_public_reads` is `false`
+    // (SEC-07 / CLAUDE.md), so opt in explicitly inside the test harness.
+    let auth = AuthConfig {
+        anonymous_public_reads: true,
+        ..AuthConfig::default()
+    };
     RegistryConfig {
         registry: RegistrySection {
             authority: AUTHORITY.into(),
@@ -70,6 +77,8 @@ fn config(playground: bool) -> RegistryConfig {
             bind: "0.0.0.0".into(),
             profiles: vec!["acdp-registry-core".into()],
             tls: Default::default(),
+            cross_registry_resolution: true,
+            cors: Default::default(),
         },
         storage: StorageConfig {
             backend: StorageBackend::Sqlite,
@@ -77,7 +86,7 @@ fn config(playground: bool) -> RegistryConfig {
             sqlite_path: None,
             max_connections: 1,
         },
-        auth: AuthConfig::default(),
+        auth,
         webhook: WebhookConfig::default(),
         limits: LimitsConfig::default(),
         playground: PlaygroundConfig {
@@ -120,6 +129,7 @@ async fn harness(playground: bool) -> Harness {
         auth,
         webhook: None,
         config: config(playground),
+        cross_registry: None,
     };
     Harness {
         router: build_router(state),

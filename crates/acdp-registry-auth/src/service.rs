@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::challenge_store::{ChallengeRecord, ChallengeStore};
 use crate::jwt::JwtSigner;
+use crate::revocation_store::{RevocationRecord, RevocationStore};
 use crate::AuthError;
 
 /// Bundles configuration + challenge store + JWT signer + DID resolver.
@@ -22,6 +23,7 @@ pub struct AuthService {
     pub signer: JwtSigner,
     pub resolver: Arc<WebResolver>,
     pub authority: String,
+    pub revocations: Option<Arc<dyn RevocationStore>>,
 }
 
 impl AuthService {
@@ -38,15 +40,35 @@ impl AuthService {
             signer,
             resolver,
             authority,
+            revocations: None,
         }
+    }
+
+    /// Attach the revocation store used by `revoke_token` and the signer.
+    /// Callers SHOULD configure `signer` with the same store via
+    /// `JwtSigner::with_revocations` so `validate` and `revoke` agree.
+    pub fn with_revocations(mut self, store: Arc<dyn RevocationStore>) -> Self {
+        self.revocations = Some(store);
+        self
     }
 
     /// Issue a fresh challenge nonce and persist it.
     ///
     /// `agent_id` is stored alongside the nonce so the token-issue path can
     /// reject any peer that tries to redeem the nonce under a different DID.
+    ///
+    /// SEC-05: a lightweight `did:web:` prefix and length check runs before
+    /// any storage work — full DID-web parsing still happens on
+    /// `issue_token`. Without this the challenge table fills with garbage
+    /// from clients that mistype the DID method.
     #[tracing::instrument(skip(self), fields(agent = %agent_id))]
     pub async fn issue_challenge(&self, agent_id: &str) -> Result<AuthChallenge, AuthError> {
+        if !agent_id.starts_with("did:web:")
+            || agent_id.len() < "did:web:".len() + 1
+            || agent_id.len() > 2048
+        {
+            return Err(AuthError::UnsupportedDidMethod(agent_id.to_string()));
+        }
         let mut bytes = [0u8; 24];
         rand::thread_rng().fill_bytes(&mut bytes);
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -206,6 +228,36 @@ impl AuthService {
         Ok(AgentDid::new(&claims.sub))
     }
 
+    /// Revoke a token by its `jti`. Returns `AuthError::TokenInvalid` when
+    /// the caller's DID does not own the target token and
+    /// `AuthError::Internal` if revocation is not configured. The caller
+    /// SHOULD authenticate the bearer presenting the request and pass the
+    /// resulting `caller_did` so an agent can only revoke their own tokens.
+    pub async fn revoke_token(&self, jti: &str, caller_did: &str) -> Result<(), AuthError> {
+        let Some(rev) = &self.revocations else {
+            return Err(AuthError::Internal(
+                "token revocation is not configured on this registry".into(),
+            ));
+        };
+        match rev.owner_of(jti).await? {
+            None => Err(AuthError::TokenInvalid(format!(
+                "no record for jti '{jti}'"
+            ))),
+            Some(owner) if owner != caller_did => Err(AuthError::TokenInvalid(
+                "may only revoke tokens issued to the calling DID".into(),
+            )),
+            Some(owner) => {
+                rev.revoke(RevocationRecord {
+                    jti: jti.into(),
+                    agent_did: owner,
+                    expires_at: Utc::now()
+                        + Duration::seconds(self.config.token_ttl_seconds as i64),
+                })
+                .await
+            }
+        }
+    }
+
     /// Spawn the background nonce-cleanup task.
     pub fn spawn_evictor(self: &Arc<Self>) {
         let challenges = self.challenges.clone();
@@ -218,6 +270,17 @@ impl AuthService {
                 }
             }
         });
+        if let Some(rev) = self.revocations.clone() {
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+                loop {
+                    interval.tick().await;
+                    if let Err(e) = rev.evict_expired(Utc::now()).await {
+                        tracing::warn!(error = %e, "revocation eviction failed");
+                    }
+                }
+            });
+        }
     }
 }
 

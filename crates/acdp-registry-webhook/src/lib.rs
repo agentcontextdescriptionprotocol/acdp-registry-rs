@@ -20,6 +20,8 @@ pub enum WebhookError {
     Closed,
     #[error("encode: {0}")]
     Encode(String),
+    #[error("config: {0}")]
+    Config(String),
 }
 
 type HmacSha256 = Hmac<Sha256>;
@@ -32,8 +34,44 @@ pub struct WebhookEmitter {
 }
 
 impl WebhookEmitter {
-    /// Spawn the worker. Returns an emitter whose `emit` method is cheap.
-    /// Dropping every clone of the emitter eventually shuts the worker down.
+    /// Validate the webhook configuration and spawn the worker.
+    ///
+    /// SEC-03: the URL is checked against the same SSRF policy
+    /// (`acdp::safe_http::SsrfPolicy::default()`) that the DID resolver
+    /// uses — HTTPS-only, no IP literals, hostnames only. Without this
+    /// gate a misconfigured or maliciously set webhook URL turns the
+    /// registry into an SSRF proxy against internal services like the
+    /// AWS / GCP metadata endpoint.
+    ///
+    /// SEC-04: when the webhook is enabled and has a non-empty URL, the
+    /// shared HMAC secret must be non-empty. The HMAC primitive will
+    /// happily compute over a zero-length key, which means a receiver
+    /// that checks `X-ACDP-Signature` will accept every event as
+    /// authentic — defeating the integrity guarantee.
+    pub fn try_spawn(config: WebhookConfig) -> Result<Self, WebhookError> {
+        if config.enabled && !config.url.is_empty() {
+            acdp::safe_http::SsrfPolicy::default()
+                .check_url(&config.url)
+                .map_err(|e| {
+                    WebhookError::Config(format!(
+                        "webhook.url '{}' rejected by SSRF policy: {e}",
+                        config.url
+                    ))
+                })?;
+            if config.secret.trim().is_empty() {
+                return Err(WebhookError::Config(
+                    "webhook.secret must be non-empty when webhook.enabled and webhook.url \
+                     are set; HMAC over an empty key accepts every signature"
+                        .into(),
+                ));
+            }
+        }
+        Ok(Self::spawn(config))
+    }
+
+    /// Spawn without configuration validation. Prefer `try_spawn` —
+    /// retained for tests and for cases where the caller has already
+    /// validated the config.
     pub fn spawn(config: WebhookConfig) -> Self {
         let capacity = config.queue_capacity.max(1);
         let (tx, rx) = mpsc::channel::<WebhookEvent>(capacity);
