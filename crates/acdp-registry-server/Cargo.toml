@@ -16,13 +16,13 @@ path = "src/main.rs"
 
 [dependencies]
 acdp                  = { workspace = true }
-acdp-registry-auth    = { path = "../acdp-registry-auth" }
-acdp-registry-core    = { path = "../acdp-registry-core" }
-acdp-registry-pg      = { path = "../acdp-registry-pg", optional = true }
-acdp-registry-sqlite  = { path = "../acdp-registry-sqlite", optional = true }
-acdp-registry-store   = { path = "../acdp-registry-store" }
-acdp-registry-types   = { path = "../acdp-registry-types" }
-acdp-registry-webhook = { path = "../acdp-registry-webhook" }
+acdp-registry-auth    = { path = "../acdp-registry-auth",    version = "0.1.0" }
+acdp-registry-core    = { path = "../acdp-registry-core",    version = "0.1.0" }
+acdp-registry-pg      = { path = "../acdp-registry-pg",      version = "0.1.0", optional = true }
+acdp-registry-sqlite  = { path = "../acdp-registry-sqlite",  version = "0.1.0", optional = true }
+acdp-registry-store   = { path = "../acdp-registry-store",   version = "0.1.0" }
+acdp-registry-types   = { path = "../acdp-registry-types",   version = "0.1.0" }
+acdp-registry-webhook = { path = "../acdp-registry-webhook", version = "0.1.0" }
 anyhow             = { workspace = true }
 async-trait        = { workspace = true }
 axum               = { workspace = true }

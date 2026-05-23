@@ -12,8 +12,8 @@ workspace = true
 
 [dependencies]
 acdp                = { workspace = true }
-acdp-registry-store = { path = "../acdp-registry-store" }
-acdp-registry-types = { path = "../acdp-registry-types", default-features = false }
+acdp-registry-store = { path = "../acdp-registry-store", version = "0.1.0" }
+acdp-registry-types = { path = "../acdp-registry-types", version = "0.1.0", default-features = false }
 async-trait = { workspace = true }
 base64      = { workspace = true }
 chrono      = { workspace = true }
