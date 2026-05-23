@@ -3,7 +3,7 @@
 # Two-stage build: Rust toolchain + cargo-chef for cached dependency
 # builds, then a slim runtime image carrying the static binary.
 
-FROM rust:1.86-bookworm AS chef
+FROM rust:1.88-bookworm AS chef
 RUN cargo install cargo-chef --locked
 WORKDIR /workspace
 

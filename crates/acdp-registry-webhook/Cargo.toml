@@ -11,7 +11,7 @@ description = "HMAC-signed webhook emitter for acdp-registry-rs"
 workspace = true
 
 [dependencies]
-acdp-registry-types = { path = "../acdp-registry-types", default-features = false }
+acdp-registry-types = { path = "../acdp-registry-types", version = "0.1.0", default-features = false }
 chrono     = { workspace = true }
 hex        = { workspace = true }
 hmac       = { workspace = true }
