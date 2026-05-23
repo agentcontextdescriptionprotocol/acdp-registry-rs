@@ -578,6 +578,66 @@ async fn health_503_when_storage_pool_closed() {
 }
 
 #[tokio::test]
+async fn revoke_returns_503_when_revocations_not_configured() {
+    // Doc contract on `revoke_token`: 503 when the registry started
+    // without a revocation store. Default builds always wire one, so
+    // this path needs a custom harness that mounts /auth/* but skips
+    // `AuthService::with_revocations`.
+    let db = tempfile::Builder::new()
+        .prefix("acdp-no-rev-")
+        .suffix(".sqlite")
+        .tempfile()
+        .unwrap();
+    let store = SqliteStore::connect(db.path(), 1).await.unwrap();
+    store.migrate().await.unwrap();
+    let server = Arc::new(RegistryServer::try_new(store, caps(), AUTHORITY).unwrap());
+    let challenges: Arc<dyn ChallengeStore> = Arc::new(InMemoryChallengeStore::new());
+    let secret = JwtSecret::from_bytes(&[42u8; 32]);
+    let signer = JwtSigner::new(secret, format!("did:web:{AUTHORITY}"), AUTHORITY.into(), 30);
+    let resolver = Arc::new(WebResolver::new());
+    let auth = Arc::new(AuthService::new(
+        AuthConfig {
+            enabled: true,
+            anonymous_public_reads: true,
+            ..AuthConfig::default()
+        },
+        challenges,
+        signer,
+        resolver,
+        AUTHORITY.into(),
+    ));
+    let mut cfg = config(true);
+    cfg.auth.enabled = true;
+    let state = AppStateInner {
+        server,
+        auth,
+        webhook: None,
+        config: cfg,
+        cross_registry: None,
+    };
+    let app = build_router(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/token/revoke")
+                .header("Content-Type", "application/json")
+                .body(Body::from(json!({"jti": "anything"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "revoke endpoint must signal 503 when the feature isn't wired, not 500"
+    );
+    let v = body_to_json(resp).await;
+    assert_eq!(v["error"]["code"], "service_unavailable");
+}
+
+#[tokio::test]
 async fn search_and_tokens_intersect() {
     // FTS5 query semantics: `q=foo bar` should match documents that contain
     // BOTH `foo` and `bar`, matching Postgres `plainto_tsquery` behavior.

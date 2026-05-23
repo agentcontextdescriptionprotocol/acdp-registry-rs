@@ -59,18 +59,21 @@ async fn main() -> anyhow::Result<()> {
 /// requirement that would otherwise be discovered lazily.
 fn validate_config(cfg: &RegistryConfig) -> anyhow::Result<()> {
     if cfg.auth.enabled && !cfg.auth.jwt_secret.is_empty() {
-        // Same decode-and-length check `JwtSecret::from_base64` performs;
-        // doing it up front means a `changeme`-style secret can be rejected
-        // at startup rather than triggering 500s mid-flight.
-        let _ = JwtSecret::from_base64(&cfg.auth.jwt_secret)
-            .map_err(|e| anyhow::anyhow!("auth.jwt_secret: {e}"))?;
         // OPS-02 stronger guard: the docker-compose default placeholder
-        // must not reach production. Mirrors the literal "changeme"
-        // suggestion in `docker-compose.yml` env defaults.
+        // must not reach production. Run the literal check FIRST so an
+        // operator who left `changeme` in place gets the actionable
+        // "generate a real secret" hint instead of the generic
+        // base64-length error that `JwtSecret::from_base64` would
+        // surface (`changeme` happens to be valid base64 of 6 bytes).
         let trimmed = cfg.auth.jwt_secret.trim();
-        if trimmed == "changeme" || trimmed.eq_ignore_ascii_case("CHANGEME") {
+        if trimmed.eq_ignore_ascii_case("changeme") {
             anyhow::bail!("auth.jwt_secret is the placeholder 'changeme'; generate a real secret");
         }
+        // Same decode-and-length check `JwtSecret::from_base64` performs;
+        // doing it up front means a malformed secret is rejected at
+        // startup rather than triggering 500s mid-flight.
+        let _ = JwtSecret::from_base64(&cfg.auth.jwt_secret)
+            .map_err(|e| anyhow::anyhow!("auth.jwt_secret: {e}"))?;
     }
     if cfg.webhook.enabled {
         if cfg.webhook.url.is_empty() {

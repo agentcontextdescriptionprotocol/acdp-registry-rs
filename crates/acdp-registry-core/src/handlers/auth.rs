@@ -7,9 +7,10 @@ use acdp_registry_store::ExtendedRegistryStore;
 use acdp_registry_types::{AuthChallenge, RegistryError, TokenRequest, TokenResponse};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
+use serde_json::json;
 
 use crate::state::AppState;
 
@@ -53,7 +54,22 @@ pub async fn revoke_token<S: ExtendedRegistryStore + 'static>(
     State(state): State<Arc<AppState<S>>>,
     headers: HeaderMap,
     Json(req): Json<RevokeRequest>,
-) -> Result<impl IntoResponse, RegistryError> {
+) -> Result<Response, RegistryError> {
+    // 503 when the revocation store isn't wired — match the doc contract
+    // above. In current binaries `state.auth.revocations` is always
+    // `Some`, so this branch is defensive against future configurations
+    // that disable revocation. Falling through would surface as a 500
+    // via `AuthError::Internal`, which is the wrong signal: the registry
+    // is healthy; the feature simply isn't available.
+    if state.auth.revocations.is_none() {
+        let body = Json(json!({
+            "error": {
+                "code": "service_unavailable",
+                "message": "token revocation is not configured on this registry"
+            }
+        }));
+        return Ok((StatusCode::SERVICE_UNAVAILABLE, body).into_response());
+    }
     let bearer = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -61,5 +77,5 @@ pub async fn revoke_token<S: ExtendedRegistryStore + 'static>(
         .ok_or_else(|| RegistryError::AuthToken("bearer token required for revocation".into()))?;
     let caller = state.auth.validate_bearer(bearer)?;
     state.auth.revoke_token(&req.jti, caller.as_str()).await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
