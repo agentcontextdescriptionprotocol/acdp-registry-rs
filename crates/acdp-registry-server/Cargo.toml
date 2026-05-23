@@ -1,0 +1,55 @@
+[package]
+name        = "acdp-registry-server"
+version     = { workspace = true }
+edition     = { workspace = true }
+rust-version = { workspace = true }
+license     = { workspace = true }
+repository  = { workspace = true }
+description = "ACDP registry HTTP server binary"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "acdp-registry"
+path = "src/main.rs"
+
+[dependencies]
+acdp                  = { workspace = true }
+acdp-registry-auth    = { path = "../acdp-registry-auth" }
+acdp-registry-core    = { path = "../acdp-registry-core" }
+acdp-registry-pg      = { path = "../acdp-registry-pg", optional = true }
+acdp-registry-sqlite  = { path = "../acdp-registry-sqlite", optional = true }
+acdp-registry-store   = { path = "../acdp-registry-store" }
+acdp-registry-types   = { path = "../acdp-registry-types" }
+acdp-registry-webhook = { path = "../acdp-registry-webhook" }
+anyhow             = { workspace = true }
+async-trait        = { workspace = true }
+axum               = { workspace = true }
+axum-server        = { workspace = true }
+base64             = { workspace = true }
+chrono             = { workspace = true }
+dotenvy            = { workspace = true }
+rand               = { workspace = true }
+tokio              = { workspace = true }
+tower              = { workspace = true }
+tower-http         = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[features]
+default        = ["storage-sqlite"]
+storage-pg     = ["dep:acdp-registry-pg"]
+storage-sqlite = ["dep:acdp-registry-sqlite"]
+storage-memory = []
+playground     = ["acdp-registry-core/playground"]
+
+[dev-dependencies]
+http-body-util = "0.1"
+serde_json     = { workspace = true }
+sqlx           = { workspace = true }
+tempfile       = "3"
+# Serialize PG integration tests so they don't fight over the shared
+# truncate-and-test database. SQLite tests use disposable tempfiles so
+# they don't need this.
+serial_test    = "3"

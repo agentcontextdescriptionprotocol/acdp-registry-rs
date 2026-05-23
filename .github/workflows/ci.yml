@@ -1,0 +1,121 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: acdp-registry-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: agentcontextdescriptionprotocol/acdp-rs
+          path: acdp-rs
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt
+        working-directory: acdp-registry-rs
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: acdp-registry-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: agentcontextdescriptionprotocol/acdp-rs
+          path: acdp-rs
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: acdp-registry-rs -> target
+      - name: clippy (sqlite default)
+        working-directory: acdp-registry-rs
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: clippy (postgres)
+        working-directory: acdp-registry-rs
+        run: |
+          cargo clippy -p acdp-registry-server \
+            --no-default-features --features storage-pg \
+            --all-targets -- -D warnings
+      - name: clippy (playground)
+        working-directory: acdp-registry-rs
+        run: |
+          cargo clippy -p acdp-registry-server \
+            --features storage-sqlite,playground \
+            --all-targets -- -D warnings
+
+  test:
+    name: tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: acdp
+          POSTGRES_PASSWORD: acdp
+          POSTGRES_DB: acdp_registry
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U acdp"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: acdp-registry-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: agentcontextdescriptionprotocol/acdp-rs
+          path: acdp-rs
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: acdp-registry-rs -> target
+      - name: cargo test (sqlite)
+        working-directory: acdp-registry-rs
+        run: cargo test --workspace
+      - name: cargo test (postgres)
+        working-directory: acdp-registry-rs
+        env:
+          ACDP_REGISTRY_TEST_PG_URL: postgres://acdp:acdp@localhost:5432/acdp_registry
+        run: |
+          cargo test -p acdp-registry-pg
+          cargo test -p acdp-registry-server \
+            --no-default-features --features storage-pg \
+            --test pg_integration
+
+  audit:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: acdp-registry-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: agentcontextdescriptionprotocol/acdp-rs
+          path: acdp-rs
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          arguments: --workspace
+          manifest-path: acdp-registry-rs/Cargo.toml

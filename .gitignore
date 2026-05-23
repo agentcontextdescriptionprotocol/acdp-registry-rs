@@ -1,0 +1,43 @@
+# Rust
+/target/
+**/target/
+**/*.rs.bk
+*.pdb
+Cargo.lock.bak
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Coverage
+*.profraw
+*.profdata
+/lcov.info
+/coverage/
+
+# Local-only configuration
+.envrc
+.env
+.env.*
+!.env.example
+
+# Local data
+/data/
+**/*.db
+**/*.db-shm
+**/*.db-wal
+**/*.sqlite
+**/*.sqlite-journal
+
+# TLS material
+*.pem
+*.crt
+*.key
+!docker/tls/.gitkeep
+
+# Plans / scratch (mirrors acdp-rs convention)
+plans/
+temp/

@@ -1,0 +1,29 @@
+[package]
+name        = "acdp-registry-types"
+version     = { workspace = true }
+edition     = { workspace = true }
+rust-version = { workspace = true }
+license     = { workspace = true }
+repository  = { workspace = true }
+description = "Shared types (config, auth wire types, errors, events) for acdp-registry-rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+acdp       = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
+chrono     = { workspace = true }
+config     = { workspace = true }
+url        = { workspace = true }
+
+# IntoResponse — kept optional so consumers that only want the types
+# don't pull in axum (e.g. a CLI tool). Enabled by default.
+axum       = { workspace = true, optional = true }
+http       = { version = "1", optional = true }
+
+[features]
+default = ["axum"]
+axum    = ["dep:axum", "dep:http"]
