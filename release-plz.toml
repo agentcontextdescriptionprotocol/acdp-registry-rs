@@ -1,0 +1,9 @@
+[workspace]
+changelog_update = true
+git_release_enable = true
+git_tag_enable = true
+publish = false  # flip to true once crates are ready for crates.io
+
+[changelog]
+header = ""
+trim = true
