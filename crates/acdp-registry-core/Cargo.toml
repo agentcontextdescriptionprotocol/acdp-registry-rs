@@ -1,0 +1,33 @@
+[package]
+name        = "acdp-registry-core"
+version     = { workspace = true }
+edition     = { workspace = true }
+rust-version = { workspace = true }
+license     = { workspace = true }
+repository  = { workspace = true }
+description = "axum router + handlers for acdp-registry-rs (storage-agnostic)"
+
+[lints]
+workspace = true
+
+[dependencies]
+acdp                  = { workspace = true }
+acdp-registry-auth    = { path = "../acdp-registry-auth",    version = "0.1.0" }
+acdp-registry-store   = { path = "../acdp-registry-store",   version = "0.1.0" }
+acdp-registry-types   = { path = "../acdp-registry-types",   version = "0.1.0" }
+acdp-registry-webhook = { path = "../acdp-registry-webhook", version = "0.1.0" }
+axum       = { workspace = true }
+chrono     = { workspace = true }
+http       = "1"
+serde      = { workspace = true }
+serde_json = { workspace = true }
+tokio      = { workspace = true }
+tower      = { workspace = true }
+tower-http = { workspace = true }
+tracing    = { workspace = true }
+uuid       = { workspace = true }
+async-trait = { workspace = true }
+
+[features]
+default    = []
+playground = []

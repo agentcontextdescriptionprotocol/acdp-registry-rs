@@ -1,0 +1,34 @@
+[registry]
+authority = "localhost"
+port      = 8443
+bind      = "0.0.0.0"
+profiles  = ["acdp-registry-core", "acdp-registry-discovery"]
+
+[registry.tls]
+enabled = false
+
+[storage]
+backend         = "postgres"
+max_connections = 20
+# postgres_url comes from ACDP_REGISTRY_STORAGE__POSTGRES_URL
+
+[auth]
+enabled              = false
+did_methods          = ["did:web"]
+token_ttl_seconds    = 3600
+challenge_ttl_seconds = 300
+token_leeway_seconds = 30
+anonymous_public_reads = true
+# jwt_secret = "<base64 ≥32-byte secret>"
+
+[webhook]
+enabled        = false
+queue_capacity = 1024
+
+[limits]
+max_payload_bytes           = 1048576
+max_embedded_bytes          = 65536
+idempotency_key_ttl_seconds = 86400
+
+[playground]
+enabled = false

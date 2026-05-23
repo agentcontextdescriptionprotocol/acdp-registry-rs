@@ -1,0 +1,53 @@
+# acdp-registry-rs configuration example.
+#
+# Load with: ACDP_REGISTRY_CONFIG=./config/registry.example.toml acdp-registry
+# or set the same fields via env vars: ACDP_REGISTRY_<SECTION>__<FIELD>.
+
+[registry]
+authority = "registry.example.com"
+port      = 8443
+bind      = "0.0.0.0"
+profiles  = ["acdp-registry-core", "acdp-registry-discovery"]
+
+[registry.tls]
+enabled   = false
+# cert_path = "/etc/acdp/tls/cert.pem"
+# key_path  = "/etc/acdp/tls/key.pem"
+
+[storage]
+# "postgres" (production), "sqlite" (dev), or "memory" (compile-time only)
+backend         = "sqlite"
+sqlite_path     = "./data/registry.db"
+# postgres_url  = "postgres://acdp:acdp@localhost:5432/acdp_registry"
+max_connections = 20
+
+[auth]
+enabled              = true
+did_methods          = ["did:web"]
+# Base64-encoded ≥32-byte random secret. Generate with:
+#   openssl rand -base64 32
+# Override per environment via ACDP_REGISTRY_AUTH__JWT_SECRET.
+jwt_secret           = ""
+token_ttl_seconds    = 3600
+challenge_ttl_seconds = 300
+# Clock-skew leeway applied to JWT exp validation.
+token_leeway_seconds = 30
+anonymous_public_reads = true
+
+[webhook]
+enabled         = false
+# url            = "https://example.com/hooks/acdp"
+# secret         = "<random shared secret>"
+timeout_seconds = 5
+max_retries     = 3
+# Bounded in-memory queue; events are dropped (with a warn log) when full.
+queue_capacity  = 1024
+
+[limits]
+max_payload_bytes  = 1048576
+max_embedded_bytes = 65536
+# TTL advertised to producers for Idempotency-Key replay (seconds).
+idempotency_key_ttl_seconds = 86400
+
+[playground]
+enabled = false
