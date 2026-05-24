@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use acdp::types::primitives::{AgentDid, CtxId, LineageId};
+use acdp::types::primitives::{AgentDid, CtxId, LineageId, Visibility};
 use acdp::types::publish::{PublishRequest, PublishResponse};
 use acdp::types::search::{SearchParams, SearchResponse};
 use acdp_registry_auth::extract_bearer;
@@ -40,28 +40,46 @@ pub struct SearchQuery {
     pub status: Option<String>,
     pub limit: Option<u32>,
     pub cursor: Option<String>,
+    /// FEAT-07: restrict results to a single visibility level. Owned by
+    /// `acdp-registry-core` (not `acdp::types::search::SearchParams`)
+    /// because the upstream struct doesn't carry the field — the filter
+    /// is applied in the handler, after the store search runs.
+    pub visibility: Option<String>,
 }
 
 impl SearchQuery {
-    fn into_params(self) -> SearchParams {
-        SearchParams {
-            q: self.q,
-            context_type: self.context_type,
-            domain: self.domain,
-            tags: self.tags,
-            agent_id: self.agent_id,
-            schema_uri: self.schema_uri,
-            derived_from: self.derived_from,
-            created_after: self.created_after,
-            created_before: self.created_before,
-            data_period_start_after: self.data_period_start_after,
-            data_period_end_before: self.data_period_end_before,
-            expires_after: self.expires_after,
-            expires_before: self.expires_before,
-            status: self.status,
-            limit: self.limit,
-            cursor: self.cursor,
-        }
+    fn into_params(self) -> (SearchParams, Option<Visibility>) {
+        let visibility = self.visibility.as_deref().and_then(parse_visibility);
+        (
+            SearchParams {
+                q: self.q,
+                context_type: self.context_type,
+                domain: self.domain,
+                tags: self.tags,
+                agent_id: self.agent_id,
+                schema_uri: self.schema_uri,
+                derived_from: self.derived_from,
+                created_after: self.created_after,
+                created_before: self.created_before,
+                data_period_start_after: self.data_period_start_after,
+                data_period_end_before: self.data_period_end_before,
+                expires_after: self.expires_after,
+                expires_before: self.expires_before,
+                status: self.status,
+                limit: self.limit,
+                cursor: self.cursor,
+            },
+            visibility,
+        )
+    }
+}
+
+fn parse_visibility(s: &str) -> Option<Visibility> {
+    match s {
+        "public" => Some(Visibility::Public),
+        "restricted" => Some(Visibility::Restricted),
+        "private" => Some(Visibility::Private),
+        _ => None,
     }
 }
 
@@ -75,20 +93,22 @@ pub async fn publish<S: ExtendedRegistryStore + 'static>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<PublishResponse>, RegistryError> {
-    if body.len() as u64 > state.config.limits.max_payload_bytes {
-        return Err(RegistryError::Acdp(
-            acdp::error::AcdpError::PayloadTooLarge(format!(
-                "publish body {} bytes exceeds max_payload_bytes {}",
-                body.len(),
-                state.config.limits.max_payload_bytes
-            )),
-        ));
-    }
+    // SEC-06: the body length cap is now enforced by
+    // `tower_http::limit::RequestBodyLimitLayer` so the same bound applies
+    // uniformly to `/auth/*` and any future endpoint, not just publish.
     let req: PublishRequest = serde_json::from_slice(&body)
         .map_err(|e| RegistryError::Acdp(acdp::error::AcdpError::SchemaViolation(e.to_string())))?;
     let idempotency_key = headers
         .get("idempotency-key")
         .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    // FEAT-04: forward the orchestrator's correlation id to the event so
+    // downstream consumers (Seam Runtime, control plane) can link the
+    // publish to a run record.
+    let run_id = headers
+        .get("x-run-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty() && s.len() <= 256)
         .map(str::to_string);
     if let Some(k) = &idempotency_key {
         if k.is_empty() || k.len() > 255 {
@@ -166,10 +186,7 @@ pub async fn publish<S: ExtendedRegistryStore + 'static>(
             ctx_id: response.ctx_id.as_str().to_string(),
             lineage_id: response.lineage_id.as_str().to_string(),
             agent_id: req.agent_id.as_str().to_string(),
-            context_type: serde_json::to_value(&req.context_type)
-                .ok()
-                .and_then(|v| v.as_str().map(str::to_string))
-                .unwrap_or_default(),
+            context_type: context_type_str(&req.context_type),
             visibility: match req.visibility {
                 acdp::types::Visibility::Public => "public",
                 acdp::types::Visibility::Restricted => "restricted",
@@ -178,19 +195,78 @@ pub async fn publish<S: ExtendedRegistryStore + 'static>(
             .into(),
             version: response.version,
             created_at: response.created_at,
+            // FEAT-05: lineage graphs need `derived_from`; without it the
+            // control plane can only reconstruct intra-lineage history.
+            derived_from: req
+                .derived_from
+                .iter()
+                .map(|c| c.as_str().to_string())
+                .collect(),
+            run_id,
         });
     }
 
     Ok(Json(response))
 }
 
+/// DESIGN-04: same typed accessor as in the storage backends.
+fn context_type_str(t: &acdp::types::primitives::ContextType) -> String {
+    use acdp::types::primitives::ContextType;
+    match t {
+        ContextType::DataSnapshot => "data_snapshot".into(),
+        ContextType::Analysis => "analysis".into(),
+        ContextType::Prediction => "prediction".into(),
+        ContextType::Alert => "alert".into(),
+        ContextType::Custom(s) => s.clone(),
+    }
+}
+
 /// `GET /contexts/{ctx_id}`.
+///
+/// FEAT-01: when the `ctx_id`'s authority differs from this registry's
+/// `config.registry.authority`, the request is delegated to
+/// `CrossRegistryResolver` (RFC-ACDP-0006 §4.1). The resolver verifies the
+/// foreign capabilities document, retrieves the body, recomputes the
+/// content hash, and verifies the producer's signature via the local
+/// `WebResolver`. Foreign retrieval is gated by
+/// `registry.cross_registry_resolution`.
 pub async fn retrieve<S: ExtendedRegistryStore + 'static>(
     State(state): State<Arc<AppState<S>>>,
     headers: HeaderMap,
     Path(ctx_id): Path<String>,
 ) -> Result<Json<acdp::types::body::FullContext>, RegistryError> {
     let requester = caller_from_headers(&state, &headers)?;
+
+    let parsed = CtxId::parse(ctx_id.clone()).map_err(RegistryError::Acdp)?;
+    if parsed.authority() != state.config.registry.authority {
+        let Some(resolver) = &state.cross_registry else {
+            return Err(RegistryError::Acdp(acdp::error::AcdpError::NotFound(
+                "context not found (cross-registry resolution disabled)".into(),
+            )));
+        };
+        let verified = resolver
+            .resolve(&parsed)
+            .await
+            .map_err(RegistryError::Acdp)?;
+        let ctx = acdp::types::body::FullContext {
+            body: verified.body().clone(),
+            registry_state: acdp::types::body::RegistryState {
+                status: acdp::types::primitives::Status::Active,
+                extensions: Default::default(),
+            },
+            registry_receipt: None,
+            extensions: Default::default(),
+        };
+        if let Some(emitter) = &state.webhook {
+            emitter.emit(WebhookEvent::ContextRetrieved {
+                ctx_id: ctx.body.ctx_id.as_str().to_string(),
+                requester_did: requester.as_ref().map(|d| d.as_str().to_string()),
+                at: Utc::now(),
+            });
+        }
+        return Ok(Json(ctx));
+    }
+
     let server = state.server.clone();
     let ctx_id_typed = CtxId(ctx_id);
     let req_owned = requester.clone();
@@ -241,12 +317,22 @@ pub async fn search<S: ExtendedRegistryStore + 'static>(
 ) -> Result<Json<SearchResponse>, RegistryError> {
     let requester = caller_from_headers(&state, &headers)?;
     let query_text = q.q.clone();
-    let params = q.into_params();
+    let (params, visibility_filter) = q.into_params();
     let server = state.server.clone();
     let req_owned = requester.clone();
-    let resp = tokio::task::spawn_blocking(move || server.search(&params, req_owned.as_ref()))
+    let mut resp = tokio::task::spawn_blocking(move || server.search(&params, req_owned.as_ref()))
         .await
         .map_err(|e| RegistryError::Internal(format!("join: {e}")))??;
+
+    // FEAT-07: client-supplied visibility filter applied at the handler
+    // boundary because the upstream `SearchParams` shape has no such field.
+    // The visibility-gate in the store still runs first (RFC-ACDP-0008
+    // §4.5 disclosure rules), so this only narrows results the caller is
+    // already permitted to see.
+    if let Some(want) = visibility_filter {
+        resp.matches
+            .retain(|m| m.visibility.as_ref() == Some(&want));
+    }
 
     if let Some(emitter) = &state.webhook {
         emitter.emit(WebhookEvent::SearchExecuted {

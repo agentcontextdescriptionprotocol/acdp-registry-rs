@@ -4,7 +4,7 @@ mod auth;
 mod context;
 mod meta;
 
-pub use auth::{issue_challenge, issue_token};
+pub use auth::{issue_challenge, issue_token, revoke_token};
 pub use context::{current, lineage, publish, retrieve, retrieve_body, search};
 pub use meta::{capabilities, health};
 

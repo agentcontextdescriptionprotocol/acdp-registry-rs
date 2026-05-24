@@ -4,18 +4,31 @@
 # or set the same fields via env vars: ACDP_REGISTRY_<SECTION>__<FIELD>.
 
 [registry]
+# Bare DNS hostname. Used to mint `ctx_id` and as the `did:web` registry id.
 authority = "registry.example.com"
+# TCP port to listen on.
 port      = 8443
+# Bind address. 0.0.0.0 accepts traffic on every interface.
 bind      = "0.0.0.0"
+# Profiles advertised in the capabilities document.
 profiles  = ["acdp-registry-core", "acdp-registry-discovery"]
+# When false, ctx_ids whose authority differs from `authority` return 404
+# instead of being resolved against the foreign registry.
+cross_registry_resolution = true
 
 [registry.tls]
 enabled   = false
 # cert_path = "/etc/acdp/tls/cert.pem"
 # key_path  = "/etc/acdp/tls/key.pem"
 
+[registry.cors]
+# Empty (default) disables CORS — browsers cannot make authenticated
+# cross-origin requests using a visitor's stored bearer token. Add your
+# UI's origin explicitly to opt in.
+allowed_origins = []
+
 [storage]
-# "postgres" (production), "sqlite" (dev), or "memory" (compile-time only)
+# "postgres" (production), "sqlite" (dev), or "memory" (compile-time only).
 backend         = "sqlite"
 sqlite_path     = "./data/registry.db"
 # postgres_url  = "postgres://acdp:acdp@localhost:5432/acdp_registry"
@@ -27,27 +40,36 @@ did_methods          = ["did:web"]
 # Base64-encoded ≥32-byte random secret. Generate with:
 #   openssl rand -base64 32
 # Override per environment via ACDP_REGISTRY_AUTH__JWT_SECRET.
+# The startup-time validator refuses to launch with the literal `changeme`.
 jwt_secret           = ""
 token_ttl_seconds    = 3600
 challenge_ttl_seconds = 300
 # Clock-skew leeway applied to JWT exp validation.
 token_leeway_seconds = 30
+# CLAUDE.md: anonymous reads are off by default. Opt in explicitly when
+# the registry hosts world-readable public contexts (developer registries,
+# discovery hubs).
 anonymous_public_reads = true
 
 [webhook]
 enabled         = false
 # url            = "https://example.com/hooks/acdp"
-# secret         = "<random shared secret>"
+# secret         = "<random shared secret — MUST be non-empty if enabled>"
 timeout_seconds = 5
 max_retries     = 3
 # Bounded in-memory queue; events are dropped (with a warn log) when full.
 queue_capacity  = 1024
 
 [limits]
+# Maximum publish-body size accepted by /contexts (enforced by the body-
+# limit layer applied to every route).
 max_payload_bytes  = 1048576
+# Maximum size of an inline data_ref `value`.
 max_embedded_bytes = 65536
 # TTL advertised to producers for Idempotency-Key replay (seconds).
 idempotency_key_ttl_seconds = 86400
 
 [playground]
+# When true, the publish handler skips DID-signature verification. NEVER
+# enable in production — the registry will accept any forged signature.
 enabled = false
