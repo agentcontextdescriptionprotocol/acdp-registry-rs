@@ -3,9 +3,13 @@ authority = "localhost"
 port      = 8443
 bind      = "0.0.0.0"
 profiles  = ["acdp-registry-core", "acdp-registry-discovery"]
+cross_registry_resolution = true
 
 [registry.tls]
 enabled = false
+
+[registry.cors]
+allowed_origins = []
 
 [storage]
 backend         = "postgres"

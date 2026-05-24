@@ -17,6 +17,16 @@ pub enum WebhookEvent {
         visibility: String,
         version: u32,
         created_at: DateTime<Utc>,
+        /// `derived_from` ctx_ids carried on the publish request. The
+        /// control plane builds lineage graphs from the event stream;
+        /// without this it can only reconstruct lineage via `lineage_id`
+        /// and loses cross-lineage provenance.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        derived_from: Vec<String>,
+        /// Optional `X-Run-Id` correlation id from the publish request,
+        /// used to link the event back to an orchestrator run record.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
     },
     /// A context was retrieved by an authenticated caller (visibility-filtered).
     ContextRetrieved {

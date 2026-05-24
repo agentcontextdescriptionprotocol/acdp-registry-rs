@@ -70,6 +70,15 @@ impl SqliteStore {
     fn block_on<F: std::future::Future<Output = T>, T>(&self, fut: F) -> T {
         tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(fut))
     }
+
+    /// Borrow the underlying connection pool. Used by the server binary to
+    /// hand the same pool to `SqliteChallengeStore` / `SqliteRevocationStore`
+    /// instead of standing up a parallel pool — and to drop the previous
+    /// `InMemoryChallengeStore` wiring that left migration 003's table
+    /// orphaned (BUG-06).
+    pub fn pool(&self) -> &sqlx::SqlitePool {
+        &self.pool
+    }
 }
 
 // ── ExtendedRegistryStore ────────────────────────────────────────────────────
@@ -122,6 +131,14 @@ impl ExtendedRegistryStore for SqliteStore {
             .await
             .map_err(|e| AcdpError::RegistryInternal(format!("list: {e}")))?;
 
+        // BUG-01: emit a `next_cursor` only when the DB had another row
+        // past the page boundary — measured by comparing the row count
+        // against the SQL `LIMIT limit+1` sentinel, not against the
+        // post-visibility-filter `items.len()`. Comparing against
+        // `items.len()` falsely fires whenever the in-Rust filter drops a
+        // row on the final page, sending the client to a phantom next
+        // page that returns empty.
+        let has_more_in_db = rows.len() > limit as usize;
         let mut items = Vec::new();
         for r in rows.iter().take(limit as usize) {
             let body_json: String = r.try_get("body_json").map_err(map_sqlx_err)?;
@@ -133,7 +150,7 @@ impl ExtendedRegistryStore for SqliteStore {
                 items.push(ctx);
             }
         }
-        let next_cursor = if rows.len() > items.len() {
+        let next_cursor = if has_more_in_db {
             items.last().map(|c| {
                 encode_cursor(c.body.created_at.timestamp_millis(), c.body.ctx_id.as_str())
             })
@@ -620,19 +637,43 @@ impl RegistryStore for SqliteStore {
                 sql.push_str(" AND json_extract(body_json, '$.data_period.end') <= ?");
                 binds.push(before.to_rfc3339());
             }
-            sql.push_str(" ORDER BY created_at DESC, ctx_id ASC");
+
+            // BUG-02: bind the cursor and LIMIT as part of the SQL query so
+            // pagination doesn't fetch the entire matching set into Rust
+            // and discard it. The +1 sentinel lets us tell whether another
+            // page exists. The visibility filter that runs in Rust below
+            // can still drop a few rows, so the returned page size may be
+            // slightly under `limit`; this is the same trade-off
+            // `list_contexts` accepts.
+            let cursor_anchor = params
+                .cursor
+                .as_deref()
+                .map(decode_cursor)
+                .transpose()?
+                .flatten();
+            if let Some((anchor_ts, anchor_id)) = cursor_anchor.as_ref() {
+                sql.push_str(" AND (created_at < ? OR (created_at = ? AND ctx_id > ?))");
+                let anchor_rfc = anchor_ts.to_rfc3339();
+                binds.push(anchor_rfc.clone());
+                binds.push(anchor_rfc);
+                binds.push(anchor_id.clone());
+            }
+            let limit = params.limit.unwrap_or(50).min(100) as usize;
+            sql.push_str(" ORDER BY created_at DESC, ctx_id ASC LIMIT ?");
 
             let mut q = sqlx::query(&sql);
             for b in &binds {
                 q = q.bind(b);
             }
+            q = q.bind((limit as i64) + 1);
             let rows = q.fetch_all(&self.pool).await.map_err(map_sqlx_err)?;
+            let has_more_in_db = rows.len() > limit;
 
             let now = Utc::now();
             let want_status = params.status.as_deref().unwrap_or("active");
 
             let mut matches: Vec<FullContext> = Vec::new();
-            for row in rows {
+            for row in rows.iter().take(limit) {
                 let body_json: String = row.try_get("body_json").map_err(map_sqlx_err)?;
                 let status: String = row.try_get("status").map_err(map_sqlx_err)?;
                 let body: Body = serde_json::from_str(&body_json)
@@ -669,25 +710,8 @@ impl RegistryStore for SqliteStore {
                 matches.push(ctx);
             }
 
-            let total_estimate = Some(matches.len() as u64);
-            let cursor_anchor = params
-                .cursor
-                .as_deref()
-                .map(decode_cursor)
-                .transpose()?
-                .flatten();
-            if let Some((anchor_ts, anchor_id)) = &cursor_anchor {
-                let anchor_ms = anchor_ts.timestamp_millis();
-                matches.retain(|c| {
-                    let ms = c.body.created_at.timestamp_millis();
-                    ms < anchor_ms
-                        || (ms == anchor_ms && c.body.ctx_id.as_str() > anchor_id.as_str())
-                });
-            }
-
-            let limit = params.limit.unwrap_or(50).min(100) as usize;
-            let next_cursor = if matches.len() > limit {
-                matches.get(limit - 1).map(|c| {
+            let next_cursor = if has_more_in_db {
+                matches.last().map(|c| {
                     encode_cursor(c.body.created_at.timestamp_millis(), c.body.ctx_id.as_str())
                 })
             } else {
@@ -696,7 +720,6 @@ impl RegistryStore for SqliteStore {
 
             let projected: Vec<SearchResult> = matches
                 .iter()
-                .take(limit)
                 .map(|ctx| SearchResult {
                     ctx_id: ctx.body.ctx_id.clone(),
                     lineage_id: ctx.body.lineage_id.clone(),
@@ -711,9 +734,13 @@ impl RegistryStore for SqliteStore {
                 })
                 .collect();
 
+            // DESIGN-05: total_estimate was previously the matches count of
+            // the current page, which is always ≤ limit and misleads any
+            // client trying to render "showing N of M". Returning `None`
+            // is honest until a separate COUNT(*) query is added.
             Ok(SearchResponse {
                 matches: projected,
-                total_estimate,
+                total_estimate: None,
                 next_cursor,
             })
         })
@@ -756,10 +783,7 @@ async fn insert_body<'c>(
         Visibility::Restricted => "restricted",
         Visibility::Private => "private",
     };
-    let context_type = serde_json::to_value(&body.context_type)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_default();
+    let context_type = context_type_str(&body.context_type);
 
     sqlx::query(
         "INSERT INTO contexts (\
@@ -816,6 +840,21 @@ fn full_context(body: Body, status: Status) -> FullContext {
         },
         registry_receipt: None,
         extensions: Default::default(),
+    }
+}
+
+/// DESIGN-04: typed accessor for the wire-form of `ContextType`. The prior
+/// implementation went through `serde_json::to_value(...).as_str()`, which
+/// silently produced an empty string for any future multi-field variant.
+/// Matching directly on the enum also avoids an allocation per insert.
+fn context_type_str(t: &acdp::types::primitives::ContextType) -> String {
+    use acdp::types::primitives::ContextType;
+    match t {
+        ContextType::DataSnapshot => "data_snapshot".into(),
+        ContextType::Analysis => "analysis".into(),
+        ContextType::Prediction => "prediction".into(),
+        ContextType::Alert => "alert".into(),
+        ContextType::Custom(s) => s.clone(),
     }
 }
 

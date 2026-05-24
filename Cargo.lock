@@ -110,6 +110,7 @@ dependencies = [
  "dotenvy",
  "http-body-util",
  "rand 0.8.6",
+ "serde",
  "serde_json",
  "serial_test",
  "sqlx",
@@ -170,6 +171,7 @@ dependencies = [
 name = "acdp-registry-webhook"
 version = "0.1.0"
 dependencies = [
+ "acdp",
  "acdp-registry-types",
  "chrono",
  "hex",
