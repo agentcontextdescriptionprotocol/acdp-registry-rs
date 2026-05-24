@@ -4,12 +4,17 @@
 
 pub mod challenge_store;
 pub mod jwt;
+pub mod revocation_store;
 pub mod service;
 
 pub use challenge_store::{
     ChallengeRecord, ChallengeStore, InMemoryChallengeStore, PgChallengeStore, SqliteChallengeStore,
 };
 pub use jwt::{JwtSecret, JwtSigner};
+pub use revocation_store::{
+    InMemoryRevocationStore, PgRevocationStore, RevocationRecord, RevocationStore,
+    SqliteRevocationStore,
+};
 pub use service::{extract_bearer, AuthService};
 
 use acdp_registry_types::RegistryError;

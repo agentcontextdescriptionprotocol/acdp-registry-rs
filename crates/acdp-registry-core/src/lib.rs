@@ -13,9 +13,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use acdp_registry_store::ExtendedRegistryStore;
+use axum::http::{HeaderName, HeaderValue, Method};
 use axum::routing::{get, post};
 use axum::Router;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
@@ -30,6 +32,8 @@ use tower_http::trace::TraceLayer;
 pub fn build_router<S: ExtendedRegistryStore + 'static>(state: AppState<S>) -> Router {
     let admin = admin_router::<S>();
     let auth_enabled = state.config.auth.enabled;
+    let body_limit = state.config.limits.max_payload_bytes;
+    let cors = build_cors_layer(&state.config.registry.cors.allowed_origins);
 
     let mut router = Router::new()
         // Capabilities + health
@@ -47,7 +51,8 @@ pub fn build_router<S: ExtendedRegistryStore + 'static>(state: AppState<S>) -> R
     if auth_enabled {
         router = router
             .route("/auth/challenge", post(handlers::issue_challenge::<S>))
-            .route("/auth/token", post(handlers::issue_token::<S>));
+            .route("/auth/token", post(handlers::issue_token::<S>))
+            .route("/auth/token/revoke", post(handlers::revoke_token::<S>));
     }
 
     router
@@ -57,7 +62,40 @@ pub fn build_router<S: ExtendedRegistryStore + 'static>(state: AppState<S>) -> R
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(TraceLayer::new_for_http())
         .layer(TimeoutLayer::new(Duration::from_secs(30)))
-        .layer(CorsLayer::permissive())
+        // SEC-06: cap every request body uniformly. The publish handler
+        // used to perform this check inline; the layer applies it to
+        // `/auth/challenge` and `/auth/token` as well so an unauthenticated
+        // caller can't push arbitrarily-large JSON at those routes.
+        .layer(RequestBodyLimitLayer::new(
+            usize::try_from(body_limit).unwrap_or(usize::MAX),
+        ))
+        .layer(cors)
+}
+
+/// SEC-02: build a CORS layer driven by `[registry.cors] allowed_origins`.
+///
+/// Default (empty list) sends no CORS headers — third-party origins
+/// cannot make cross-origin authenticated requests using a visitor's
+/// stored bearer token. `CorsLayer::permissive()` (the prior default)
+/// unconditionally set `Access-Control-Allow-Origin: *`, which was
+/// inappropriate for a registry that serves restricted/private contexts.
+fn build_cors_layer(allowed_origins: &[String]) -> CorsLayer {
+    if allowed_origins.is_empty() {
+        return CorsLayer::new();
+    }
+    let parsed: Vec<HeaderValue> = allowed_origins
+        .iter()
+        .filter_map(|o| HeaderValue::from_str(o).ok())
+        .collect();
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(parsed))
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers([
+            HeaderName::from_static("authorization"),
+            HeaderName::from_static("content-type"),
+            HeaderName::from_static("idempotency-key"),
+            HeaderName::from_static("x-run-id"),
+        ])
 }
 
 #[cfg(feature = "playground")]

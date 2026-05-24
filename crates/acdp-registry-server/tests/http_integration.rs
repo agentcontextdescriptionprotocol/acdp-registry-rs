@@ -63,6 +63,13 @@ fn caps() -> CapabilitiesDocument {
 }
 
 fn config(playground: bool) -> RegistryConfig {
+    // Tests expect anonymous reads to surface published public contexts.
+    // The new shipped default for `anonymous_public_reads` is `false`
+    // (SEC-07 / CLAUDE.md), so opt in explicitly inside the test harness.
+    let auth = AuthConfig {
+        anonymous_public_reads: true,
+        ..AuthConfig::default()
+    };
     RegistryConfig {
         registry: RegistrySection {
             authority: AUTHORITY.into(),
@@ -70,6 +77,8 @@ fn config(playground: bool) -> RegistryConfig {
             bind: "0.0.0.0".into(),
             profiles: vec!["acdp-registry-core".into()],
             tls: Default::default(),
+            cross_registry_resolution: true,
+            cors: Default::default(),
         },
         storage: StorageConfig {
             backend: StorageBackend::Sqlite,
@@ -77,7 +86,7 @@ fn config(playground: bool) -> RegistryConfig {
             sqlite_path: None,
             max_connections: 1,
         },
-        auth: AuthConfig::default(),
+        auth,
         webhook: WebhookConfig::default(),
         limits: LimitsConfig::default(),
         playground: PlaygroundConfig {
@@ -120,6 +129,7 @@ async fn harness(playground: bool) -> Harness {
         auth,
         webhook: None,
         config: config(playground),
+        cross_registry: None,
     };
     Harness {
         router: build_router(state),
@@ -435,6 +445,196 @@ async fn auth_routes_absent_when_disabled() {
         StatusCode::NOT_FOUND,
         "auth routes should be unmounted when auth.enabled = false"
     );
+}
+
+#[tokio::test]
+async fn search_visibility_filter_narrows_results() {
+    // FEAT-07: ?visibility=public must drop a published-restricted row
+    // from the same producer's search results, even though the requester
+    // (anonymous in this test) is already gated by the disclosure rules.
+    let h = harness(true).await;
+    let app = &h.router;
+    let req_pub = producer(20)
+        .publish_request()
+        .title("filterable-public")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let req_restricted = producer(20)
+        .publish_request()
+        .title("filterable-restricted")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Restricted)
+        .audience(vec![AgentDid::new("did:web:agents.test:audience-x")])
+        .build()
+        .unwrap();
+    publish(app, &req_pub, None).await;
+    publish(app, &req_restricted, None).await;
+
+    // Anonymous caller, no visibility filter: only the public row passes
+    // disclosure (the restricted one is filtered by the store predicate).
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/contexts/search?q=filterable")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = body_to_json(resp).await;
+    let matches = v["matches"].as_array().unwrap();
+    assert_eq!(
+        matches.len(),
+        1,
+        "anonymous disclosure dropped the restricted row"
+    );
+    assert_eq!(matches[0]["title"], "filterable-public");
+
+    // Same query with ?visibility=public — same result.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/contexts/search?q=filterable&visibility=public")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = body_to_json(resp).await;
+    let matches = v["matches"].as_array().unwrap();
+    assert_eq!(matches.len(), 1);
+
+    // ?visibility=private must yield zero (anonymous can never see private).
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/contexts/search?q=filterable&visibility=private")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = body_to_json(resp).await;
+    assert_eq!(v["matches"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn health_503_when_storage_pool_closed() {
+    // BUG-05: /healthz returns 503 + status "degraded" when the storage
+    // health check fails. Realised by closing the SQLite pool out from
+    // under the running server.
+    let db = tempfile::Builder::new()
+        .prefix("acdp-degraded-")
+        .suffix(".sqlite")
+        .tempfile()
+        .unwrap();
+    let store = SqliteStore::connect(db.path(), 1).await.unwrap();
+    store.migrate().await.unwrap();
+    // Close the pool: subsequent health() calls will fail.
+    store.pool().close().await;
+
+    let server = Arc::new(RegistryServer::try_new(store, caps(), AUTHORITY).unwrap());
+    let challenges: Arc<dyn ChallengeStore> = Arc::new(InMemoryChallengeStore::new());
+    let secret = JwtSecret::from_bytes(&[42u8; 32]);
+    let signer = JwtSigner::new(secret, format!("did:web:{AUTHORITY}"), AUTHORITY.into(), 30);
+    let resolver = Arc::new(WebResolver::new());
+    let auth = Arc::new(AuthService::new(
+        AuthConfig::default(),
+        challenges,
+        signer,
+        resolver,
+        AUTHORITY.into(),
+    ));
+    let state = AppStateInner {
+        server,
+        auth,
+        webhook: None,
+        config: config(true),
+        cross_registry: None,
+    };
+    let app = build_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "load balancers gate traffic on 503; degraded must not return 200"
+    );
+    let v = body_to_json(resp).await;
+    assert_eq!(v["status"], "degraded");
+    assert_eq!(v["storage"], false);
+}
+
+#[tokio::test]
+async fn revoke_returns_503_when_revocations_not_configured() {
+    // Doc contract on `revoke_token`: 503 when the registry started
+    // without a revocation store. Default builds always wire one, so
+    // this path needs a custom harness that mounts /auth/* but skips
+    // `AuthService::with_revocations`.
+    let db = tempfile::Builder::new()
+        .prefix("acdp-no-rev-")
+        .suffix(".sqlite")
+        .tempfile()
+        .unwrap();
+    let store = SqliteStore::connect(db.path(), 1).await.unwrap();
+    store.migrate().await.unwrap();
+    let server = Arc::new(RegistryServer::try_new(store, caps(), AUTHORITY).unwrap());
+    let challenges: Arc<dyn ChallengeStore> = Arc::new(InMemoryChallengeStore::new());
+    let secret = JwtSecret::from_bytes(&[42u8; 32]);
+    let signer = JwtSigner::new(secret, format!("did:web:{AUTHORITY}"), AUTHORITY.into(), 30);
+    let resolver = Arc::new(WebResolver::new());
+    let auth = Arc::new(AuthService::new(
+        AuthConfig {
+            enabled: true,
+            anonymous_public_reads: true,
+            ..AuthConfig::default()
+        },
+        challenges,
+        signer,
+        resolver,
+        AUTHORITY.into(),
+    ));
+    let mut cfg = config(true);
+    cfg.auth.enabled = true;
+    let state = AppStateInner {
+        server,
+        auth,
+        webhook: None,
+        config: cfg,
+        cross_registry: None,
+    };
+    let app = build_router(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/token/revoke")
+                .header("Content-Type", "application/json")
+                .body(Body::from(json!({"jti": "anything"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "revoke endpoint must signal 503 when the feature isn't wired, not 500"
+    );
+    let v = body_to_json(resp).await;
+    assert_eq!(v["error"]["code"], "service_unavailable");
 }
 
 #[tokio::test]

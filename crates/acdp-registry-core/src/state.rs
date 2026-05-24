@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use acdp::client::CrossRegistryResolver;
 use acdp::registry::RegistryServer;
 use acdp_registry_auth::AuthService;
 use acdp_registry_store::ExtendedRegistryStore;
@@ -16,4 +17,8 @@ pub struct AppStateInner<S: ExtendedRegistryStore> {
     pub auth: Arc<AuthService>,
     pub webhook: Option<WebhookEmitter>,
     pub config: RegistryConfig,
+    /// FEAT-01: cross-registry resolver consulted by `retrieve` when the
+    /// requested `ctx_id`'s authority differs from this registry's
+    /// `config.registry.authority`. `None` disables forwarding.
+    pub cross_registry: Option<Arc<CrossRegistryResolver>>,
 }
