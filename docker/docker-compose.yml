@@ -1,14 +1,21 @@
+# OPS-02: every secret-bearing variable is now sourced from a sibling
+# `.env` file (or the operator's environment). The `${VAR:-default}`
+# substitution keeps the compose file usable for local demos via the
+# placeholder defaults, while the startup-time validator (see main.rs)
+# refuses to launch when ACDP_REGISTRY_AUTH__JWT_SECRET is the literal
+# `changeme`. Generate a real one with `openssl rand -base64 32`.
+
 services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: acdp
-      POSTGRES_PASSWORD: acdp
-      POSTGRES_DB: acdp_registry
+      POSTGRES_USER: ${POSTGRES_USER:-acdp}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-acdp}
+      POSTGRES_DB: ${POSTGRES_DB:-acdp_registry}
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U acdp"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-acdp}"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -26,7 +33,10 @@ services:
         condition: service_healthy
     environment:
       ACDP_REGISTRY_CONFIG: /app/config.toml
-      ACDP_REGISTRY_STORAGE__POSTGRES_URL: postgres://acdp:acdp@postgres:5432/acdp_registry
+      ACDP_REGISTRY_STORAGE__POSTGRES_URL: postgres://${POSTGRES_USER:-acdp}:${POSTGRES_PASSWORD:-acdp}@postgres:5432/${POSTGRES_DB:-acdp_registry}
+      # Refuses to start if left at `changeme`. Replace before promoting
+      # to anything non-disposable.
+      ACDP_REGISTRY_AUTH__JWT_SECRET: ${ACDP_REGISTRY_JWT_SECRET:-changeme}
       RUST_LOG: info,acdp=info,acdp_registry=info
     ports:
       - "8443:8443"

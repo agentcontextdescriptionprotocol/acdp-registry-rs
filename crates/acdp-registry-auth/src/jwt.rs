@@ -5,6 +5,7 @@ use std::sync::Arc;
 use acdp_registry_types::BearerClaims;
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation};
 
+use crate::revocation_store::RevocationStore;
 use crate::AuthError;
 
 /// Wraps the raw HMAC secret so the encoding/decoding keys are built once.
@@ -48,6 +49,7 @@ pub struct JwtSigner {
     pub issuer: String,
     pub registry_authority: String,
     pub leeway_seconds: u64,
+    revocations: Option<Arc<dyn RevocationStore>>,
 }
 
 impl JwtSigner {
@@ -62,7 +64,15 @@ impl JwtSigner {
             issuer,
             registry_authority,
             leeway_seconds,
+            revocations: None,
         }
+    }
+
+    /// Attach a revocation store. `validate` will reject any token whose
+    /// `jti` is present and unexpired in the store.
+    pub fn with_revocations(mut self, store: Arc<dyn RevocationStore>) -> Self {
+        self.revocations = Some(store);
+        self
     }
 
     pub fn sign(&self, claims: &BearerClaims) -> Result<String, AuthError> {
@@ -83,6 +93,14 @@ impl JwtSigner {
                 "wrong registry: claim '{}' vs '{}'",
                 data.claims.acdp.registry, self.registry_authority
             )));
+        }
+        if let Some(rev) = &self.revocations {
+            if rev.is_revoked(&data.claims.jti)? {
+                return Err(AuthError::TokenInvalid(format!(
+                    "token jti '{}' has been revoked",
+                    data.claims.jti
+                )));
+            }
         }
         Ok(data.claims)
     }

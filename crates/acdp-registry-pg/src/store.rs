@@ -33,6 +33,14 @@ impl PgStore {
     fn block_on<F: std::future::Future<Output = T>, T>(&self, fut: F) -> T {
         tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(fut))
     }
+
+    /// Borrow the underlying connection pool. Used by the server binary
+    /// for crash-safe `PgChallengeStore` / `PgRevocationStore` wiring
+    /// (BUG-06). The previous code held an `InMemoryChallengeStore` even
+    /// in the Postgres build, which broke handshakes across replicas.
+    pub fn pool(&self) -> &sqlx::PgPool {
+        &self.pool
+    }
 }
 
 #[async_trait]
@@ -62,23 +70,38 @@ impl ExtendedRegistryStore for PgStore {
         let limit = limit.clamp(1, 200) as i64;
         let anchor = cursor.map(decode_cursor).transpose()?.flatten();
 
+        // BUG-03: bind the LIMIT instead of concatenating it. The value
+        // is range-clamped above so there is no injection risk today, but
+        // the inline pattern was contrary to every other query in this
+        // file and is fragile if the clamp is ever loosened.
         let mut q = String::from("SELECT body_json, status FROM contexts WHERE 1=1");
+        let mut next_pos = 1usize;
         if anchor.is_some() {
-            // Keyset compare with ctx_id tiebreaker for stable pagination when
-            // multiple rows share a created_at.
-            q.push_str(" AND (created_at < $1 OR (created_at = $1 AND ctx_id > $2))");
+            q.push_str(&format!(
+                " AND (created_at < ${a} OR (created_at = ${a} AND ctx_id > ${b}))",
+                a = next_pos,
+                b = next_pos + 1
+            ));
+            next_pos += 2;
         }
-        q.push_str(" ORDER BY created_at DESC, ctx_id ASC LIMIT ");
-        // Bind limit inline since sqlx 0.8 doesn't allow more bind positions
-        // after the optional ones cleanly; use a literal.
-        q.push_str(&(limit + 1).to_string());
+        q.push_str(&format!(
+            " ORDER BY created_at DESC, ctx_id ASC LIMIT ${}",
+            next_pos
+        ));
 
         let mut query = sqlx::query(&q);
         if let Some((anchor_ts, anchor_ctx)) = anchor.as_ref() {
             query = query.bind(*anchor_ts).bind(anchor_ctx);
         }
+        query = query.bind(limit + 1);
         let rows = query.fetch_all(&self.pool).await.map_err(map_sqlx_err)?;
 
+        // BUG-01: cursor signal must compare against the DB sentinel
+        // (`limit + 1` rows fetched), not against the post-visibility-
+        // filter item count. The previous comparison sent clients on a
+        // phantom next page whenever the in-Rust filter dropped a row on
+        // the final DB page.
+        let has_more_in_db = rows.len() > limit as usize;
         let mut items = Vec::new();
         for r in rows.iter().take(limit as usize) {
             let body_json: serde_json::Value = r.try_get("body_json").map_err(map_sqlx_err)?;
@@ -90,7 +113,7 @@ impl ExtendedRegistryStore for PgStore {
                 items.push(ctx);
             }
         }
-        let next_cursor = if rows.len() > items.len() {
+        let next_cursor = if has_more_in_db {
             items.last().map(|c| {
                 encode_cursor(c.body.created_at.timestamp_millis(), c.body.ctx_id.as_str())
             })
@@ -580,7 +603,31 @@ impl RegistryStore for PgStore {
                 binds.push(Bind::Ts(before));
             }
 
-            sql.push_str(" ORDER BY created_at DESC, ctx_id ASC");
+            // BUG-02: bind the cursor predicate AND the per-page LIMIT so
+            // search doesn't fetch the entire matching set into memory
+            // before discarding everything past the page. On a registry
+            // with thousands of matching rows this would allocate and
+            // drop them on every paginated call.
+            let cursor_anchor = params
+                .cursor
+                .as_deref()
+                .map(decode_cursor)
+                .transpose()?
+                .flatten();
+            if let Some((anchor_ts, anchor_id)) = cursor_anchor.as_ref() {
+                let a = next();
+                let b = next();
+                sql.push_str(&format!(
+                    " AND (created_at < ${a} OR (created_at = ${a} AND ctx_id > ${b}))",
+                ));
+                binds.push(Bind::Ts(*anchor_ts));
+                binds.push(Bind::Str(anchor_id.clone()));
+            }
+            let limit = params.limit.unwrap_or(50).min(100) as usize;
+            sql.push_str(&format!(
+                " ORDER BY created_at DESC, ctx_id ASC LIMIT ${}",
+                next()
+            ));
 
             let mut query = sqlx::query(&sql);
             for b in &binds {
@@ -590,12 +637,14 @@ impl RegistryStore for PgStore {
                     Bind::TextArray(v) => query.bind(v),
                 };
             }
+            query = query.bind((limit as i64) + 1);
             let rows = query.fetch_all(&self.pool).await.map_err(map_sqlx_err)?;
+            let has_more_in_db = rows.len() > limit;
 
             let now = Utc::now();
             let want_status = params.status.as_deref().unwrap_or("active");
             let mut matches: Vec<FullContext> = Vec::new();
-            for r in rows {
+            for r in rows.iter().take(limit) {
                 let body_json: serde_json::Value = r.try_get("body_json").map_err(map_sqlx_err)?;
                 let status: String = r.try_get("status").map_err(map_sqlx_err)?;
                 let body: Body = serde_json::from_value(body_json)
@@ -617,25 +666,8 @@ impl RegistryStore for PgStore {
                 matches.push(ctx);
             }
 
-            let total_estimate = Some(matches.len() as u64);
-            let cursor_anchor = params
-                .cursor
-                .as_deref()
-                .map(decode_cursor)
-                .transpose()?
-                .flatten();
-            if let Some((anchor_ts, anchor_id)) = &cursor_anchor {
-                let anchor_ms = anchor_ts.timestamp_millis();
-                matches.retain(|c| {
-                    let ms = c.body.created_at.timestamp_millis();
-                    ms < anchor_ms
-                        || (ms == anchor_ms && c.body.ctx_id.as_str() > anchor_id.as_str())
-                });
-            }
-
-            let limit = params.limit.unwrap_or(50).min(100) as usize;
-            let next_cursor = if matches.len() > limit {
-                matches.get(limit - 1).map(|c| {
+            let next_cursor = if has_more_in_db {
+                matches.last().map(|c| {
                     encode_cursor(c.body.created_at.timestamp_millis(), c.body.ctx_id.as_str())
                 })
             } else {
@@ -644,7 +676,6 @@ impl RegistryStore for PgStore {
 
             let projected: Vec<SearchResult> = matches
                 .iter()
-                .take(limit)
                 .map(|ctx| SearchResult {
                     ctx_id: ctx.body.ctx_id.clone(),
                     lineage_id: ctx.body.lineage_id.clone(),
@@ -659,9 +690,11 @@ impl RegistryStore for PgStore {
                 })
                 .collect();
 
+            // DESIGN-05: dropped the page-local count masquerading as a
+            // registry-wide total. See SqliteStore::search for context.
             Ok(SearchResponse {
                 matches: projected,
-                total_estimate,
+                total_estimate: None,
                 next_cursor,
             })
         })
@@ -709,10 +742,7 @@ async fn insert_body<'c>(
         Visibility::Restricted => "restricted",
         Visibility::Private => "private",
     };
-    let context_type = serde_json::to_value(&body.context_type)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_default();
+    let context_type = context_type_str(&body.context_type);
 
     sqlx::query(
         "INSERT INTO contexts (\
@@ -776,6 +806,19 @@ fn full_context(body: Body, status: Status) -> FullContext {
         },
         registry_receipt: None,
         extensions: Default::default(),
+    }
+}
+
+/// DESIGN-04: typed accessor for the wire-form of `ContextType`. See the
+/// SQLite store for the rationale.
+fn context_type_str(t: &acdp::types::primitives::ContextType) -> String {
+    use acdp::types::primitives::ContextType;
+    match t {
+        ContextType::DataSnapshot => "data_snapshot".into(),
+        ContextType::Analysis => "analysis".into(),
+        ContextType::Prediction => "prediction".into(),
+        ContextType::Alert => "alert".into(),
+        ContextType::Custom(s) => s.clone(),
     }
 }
 

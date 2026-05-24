@@ -18,6 +18,28 @@ use chrono::{DateTime, Utc};
 
 use crate::AuthError;
 
+/// Map a sqlx error to either `ChallengeReplay` (on a unique-constraint
+/// violation — duplicate nonce) or generic `Storage`. Keeps DB backends
+/// behaviorally consistent with `InMemoryChallengeStore::put`, which
+/// returns `ChallengeReplay` on duplicate inserts. Without this mapping
+/// log alerting and client-visible error codes diverge across backends.
+fn map_insert_err(e: sqlx::Error) -> AuthError {
+    if let sqlx::Error::Database(db_err) = &e {
+        // Postgres: SQLSTATE 23505 (unique_violation).
+        // SQLite: extended code 2067 / primary code 19 (constraint violation).
+        let is_unique = db_err.code().as_deref() == Some("23505")
+            || db_err.code().as_deref() == Some("2067")
+            || db_err
+                .message()
+                .to_ascii_lowercase()
+                .contains("unique constraint");
+        if is_unique {
+            return AuthError::ChallengeReplay("duplicate nonce".into());
+        }
+    }
+    AuthError::Storage(e.to_string())
+}
+
 /// A stored challenge.
 ///
 /// The `agent_id` is bound at issuance so a peer can't steal the nonce + signing
@@ -123,7 +145,7 @@ impl ChallengeStore for SqliteChallengeStore {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|e| AuthError::Storage(e.to_string()))
+        .map_err(map_insert_err)
     }
 
     async fn take(&self, nonce: &str) -> Result<Option<ChallengeRecord>, AuthError> {
@@ -197,7 +219,7 @@ impl ChallengeStore for PgChallengeStore {
             .execute(&self.pool)
             .await
             .map(|_| ())
-            .map_err(|e| AuthError::Storage(e.to_string()))
+            .map_err(map_insert_err)
     }
 
     async fn take(&self, nonce: &str) -> Result<Option<ChallengeRecord>, AuthError> {
@@ -272,6 +294,38 @@ mod tests {
         store.put(rec.clone()).await.unwrap();
         let err = store.put(rec).await.unwrap_err();
         assert!(matches!(err, AuthError::ChallengeReplay(_)));
+    }
+
+    #[tokio::test]
+    async fn sqlite_put_duplicate_nonce_returns_challenge_replay() {
+        // BUG-04: the SQLite store used to surface the unique-constraint
+        // violation as the generic `AuthError::Storage`, diverging from
+        // `InMemoryChallengeStore::put` which returns `ChallengeReplay`.
+        // After the fix the DB and in-memory variants behave identically.
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE auth_challenges (
+                nonce TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let store = SqliteChallengeStore::new(pool);
+        let rec = ChallengeRecord {
+            nonce: "dup".into(),
+            agent_id: "did:web:agent.example".into(),
+            expires_at: Utc::now() + chrono::Duration::seconds(60),
+        };
+        store.put(rec.clone()).await.unwrap();
+        let err = store.put(rec).await.unwrap_err();
+        assert!(
+            matches!(err, AuthError::ChallengeReplay(_)),
+            "expected ChallengeReplay, got {err:?}"
+        );
     }
 
     #[tokio::test]
