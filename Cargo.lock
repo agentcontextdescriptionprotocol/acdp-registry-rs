@@ -59,6 +59,7 @@ dependencies = [
  "acdp-registry-webhook",
  "async-trait",
  "axum",
+ "base64",
  "chrono",
  "http",
  "serde",
@@ -164,6 +165,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+ "toml",
  "url",
 ]
 

@@ -27,3 +27,6 @@ http       = { version = "1", optional = true }
 [features]
 default = ["axum"]
 axum    = ["dep:axum", "dep:http"]
+
+[dev-dependencies]
+toml = { workspace = true }
