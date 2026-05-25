@@ -141,8 +141,7 @@ mod tests {
     fn empty_pinned_list_is_skipped() {
         let key = SigningKey::generate();
         let (req, _) = build_signed_request(key, "did:web:x:agents:alice");
-        let outcome =
-            enforce_pinned_signature(&req, &cfg(vec![], false)).unwrap();
+        let outcome = enforce_pinned_signature(&req, &cfg(vec![], false)).unwrap();
         assert_eq!(outcome, PinOutcome::Skipped);
     }
 
@@ -156,8 +155,7 @@ mod tests {
             public_key_b64: pub_b64,
             algorithm: "ed25519".into(),
         };
-        let outcome =
-            enforce_pinned_signature(&req, &cfg(vec![pinned], false)).unwrap();
+        let outcome = enforce_pinned_signature(&req, &cfg(vec![pinned], false)).unwrap();
         assert_eq!(outcome, PinOutcome::Verified);
     }
 
@@ -169,15 +167,14 @@ mod tests {
 
         // Different key → mismatch → InvalidSignature
         let wrong = SigningKey::generate();
-        let wrong_pub = base64::engine::general_purpose::STANDARD
-            .encode(wrong.verifying_key_bytes());
+        let wrong_pub =
+            base64::engine::general_purpose::STANDARD.encode(wrong.verifying_key_bytes());
         let pinned = PinnedAgentKey {
             agent_did: did.into(),
             public_key_b64: wrong_pub,
             algorithm: "ed25519".into(),
         };
-        let err =
-            enforce_pinned_signature(&req, &cfg(vec![pinned], false)).unwrap_err();
+        let err = enforce_pinned_signature(&req, &cfg(vec![pinned], false)).unwrap_err();
         let msg = format!("{err:?}");
         assert!(
             msg.contains("InvalidSignature") || msg.contains("signature"),
@@ -194,8 +191,7 @@ mod tests {
             public_key_b64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
             algorithm: "ed25519".into(),
         };
-        let outcome =
-            enforce_pinned_signature(&req, &cfg(vec![pinned_for_other], false)).unwrap();
+        let outcome = enforce_pinned_signature(&req, &cfg(vec![pinned_for_other], false)).unwrap();
         assert_eq!(outcome, PinOutcome::Unpinned);
     }
 
@@ -208,8 +204,7 @@ mod tests {
             public_key_b64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
             algorithm: "ed25519".into(),
         };
-        let err =
-            enforce_pinned_signature(&req, &cfg(vec![pinned_for_other], true)).unwrap_err();
+        let err = enforce_pinned_signature(&req, &cfg(vec![pinned_for_other], true)).unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("not in playground.pinned_keys"), "got {msg}");
     }
@@ -224,8 +219,7 @@ mod tests {
             public_key_b64: pub_b64,
             algorithm: "ecdsa-p256".into(),
         };
-        let err =
-            enforce_pinned_signature(&req, &cfg(vec![pinned], false)).unwrap_err();
+        let err = enforce_pinned_signature(&req, &cfg(vec![pinned], false)).unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("ecdsa-p256"), "got {msg}");
     }
@@ -240,8 +234,7 @@ mod tests {
             public_key_b64: "not-base64!!!".into(),
             algorithm: "ed25519".into(),
         };
-        let err =
-            enforce_pinned_signature(&req, &cfg(vec![pinned], false)).unwrap_err();
+        let err = enforce_pinned_signature(&req, &cfg(vec![pinned], false)).unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("base64"), "got {msg}");
     }
@@ -258,8 +251,7 @@ mod tests {
             public_key_b64: too_short,
             algorithm: "ed25519".into(),
         };
-        let err =
-            enforce_pinned_signature(&req, &cfg(vec![pinned], false)).unwrap_err();
+        let err = enforce_pinned_signature(&req, &cfg(vec![pinned], false)).unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("32"), "got {msg}");
     }

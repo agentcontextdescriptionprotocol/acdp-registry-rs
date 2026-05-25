@@ -10,10 +10,14 @@
 //! - `/healthz`
 //! - `/.well-known/acdp.json`
 //! - publish → retrieve → search round trip
+//! - `/contexts/{ctx_id}/body` bare-Body response
+//! - `/lineages/{id}` and `/lineages/{id}/current` (round trip + 404)
 //! - visibility filtering for restricted contexts
 //! - Idempotency-Key replay and collision
 //! - list pagination across same-second created_at
 //! - webhook absence when disabled
+//! - 413 enforcement on `RequestBodyLimitLayer`
+//! - playground pinned-key strict/lax/wrong-key paths
 
 #![cfg(feature = "storage-sqlite")]
 
@@ -32,11 +36,12 @@ use acdp_registry_core::{build_router, AppStateInner};
 use acdp_registry_sqlite::SqliteStore;
 use acdp_registry_store::ExtendedRegistryStore;
 use acdp_registry_types::{
-    AuthConfig, LimitsConfig, PlaygroundConfig, RegistryConfig, RegistrySection, StorageBackend,
-    StorageConfig, WebhookConfig,
+    config::PinnedAgentKey, AuthConfig, LimitsConfig, PlaygroundConfig, RegistryConfig,
+    RegistrySection, StorageBackend, StorageConfig, WebhookConfig,
 };
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -91,6 +96,7 @@ fn config(playground: bool) -> RegistryConfig {
         limits: LimitsConfig::default(),
         playground: PlaygroundConfig {
             enabled: playground,
+            ..Default::default()
         },
     }
 }
@@ -679,4 +685,389 @@ async fn search_and_tokens_intersect() {
         "AND-of-tokens: only the 'foo bar baz' doc should match, got {v}"
     );
     assert_eq!(matches[0]["title"], "foo bar baz");
+}
+
+#[tokio::test]
+async fn retrieve_body_returns_bare_body() {
+    // `/contexts/{ctx_id}/body` returns the producer-signed Body directly
+    // (not wrapped in a FullContext envelope). Regression-guards against
+    // accidentally serving FullContext from the body route, which would
+    // leak registry_state and inflate the response.
+    let h = harness(true).await;
+    let app = &h.router;
+    let req = producer(31)
+        .publish_request()
+        .title("body-target")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .summary("body only")
+        .build()
+        .unwrap();
+    let (status, v) = publish(app, &req, None).await;
+    assert_eq!(status, StatusCode::OK, "publish body = {v}");
+    let ctx_id = v["ctx_id"].as_str().unwrap().to_string();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/contexts/{}/body",
+                    pct_encode_path_segment(&ctx_id)
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_to_json(resp).await;
+    assert_eq!(v["title"], "body-target");
+    assert_eq!(v["summary"], "body only");
+    assert_eq!(v["ctx_id"], ctx_id);
+    assert!(
+        v.get("registry_state").is_none(),
+        "/body must return the bare Body, not a FullContext envelope: {v}"
+    );
+}
+
+#[tokio::test]
+async fn lineage_round_trip_lists_versions_and_returns_current() {
+    // Publish v1 → publish v2 superseding v1 → GET /lineages/{id} returns
+    // both versions; GET /lineages/{id}/current returns v2. Exercises the
+    // two lineage HTTP routes end-to-end, which had no direct coverage.
+    let h = harness(true).await;
+    let app = &h.router;
+    let p = producer(40);
+
+    let v1_req = p
+        .publish_request()
+        .title("v1")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (status, v) = publish(app, &v1_req, None).await;
+    assert_eq!(status, StatusCode::OK, "v1 publish body = {v}");
+    let v1_ctx_id = v["ctx_id"].as_str().unwrap().to_string();
+    let lineage_id = v["lineage_id"].as_str().unwrap().to_string();
+
+    // Fetch v1 body and chain v2 from it — `supersede_body` propagates
+    // version + expected_lineage_id, matching what a real producer does.
+    let v1_body_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/contexts/{}/body",
+                    pct_encode_path_segment(&v1_ctx_id)
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v1_body_json = body_to_json(v1_body_resp).await;
+    let v1_body: acdp::types::body::Body = serde_json::from_value(v1_body_json).unwrap();
+
+    let v2_req = p
+        .supersede_body(&v1_body)
+        .title("v2")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (status, v) = publish(app, &v2_req, None).await;
+    assert_eq!(status, StatusCode::OK, "v2 publish body = {v}");
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/lineages/{}",
+                    pct_encode_path_segment(&lineage_id)
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let items = body_to_json(resp).await;
+    let arr = items.as_array().expect("lineage returns array");
+    assert_eq!(arr.len(), 2, "expected 2 versions, got {items}");
+    let titles: Vec<&str> = arr
+        .iter()
+        .map(|i| i["body"]["title"].as_str().unwrap())
+        .collect();
+    assert!(
+        titles.contains(&"v1") && titles.contains(&"v2"),
+        "got {titles:?}"
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/lineages/{}/current",
+                    pct_encode_path_segment(&lineage_id)
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let cur = body_to_json(resp).await;
+    assert_eq!(cur["body"]["title"], "v2");
+    assert_eq!(cur["body"]["version"], 2);
+}
+
+#[tokio::test]
+async fn lineage_unknown_id_returns_404() {
+    let h = harness(true).await;
+    let app = &h.router;
+    // /current is the route that returns 404 on a missing lineage (the
+    // bare /lineages/{id} returns an empty array). Pick a syntactically
+    // valid lineage id with no matching row.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/lineages/{}/current",
+                    pct_encode_path_segment("acdp://registry.test/no-such-lineage")
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let v = body_to_json(resp).await;
+    assert_eq!(v["error"]["code"], "not_found");
+}
+
+#[tokio::test]
+async fn publish_payload_above_limit_rejected() {
+    // The router applies a uniform `RequestBodyLimitLayer` driven by
+    // `limits.max_payload_bytes`. Build a harness with a tiny cap and
+    // verify the layer rejects an over-sized POST with 413 — including
+    // for non-publish routes that share the same limit.
+    let db = tempfile::Builder::new()
+        .prefix("acdp-payload-")
+        .suffix(".sqlite")
+        .tempfile()
+        .unwrap();
+    let store = SqliteStore::connect(db.path(), 1).await.unwrap();
+    store.migrate().await.unwrap();
+    let server = Arc::new(RegistryServer::try_new(store, caps(), AUTHORITY).unwrap());
+    let challenges: Arc<dyn ChallengeStore> = Arc::new(InMemoryChallengeStore::new());
+    let secret = JwtSecret::from_bytes(&[42u8; 32]);
+    let signer = JwtSigner::new(secret, format!("did:web:{AUTHORITY}"), AUTHORITY.into(), 30);
+    let resolver = Arc::new(WebResolver::new());
+    let auth = Arc::new(AuthService::new(
+        AuthConfig::default(),
+        challenges,
+        signer,
+        resolver,
+        AUTHORITY.into(),
+    ));
+    let mut cfg = config(true);
+    cfg.limits.max_payload_bytes = 1024;
+    let state = AppStateInner {
+        server,
+        auth,
+        webhook: None,
+        config: cfg,
+        cross_registry: None,
+    };
+    let app = build_router(state);
+
+    let big = vec![b'x'; 4096];
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/contexts")
+                .header("Content-Type", "application/json")
+                .body(Body::from(big))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "publish payload above limit must return 413, not 400/500"
+    );
+}
+
+#[tokio::test]
+async fn playground_strict_mode_rejects_unknown_agent() {
+    // SEC-08: pinned_only=true forbids any agent_did not in pinned_keys.
+    // Reaches the same enforcement path the unit tests cover, but through
+    // the real router so the error envelope shape is exercised too.
+    let known = SigningKey::from_bytes(&[7u8; 32]);
+    let known_did = "did:web:agents.test:smoke-pinned";
+    let known_pub_b64 = B64.encode(known.verifying_key_bytes());
+
+    let unknown_producer = producer(8);
+
+    let h = harness_with_playground(PlaygroundConfig {
+        enabled: true,
+        pinned_keys: vec![PinnedAgentKey {
+            agent_did: known_did.into(),
+            public_key_b64: known_pub_b64,
+            algorithm: "ed25519".into(),
+        }],
+        pinned_only: true,
+    })
+    .await;
+    let app = &h.router;
+
+    let req = unknown_producer
+        .publish_request()
+        .title("nope")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (status, v) = publish(app, &req, None).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "strict pinned_only must 403 for unknown agents, got {v}"
+    );
+    assert_eq!(v["error"]["code"], "key_not_authorized");
+}
+
+#[tokio::test]
+async fn playground_pinned_agent_with_matching_key_publishes() {
+    // Positive case: a pinned agent publishes with the correct key — the
+    // Ed25519 verifier accepts and the row lands in storage. Confirms the
+    // happy-path wire integration of `enforce_pinned_signature`.
+    let key = SigningKey::from_bytes(&[9u8; 32]);
+    let did = "did:web:agents.test:smoke-pinned-ok";
+    let pub_b64 = B64.encode(key.verifying_key_bytes());
+    let p = Producer::new(key, AgentDid::new(did), format!("{did}#key-1"));
+
+    let h = harness_with_playground(PlaygroundConfig {
+        enabled: true,
+        pinned_keys: vec![PinnedAgentKey {
+            agent_did: did.into(),
+            public_key_b64: pub_b64,
+            algorithm: "ed25519".into(),
+        }],
+        pinned_only: true,
+    })
+    .await;
+    let app = &h.router;
+
+    let req = p
+        .publish_request()
+        .title("pinned-ok")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (status, v) = publish(app, &req, None).await;
+    assert_eq!(status, StatusCode::OK, "pinned publish body = {v}");
+    let ctx_id = v["ctx_id"].as_str().unwrap().to_string();
+
+    // Retrieve to confirm the row actually persisted, not just that the
+    // response 200'd.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/contexts/{}", pct_encode_path_segment(&ctx_id)))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn playground_pinned_agent_with_wrong_key_rejected() {
+    // Negative case: a pinned agent publishes with a *different* signing
+    // key than the one pinned in config. The verifier MUST reject — this
+    // is the whole reason pinned_keys exists.
+    let real_key = SigningKey::from_bytes(&[10u8; 32]);
+    let did = "did:web:agents.test:smoke-pinned-bad";
+    let p = Producer::new(real_key, AgentDid::new(did), format!("{did}#key-1"));
+
+    // Pin a *different* key — verification must fail.
+    let other = SigningKey::from_bytes(&[11u8; 32]);
+    let other_pub_b64 = B64.encode(other.verifying_key_bytes());
+
+    let h = harness_with_playground(PlaygroundConfig {
+        enabled: true,
+        pinned_keys: vec![PinnedAgentKey {
+            agent_did: did.into(),
+            public_key_b64: other_pub_b64,
+            algorithm: "ed25519".into(),
+        }],
+        pinned_only: false,
+    })
+    .await;
+    let app = &h.router;
+
+    let req = p
+        .publish_request()
+        .title("wrong-key")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (status, v) = publish(app, &req, None).await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "pinned agent signing with a non-pinned key must be rejected, got 200 with {v}"
+    );
+}
+
+/// Build a harness with a fully-specified PlaygroundConfig so tests can
+/// inject pinned_keys / pinned_only. The default `harness(playground)`
+/// helper only flips the `enabled` flag, which isn't enough for the
+/// pinned-signature suite.
+async fn harness_with_playground(playground: PlaygroundConfig) -> Harness {
+    let db = tempfile::Builder::new()
+        .prefix("acdp-pin-")
+        .suffix(".sqlite")
+        .tempfile()
+        .unwrap();
+    let store = SqliteStore::connect(db.path(), 1).await.unwrap();
+    store.migrate().await.unwrap();
+    let server = Arc::new(RegistryServer::try_new(store, caps(), AUTHORITY).unwrap());
+    let challenges: Arc<dyn ChallengeStore> = Arc::new(InMemoryChallengeStore::new());
+    let secret = JwtSecret::from_bytes(&[42u8; 32]);
+    let signer = JwtSigner::new(secret, format!("did:web:{AUTHORITY}"), AUTHORITY.into(), 30);
+    let resolver = Arc::new(WebResolver::new());
+    let auth = Arc::new(AuthService::new(
+        AuthConfig::default(),
+        challenges,
+        signer,
+        resolver,
+        AUTHORITY.into(),
+    ));
+    let mut cfg = config(true);
+    cfg.playground = playground;
+    let state = AppStateInner {
+        server,
+        auth,
+        webhook: None,
+        config: cfg,
+        cross_registry: None,
+    };
+    Harness {
+        router: build_router(state),
+        _db: db,
+    }
 }
