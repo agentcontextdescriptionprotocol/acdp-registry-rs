@@ -923,6 +923,8 @@ async fn playground_strict_mode_rejects_unknown_agent() {
             agent_did: known_did.into(),
             public_key_b64: known_pub_b64,
             algorithm: "ed25519".into(),
+            valid_from: None,
+            valid_until: None,
         }],
         pinned_only: true,
     })
@@ -961,6 +963,8 @@ async fn playground_pinned_agent_with_matching_key_publishes() {
             agent_did: did.into(),
             public_key_b64: pub_b64,
             algorithm: "ed25519".into(),
+            valid_from: None,
+            valid_until: None,
         }],
         pinned_only: true,
     })
@@ -1012,6 +1016,8 @@ async fn playground_pinned_agent_with_wrong_key_rejected() {
             agent_did: did.into(),
             public_key_b64: other_pub_b64,
             algorithm: "ed25519".into(),
+            valid_from: None,
+            valid_until: None,
         }],
         pinned_only: false,
     })
