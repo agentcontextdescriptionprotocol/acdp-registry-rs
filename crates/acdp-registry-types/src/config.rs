@@ -276,9 +276,139 @@ impl Default for LimitsConfig {
     }
 }
 
+/// Playground-mode controls.
+///
+/// Playground mode skips the full DID-web verification pipeline so
+/// scenarios can run without standing up real DID documents. To keep
+/// playground demos from accepting impostor publishes, operators can
+/// configure `pinned_keys`: a list of `agent_did -> public_key_b64`
+/// entries the registry MUST verify against before accepting the
+/// publish.
+///
+/// Two enforcement modes:
+///   * **lax** (default, `pinned_only = false`): pinned agents are
+///     verified against their pinned key; agents not in the list are
+///     still accepted. Useful while adding pinning incrementally.
+///   * **strict** (`pinned_only = true`): publishes from agents NOT in
+///     the pinned list are rejected outright. Useful for locked-down
+///     demos.
+///
+/// Verification (base64 decode + Ed25519 signature check against the
+/// pinned key) is performed by the handler in `acdp-registry-core` —
+/// this struct is pure data so the types crate stays crypto-free.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlaygroundConfig {
     #[serde(default)]
     pub enabled: bool,
+    /// Agent identities whose publish signatures must verify against a
+    /// pinned public key. See [`PinnedAgentKey`] for the per-entry
+    /// shape. Empty (the default) means no pinning is enforced.
+    #[serde(default)]
+    pub pinned_keys: Vec<PinnedAgentKey>,
+    /// When true AND `pinned_keys` is non-empty, reject publishes from
+    /// agents not listed in `pinned_keys`. When false (the default),
+    /// unpinned agents are still accepted. Has no effect when
+    /// `pinned_keys` is empty.
+    #[serde(default)]
+    pub pinned_only: bool,
+}
+
+/// One pinned agent identity.
+///
+/// `public_key_b64` MUST be the raw key material (32 bytes for
+/// Ed25519), standard-base64-encoded (44 chars with padding) — the
+/// format `AcdpProducer.public_key_b64` returns.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PinnedAgentKey {
+    /// Full DID, e.g. `did:web:registry-a.playground.local:agents:alice`.
+    pub agent_did: String,
+    /// Standard base64 of the raw public key bytes.
+    pub public_key_b64: String,
+    /// Algorithm tag — currently only `ed25519` is supported. Defaulted
+    /// for forward compatibility.
+    #[serde(default = "default_pinned_algorithm")]
+    pub algorithm: String,
+}
+
+fn default_pinned_algorithm() -> String {
+    "ed25519".into()
+}
+
+impl PlaygroundConfig {
+    /// Look up the pinned entry for an agent_did. Returns `None` when
+    /// the agent isn't pinned (callers check `pinned_only` to decide
+    /// whether that should be a rejection).
+    pub fn pinned_for(&self, agent_did: &str) -> Option<&PinnedAgentKey> {
+        self.pinned_keys.iter().find(|p| p.agent_did == agent_did)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pinned(did: &str, b64: &str) -> PinnedAgentKey {
+        PinnedAgentKey {
+            agent_did: did.into(),
+            public_key_b64: b64.into(),
+            algorithm: default_pinned_algorithm(),
+        }
+    }
+
+    #[test]
+    fn pinned_keys_defaults_remain_empty() {
+        // Backward compat: existing configs without pinned_keys MUST still
+        // deserialize and produce an empty list.
+        let cfg: PlaygroundConfig = toml::from_str("enabled = true").unwrap();
+        assert!(cfg.enabled);
+        assert!(cfg.pinned_keys.is_empty());
+        assert!(!cfg.pinned_only);
+    }
+
+    #[test]
+    fn pinned_keys_round_trip_toml() {
+        let toml = r#"
+enabled = true
+pinned_only = true
+
+[[pinned_keys]]
+agent_did = "did:web:demo.local:agents:alice"
+public_key_b64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+
+[[pinned_keys]]
+agent_did = "did:web:demo.local:agents:bob"
+public_key_b64 = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+algorithm = "ed25519"
+"#;
+        let cfg: PlaygroundConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.pinned_keys.len(), 2);
+        assert!(cfg.pinned_only);
+        assert_eq!(cfg.pinned_keys[0].algorithm, "ed25519");
+        assert_eq!(cfg.pinned_keys[1].algorithm, "ed25519");
+    }
+
+    #[test]
+    fn pinned_for_finds_match() {
+        let cfg = PlaygroundConfig {
+            enabled: true,
+            pinned_only: false,
+            pinned_keys: vec![pinned("did:web:x", "AAAA")],
+        };
+        assert!(cfg.pinned_for("did:web:x").is_some());
+        assert!(cfg.pinned_for("did:web:nope").is_none());
+    }
+
+    #[test]
+    fn unknown_field_rejected() {
+        // `deny_unknown_fields` guards against typos like `pin_keys`.
+        let toml = r#"
+enabled = true
+pin_keys = []
+"#;
+        let err = toml::from_str::<PlaygroundConfig>(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("pin_keys"), "unexpected error: {msg}");
+    }
 }

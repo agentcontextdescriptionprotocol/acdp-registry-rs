@@ -5,6 +5,7 @@
 //! specific storage crate — the binary picks one via Cargo features.
 
 pub mod handlers;
+pub mod playground;
 pub mod state;
 
 pub use state::{AppState, AppStateInner};
