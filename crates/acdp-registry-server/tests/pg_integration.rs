@@ -101,6 +101,7 @@ fn config(playground: bool) -> RegistryConfig {
         limits: LimitsConfig::default(),
         playground: PlaygroundConfig {
             enabled: playground,
+            ..Default::default()
         },
     }
 }
