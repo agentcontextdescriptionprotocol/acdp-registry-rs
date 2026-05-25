@@ -127,6 +127,20 @@ pub async fn publish<S: ExtendedRegistryStore + 'static>(
         // `publish_unverified_for_tests` doesn't accept an idempotency key,
         // so we run idempotency lookup/record around it via the store to
         // preserve replay semantics for tests and demos.
+        //
+        // Pinned-key enforcement (FEAT-Phase5): when operators configure
+        // playground.pinned_keys, the registry refuses to accept publishes
+        // claiming a pinned DID unless the signature verifies against the
+        // pinned public key. In strict mode (`pinned_only = true`), every
+        // publishing agent must be listed.
+        let pin_outcome =
+            crate::playground::enforce_pinned_signature(&req, &state.config.playground)?;
+        tracing::debug!(
+            agent_did = req.agent_id.as_str(),
+            pin_outcome = ?pin_outcome,
+            "playground pinned-key check"
+        );
+
         if let Some(key) = idempotency_key.as_deref() {
             let server2 = server.clone();
             let agent2 = req.agent_id.clone();
