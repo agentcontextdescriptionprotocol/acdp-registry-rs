@@ -102,7 +102,10 @@ fn config() -> RegistryConfig {
         // The playground bypasses DID verification, which lets the
         // harness replay synthetic fixtures without standing up a TLS
         // mock for `did:web` resolution.
-        playground: PlaygroundConfig { enabled: true },
+        playground: PlaygroundConfig {
+            enabled: true,
+            ..Default::default()
+        },
     }
 }
 
