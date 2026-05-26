@@ -352,6 +352,7 @@ mod tests {
                 registry: "registry.test".into(),
                 key_id: "did:web:registry.test:agents:alice#key-1".into(),
             },
+            tenant: None,
         }
     }
 

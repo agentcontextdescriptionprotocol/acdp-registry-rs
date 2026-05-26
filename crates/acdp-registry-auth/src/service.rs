@@ -229,6 +229,10 @@ impl AuthService {
                 registry: self.authority.clone(),
                 key_id: req.key_id.clone(),
             },
+            // Tenant binding for registry-issued tokens is plan-§6
+            // follow-up — the registry doesn't yet maintain an
+            // agent→tenant map. None here preserves V0 behavior.
+            tenant: None,
         };
         let token = self.signer.sign(&claims)?;
         // SEC-01 (post-798cb34): record the issued jti so the revocation
@@ -256,6 +260,15 @@ impl AuthService {
     pub fn validate_bearer(&self, token: &str) -> Result<AgentDid, AuthError> {
         let claims = self.signer.validate(token)?;
         Ok(AgentDid::new(&claims.sub))
+    }
+
+    /// Validate a bearer token and return the full claim set. Callers
+    /// that need the `tenant` claim (or future scope/aud claims) use
+    /// this instead of `validate_bearer`. The two methods share the
+    /// same validation path; one returns just the DID for legacy
+    /// callers, the other returns everything.
+    pub fn validate_bearer_claims(&self, token: &str) -> Result<BearerClaims, AuthError> {
+        self.signer.validate(token)
     }
 
     /// Revoke a token by its `jti`. Returns `AuthError::TokenInvalid` when
