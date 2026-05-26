@@ -4,6 +4,7 @@
 
 pub mod challenge_store;
 pub mod jwt;
+pub mod revocation_poller;
 pub mod revocation_store;
 pub mod service;
 

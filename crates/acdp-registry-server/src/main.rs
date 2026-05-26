@@ -306,11 +306,29 @@ async fn serve_with_store<S: ExtendedRegistryStore + 'static>(
         resolver.clone(),
         cfg.registry.authority.clone(),
     );
+    // Snapshot the Arc *before* moving into AuthService — the poller
+    // also needs a handle.
+    let revocations_for_poller = revocations.clone();
     if let Some(rev) = revocations {
         auth = auth.with_revocations(rev);
     }
     let auth = Arc::new(auth);
     auth.spawn_evictor();
+
+    // Cross-issuer revocation propagation (plan §9): each configured
+    // peer feed is polled by an independent background task.
+    if let Some(rev_store) = revocations_for_poller {
+        if !cfg.auth.revocation_feeds.is_empty() {
+            tracing::info!(
+                count = cfg.auth.revocation_feeds.len(),
+                "spawning cross-issuer revocation pollers"
+            );
+            acdp_registry_auth::revocation_poller::spawn_revocation_pollers(
+                cfg.auth.revocation_feeds.clone(),
+                rev_store,
+            );
+        }
+    }
 
     // Webhook. SEC-03 / SEC-04: try_spawn validates URL + secret before
     // accepting any events.
