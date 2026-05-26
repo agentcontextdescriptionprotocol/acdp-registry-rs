@@ -83,6 +83,25 @@ fn parse_visibility(s: &str) -> Option<Visibility> {
     }
 }
 
+/// Caller-asserted tenant id from the `X-Tenant-Id` request header.
+///
+/// V1 tenancy is opt-in and trust-on-input: any caller can declare a
+/// tenant. Hardening into auth-bound enforcement (extracted from a
+/// signed JWT claim, or required from a trusted proxy) is plan §6
+/// follow-up. This extractor is the seam for that future work — its
+/// callers should NOT bypass it.
+///
+/// Returns `None` when the header is absent, meaning "no tenant
+/// filter" — preserving the V0 behavior of seeing all rows.
+pub(crate) fn tenant_from_headers(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-tenant-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// `POST /contexts`.
 ///
 /// The publish pipeline already carries the producer's signature over
@@ -195,6 +214,19 @@ pub async fn publish<S: ExtendedRegistryStore + 'static>(
             .await?
     };
 
+    // Stamp tenant_id post-publish. The protocol-level upsert path
+    // doesn't carry tenancy (acdp::registry::RegistryStore is shared
+    // across implementations); we apply it here via the extended
+    // trait. A `None` from tenant_from_headers means "no tenant
+    // header was sent" → the column's default ('default') is kept.
+    if let Some(tenant_id) = tenant_from_headers(&headers) {
+        state
+            .server
+            .store()
+            .set_tenant_of_ctx(response.ctx_id.as_str(), &tenant_id)
+            .await?;
+    }
+
     if let Some(emitter) = &state.webhook {
         emitter.emit(WebhookEvent::ContextPublished {
             ctx_id: response.ctx_id.as_str().to_string(),
@@ -282,7 +314,7 @@ pub async fn retrieve<S: ExtendedRegistryStore + 'static>(
     }
 
     let server = state.server.clone();
-    let ctx_id_typed = CtxId(ctx_id);
+    let ctx_id_typed = CtxId(ctx_id.clone());
     let req_owned = requester.clone();
     let ctx =
         tokio::task::spawn_blocking(move || server.retrieve(&ctx_id_typed, req_owned.as_ref()))
@@ -293,6 +325,25 @@ pub async fn retrieve<S: ExtendedRegistryStore + 'static>(
             "context not found".into(),
         )));
     };
+    // Tenant gate. When the caller sends X-Tenant-Id, the stored
+    // tenant MUST match — otherwise return the same not-found shape
+    // as a row that doesn't exist (no oracle: a caller can't probe
+    // whether ctx_id X exists in a tenant they don't belong to).
+    // No header → no filter (V0 backward compatibility; existing
+    // callers without tenant awareness still work).
+    if let Some(requested_tenant) = tenant_from_headers(&headers) {
+        let stored = state
+            .server
+            .store()
+            .tenant_of_ctx(&ctx_id)
+            .await?
+            .unwrap_or_else(|| "default".into());
+        if stored != requested_tenant {
+            return Err(RegistryError::Acdp(acdp::error::AcdpError::NotFound(
+                "context not found".into(),
+            )));
+        }
+    }
     if let Some(emitter) = &state.webhook {
         emitter.emit(WebhookEvent::ContextRetrieved {
             ctx_id: ctx.body.ctx_id.as_str().to_string(),
