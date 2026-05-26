@@ -6,7 +6,7 @@ mod meta;
 
 pub use auth::{issue_challenge, issue_token, revoke_token};
 pub use context::{current, lineage, publish, retrieve, retrieve_body, search};
-pub use meta::{capabilities, health};
+pub use meta::{capabilities, health, jwks};
 
 #[cfg(feature = "playground")]
 mod admin;

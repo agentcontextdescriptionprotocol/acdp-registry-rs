@@ -167,6 +167,24 @@ pub struct AuthConfig {
     /// want world-readable public contexts MUST set this to true.
     #[serde(default)]
     pub anonymous_public_reads: bool,
+    /// JWT signing algorithm. `HS256` (default, backward-compatible) uses
+    /// `jwt_secret`. `EdDSA` (Ed25519) uses `jwt_private_key_pem` and
+    /// publishes the public key at `GET /.well-known/jwks.json` so
+    /// federated peers can verify without out-of-band secret distribution.
+    #[serde(default = "default_jwt_alg")]
+    pub jwt_signing_alg: String,
+    /// PEM-encoded Ed25519 private key (PKCS#8). Required when
+    /// `jwt_signing_alg = "EdDSA"`.
+    #[serde(default)]
+    pub jwt_private_key_pem: String,
+    /// Optional explicit key id. When empty, derived from the public-key
+    /// fingerprint (stable across restarts when the key bytes are stable).
+    #[serde(default)]
+    pub jwt_kid: String,
+}
+
+fn default_jwt_alg() -> String {
+    "HS256".into()
 }
 
 fn default_did_methods() -> Vec<String> {
@@ -195,6 +213,9 @@ impl Default for AuthConfig {
             challenge_ttl_seconds: default_challenge_ttl(),
             token_leeway_seconds: default_token_leeway(),
             anonymous_public_reads: false,
+            jwt_signing_alg: default_jwt_alg(),
+            jwt_private_key_pem: String::new(),
+            jwt_kid: String::new(),
         }
     }
 }

@@ -58,7 +58,26 @@ async fn main() -> anyhow::Result<()> {
 /// FEAT-09: pre-bind config validation. Each check matches a runtime
 /// requirement that would otherwise be discovered lazily.
 fn validate_config(cfg: &RegistryConfig) -> anyhow::Result<()> {
-    if cfg.auth.enabled && !cfg.auth.jwt_secret.is_empty() {
+    if cfg.auth.enabled {
+        match cfg.auth.jwt_signing_alg.as_str() {
+            "HS256" | "" => {}
+            "EdDSA" => {
+                if cfg.auth.jwt_private_key_pem.trim().is_empty() {
+                    anyhow::bail!(
+                        "auth.jwt_signing_alg=EdDSA but auth.jwt_private_key_pem is empty"
+                    );
+                }
+            }
+            other => anyhow::bail!(
+                "auth.jwt_signing_alg must be 'HS256' or 'EdDSA' (got '{}')",
+                other
+            ),
+        }
+    }
+    if cfg.auth.enabled
+        && cfg.auth.jwt_signing_alg.as_str() != "EdDSA"
+        && !cfg.auth.jwt_secret.is_empty()
+    {
         // OPS-02 stronger guard: the docker-compose default placeholder
         // must not reach production. Run the literal check FIRST so an
         // operator who left `changeme` in place gets the actionable
@@ -232,25 +251,50 @@ async fn serve_with_store<S: ExtendedRegistryStore + 'static>(
     let server = Arc::new(server);
 
     // Auth.
-    let jwt_secret = if cfg.auth.jwt_secret.is_empty() {
-        // Ephemeral secret — tokens won't survive a restart. Operators
-        // running in production MUST set ACDP_REGISTRY_AUTH__JWT_SECRET.
-        tracing::warn!("auth.jwt_secret not set — generating an ephemeral key");
-        use rand::RngCore;
-        let mut bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut bytes);
-        JwtSecret::from_bytes(&bytes)
-    } else {
-        JwtSecret::from_base64(&cfg.auth.jwt_secret)
-            .map_err(|e| anyhow::anyhow!("jwt_secret: {e}"))?
-    };
     let issuer = authority_to_did_web(&cfg.registry.authority);
-    let mut signer = JwtSigner::new(
-        jwt_secret,
-        issuer,
-        cfg.registry.authority.clone(),
-        cfg.auth.token_leeway_seconds,
-    );
+    let mut signer = match cfg.auth.jwt_signing_alg.as_str() {
+        "EdDSA" => {
+            if cfg.auth.jwt_private_key_pem.trim().is_empty() {
+                return Err(anyhow::anyhow!(
+                    "auth.jwt_signing_alg=EdDSA but auth.jwt_private_key_pem is empty"
+                ));
+            }
+            let kid_override = if cfg.auth.jwt_kid.is_empty() {
+                None
+            } else {
+                Some(cfg.auth.jwt_kid.clone())
+            };
+            JwtSigner::new_eddsa(
+                &cfg.auth.jwt_private_key_pem,
+                issuer,
+                cfg.registry.authority.clone(),
+                cfg.auth.token_leeway_seconds,
+                kid_override,
+            )
+            .map_err(|e| anyhow::anyhow!("jwt_private_key_pem: {e}"))?
+        }
+        // Default (HS256, backward-compatible).
+        _ => {
+            let jwt_secret = if cfg.auth.jwt_secret.is_empty() {
+                // Ephemeral secret — tokens won't survive a restart. Operators
+                // running in production MUST set ACDP_REGISTRY_AUTH__JWT_SECRET.
+                tracing::warn!("auth.jwt_secret not set — generating an ephemeral key");
+                use rand::RngCore;
+                let mut bytes = [0u8; 32];
+                rand::thread_rng().fill_bytes(&mut bytes);
+                JwtSecret::from_bytes(&bytes)
+            } else {
+                JwtSecret::from_base64(&cfg.auth.jwt_secret)
+                    .map_err(|e| anyhow::anyhow!("jwt_secret: {e}"))?
+            };
+            JwtSigner::new(
+                jwt_secret,
+                issuer,
+                cfg.registry.authority.clone(),
+                cfg.auth.token_leeway_seconds,
+            )
+        }
+    };
     if let Some(rev) = revocations.clone() {
         signer = signer.with_revocations(rev);
     }
