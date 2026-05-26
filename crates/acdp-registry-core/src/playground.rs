@@ -243,8 +243,8 @@ mod tests {
         req.signature.algorithm = "ecdsa-p256".into();
         req.signature.value = sig_b64;
 
-        let pub_b64 = base64::engine::general_purpose::STANDARD
-            .encode(p256_key.verifying_key_sec1());
+        let pub_b64 =
+            base64::engine::general_purpose::STANDARD.encode(p256_key.verifying_key_sec1());
         (req, pub_b64)
     }
 
@@ -347,8 +347,8 @@ mod tests {
         let did = "did:web:x:agents:alice";
         let (req, _real_pub) = build_p256_signed_request(did);
         let wrong = P256SigningKey::generate();
-        let wrong_pub = base64::engine::general_purpose::STANDARD
-            .encode(wrong.verifying_key_sec1());
+        let wrong_pub =
+            base64::engine::general_purpose::STANDARD.encode(wrong.verifying_key_sec1());
         let pinned = PinnedAgentKey {
             agent_did: did.into(),
             public_key_b64: wrong_pub,
@@ -385,7 +385,9 @@ mod tests {
         // Replace the first byte (0x04 SEC1 tag) with 0x02 (compressed
         // form) — verifier wouldn't accept this; we surface it as a
         // config error so the operator notices on first publish.
-        let mut bytes = base64::engine::general_purpose::STANDARD.decode(&pub_b64).unwrap();
+        let mut bytes = base64::engine::general_purpose::STANDARD
+            .decode(&pub_b64)
+            .unwrap();
         bytes[0] = 0x02;
         let bad_tag = base64::engine::general_purpose::STANDARD.encode(&bytes);
         let pinned = PinnedAgentKey {
@@ -409,8 +411,8 @@ mod tests {
         let did = "did:web:x:agents:alice";
         let (req, _) = build_signed_request(key, did);
         let p256_key = P256SigningKey::generate();
-        let pub_b64 = base64::engine::general_purpose::STANDARD
-            .encode(p256_key.verifying_key_sec1());
+        let pub_b64 =
+            base64::engine::general_purpose::STANDARD.encode(p256_key.verifying_key_sec1());
         let pinned = PinnedAgentKey {
             agent_did: did.into(),
             public_key_b64: pub_b64,
@@ -432,8 +434,7 @@ mod tests {
         // does not match → downgrade defense fires before any
         // verification path runs.
         let ed_key = SigningKey::generate();
-        let ed_pub = base64::engine::general_purpose::STANDARD
-            .encode(ed_key.verifying_key_bytes());
+        let ed_pub = base64::engine::general_purpose::STANDARD.encode(ed_key.verifying_key_bytes());
         let pinned = PinnedAgentKey {
             agent_did: did.into(),
             public_key_b64: ed_pub,
