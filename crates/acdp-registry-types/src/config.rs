@@ -181,6 +181,45 @@ pub struct AuthConfig {
     /// fingerprint (stable across restarts when the key bytes are stable).
     #[serde(default)]
     pub jwt_kid: String,
+
+    /// Cross-issuer revocation feeds the registry polls for propagated
+    /// revocations (plan §9). Empty (default) = no federation; the
+    /// registry trusts only its own revocation list.
+    #[serde(default)]
+    pub revocation_feeds: Vec<RevocationFeedConfig>,
+}
+
+/// One peer issuer whose revocation list this registry should mirror.
+///
+/// Wire format (TOML):
+///
+///   [[auth.revocation_feeds]]
+///   issuer        = "did:web:control-plane.example"
+///   feed_url      = "https://control-plane.example/auth/revocations"
+///   admin_token   = "..."           # api key with admin role on the issuer
+///   poll_seconds  = 60              # default 300
+///
+/// The poller runs in the background, paged by `revoked_at_ms` cursor;
+/// each propagated entry is inserted into the local revocation store
+/// so existing JWT-verify code rejects the token without further
+/// federation work.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevocationFeedConfig {
+    /// Issuer `iss` the propagated entries belong to. Stamped onto each
+    /// local revocation record for audit.
+    pub issuer: String,
+    /// Full URL of the peer's revocation feed endpoint.
+    pub feed_url: String,
+    /// Admin api key for the peer (peer's feed is admin-gated).
+    pub admin_token: String,
+    /// Poll interval. Default 300s.
+    #[serde(default = "default_revocation_poll_seconds")]
+    pub poll_seconds: u64,
+}
+
+fn default_revocation_poll_seconds() -> u64 {
+    300
 }
 
 fn default_jwt_alg() -> String {
@@ -216,6 +255,7 @@ impl Default for AuthConfig {
             jwt_signing_alg: default_jwt_alg(),
             jwt_private_key_pem: String::new(),
             jwt_kid: String::new(),
+            revocation_feeds: Vec::new(),
         }
     }
 }
