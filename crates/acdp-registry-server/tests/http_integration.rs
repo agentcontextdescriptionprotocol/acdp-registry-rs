@@ -192,6 +192,112 @@ async fn health_returns_ok() {
 }
 
 #[tokio::test]
+async fn jwks_returns_empty_keys_in_hs256_mode() {
+    // Default harness uses HS256 — JWKS is documented to return an empty
+    // key set (symmetric secrets are never published).
+    let h = harness(true).await;
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/jwks.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .map(|v| v.to_str().unwrap()),
+        Some("application/jwk-set+json"),
+    );
+    let v = body_to_json(resp).await;
+    assert_eq!(v["keys"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn jwks_publishes_eddsa_public_key_in_eddsa_mode() {
+    // Mint a fresh keypair and build a harness whose signer is EdDSA.
+    let db = tempfile::Builder::new()
+        .prefix("acdp-test-")
+        .suffix(".sqlite")
+        .tempfile()
+        .unwrap();
+    let store = SqliteStore::connect(db.path(), 1).await.unwrap();
+    store.migrate().await.unwrap();
+    let server = Arc::new(RegistryServer::try_new(store, caps(), AUTHORITY).unwrap());
+    let challenges: Arc<dyn ChallengeStore> = Arc::new(InMemoryChallengeStore::new());
+
+    // Build a minimal PKCS#8 v1 Ed25519 PEM from a fresh seed.
+    let pem = {
+        use base64::Engine as _;
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+        let sk = SigningKey::generate(&mut OsRng);
+        let prefix: [u8; 16] = [
+            0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22,
+            0x04, 0x20,
+        ];
+        let mut der = Vec::with_capacity(prefix.len() + 32);
+        der.extend_from_slice(&prefix);
+        der.extend_from_slice(&sk.to_bytes());
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&der);
+        format!(
+            "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+            b64
+        )
+    };
+    let signer = JwtSigner::new_eddsa(
+        &pem,
+        format!("did:web:{AUTHORITY}"),
+        AUTHORITY.into(),
+        30,
+        None,
+    )
+    .expect("new_eddsa");
+    let resolver = Arc::new(WebResolver::new());
+    let auth = Arc::new(AuthService::new(
+        AuthConfig::default(),
+        challenges,
+        signer,
+        resolver,
+        AUTHORITY.into(),
+    ));
+    let state = AppStateInner {
+        server,
+        auth,
+        webhook: None,
+        config: config(true),
+        cross_registry: None,
+    };
+    let router = build_router(state);
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/jwks.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_to_json(resp).await;
+    let keys = v["keys"].as_array().expect("keys array");
+    assert_eq!(keys.len(), 1);
+    let jwk = &keys[0];
+    assert_eq!(jwk["kty"], "OKP");
+    assert_eq!(jwk["crv"], "Ed25519");
+    assert_eq!(jwk["alg"], "EdDSA");
+    assert_eq!(jwk["use"], "sig");
+    assert!(jwk["kid"].as_str().is_some_and(|s| !s.is_empty()));
+    assert!(jwk["x"].as_str().is_some_and(|s| !s.is_empty()));
+}
+
+#[tokio::test]
 async fn capabilities_round_trips() {
     let h = harness(true).await;
     let app = &h.router;
