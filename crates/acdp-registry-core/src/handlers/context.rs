@@ -360,7 +360,23 @@ pub async fn retrieve_body<S: ExtendedRegistryStore + 'static>(
     headers: HeaderMap,
     Path(ctx_id): Path<String>,
 ) -> Result<Json<acdp::types::body::Body>, RegistryError> {
+    let requested_tenant = tenant_from_headers(&headers);
     let requester = caller_from_headers(&state, &headers)?;
+    // Tenant gate before fetching the body — saves work when the
+    // caller can't see this row anyway.
+    if let Some(ref tenant) = requested_tenant {
+        let stored = state
+            .server
+            .store()
+            .tenant_of_ctx(&ctx_id)
+            .await?
+            .unwrap_or_else(|| "default".into());
+        if &stored != tenant {
+            return Err(RegistryError::Acdp(acdp::error::AcdpError::NotFound(
+                "context not found".into(),
+            )));
+        }
+    }
     let server = state.server.clone();
     let ctx_id_typed = CtxId(ctx_id);
     let body = tokio::task::spawn_blocking(move || {
@@ -399,6 +415,23 @@ pub async fn search<S: ExtendedRegistryStore + 'static>(
             .retain(|m| m.visibility.as_ref() == Some(&want));
     }
 
+    // Tenant filter — same opt-in semantics as retrieve. Absent
+    // X-Tenant-Id → no filter (V0 backward-compat). Present → drop
+    // any match whose row is tagged to a different tenant. Uses the
+    // batch lookup so it's one extra query, not N.
+    if let Some(requested_tenant) = tenant_from_headers(&headers) {
+        if !resp.matches.is_empty() {
+            let ids: Vec<&str> = resp.matches.iter().map(|m| m.ctx_id.as_str()).collect();
+            let owners = state.server.store().tenants_of_ctxs(&ids).await?;
+            resp.matches.retain(|m| {
+                owners
+                    .get(m.ctx_id.as_str())
+                    .map(|t| t == &requested_tenant)
+                    .unwrap_or(false)
+            });
+        }
+    }
+
     if let Some(emitter) = &state.webhook {
         emitter.emit(WebhookEvent::SearchExecuted {
             query: query_text,
@@ -416,12 +449,25 @@ pub async fn lineage<S: ExtendedRegistryStore + 'static>(
     headers: HeaderMap,
     Path(lineage_id): Path<String>,
 ) -> Result<Json<Vec<acdp::types::body::FullContext>>, RegistryError> {
+    let requested_tenant = tenant_from_headers(&headers);
     let requester = caller_from_headers(&state, &headers)?;
     let server = state.server.clone();
     let id = LineageId(lineage_id);
-    let items = tokio::task::spawn_blocking(move || server.lineage(&id, requester.as_ref()))
+    let mut items = tokio::task::spawn_blocking(move || server.lineage(&id, requester.as_ref()))
         .await
         .map_err(|e| RegistryError::Internal(format!("join: {e}")))??;
+    if let Some(tenant) = requested_tenant {
+        if !items.is_empty() {
+            let ids: Vec<&str> = items.iter().map(|c| c.body.ctx_id.as_str()).collect();
+            let owners = state.server.store().tenants_of_ctxs(&ids).await?;
+            items.retain(|c| {
+                owners
+                    .get(c.body.ctx_id.as_str())
+                    .map(|t| t == &tenant)
+                    .unwrap_or(false)
+            });
+        }
+    }
     Ok(Json(items))
 }
 
@@ -431,16 +477,32 @@ pub async fn current<S: ExtendedRegistryStore + 'static>(
     headers: HeaderMap,
     Path(lineage_id): Path<String>,
 ) -> Result<Json<acdp::types::body::FullContext>, RegistryError> {
+    let requested_tenant = tenant_from_headers(&headers);
     let requester = caller_from_headers(&state, &headers)?;
     let server = state.server.clone();
     let id = LineageId(lineage_id);
     let ctx = tokio::task::spawn_blocking(move || server.current(&id, requester.as_ref()))
         .await
         .map_err(|e| RegistryError::Internal(format!("join: {e}")))??;
-    ctx.map(Json)
-        .ok_or(RegistryError::Acdp(acdp::error::AcdpError::NotFound(
+    let Some(ctx) = ctx else {
+        return Err(RegistryError::Acdp(acdp::error::AcdpError::NotFound(
             "no current version".into(),
-        )))
+        )));
+    };
+    if let Some(tenant) = requested_tenant {
+        let stored = state
+            .server
+            .store()
+            .tenant_of_ctx(ctx.body.ctx_id.as_str())
+            .await?
+            .unwrap_or_else(|| "default".into());
+        if stored != tenant {
+            return Err(RegistryError::Acdp(acdp::error::AcdpError::NotFound(
+                "no current version".into(),
+            )));
+        }
+    }
+    Ok(Json(ctx))
 }
 
 /// Pull an authenticated caller DID out of the `Authorization` header.
