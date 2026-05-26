@@ -124,6 +124,32 @@ impl ExtendedRegistryStore for SqliteStore {
         Ok(())
     }
 
+    async fn tenants_of_ctxs(
+        &self,
+        ctx_ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, String>, AcdpError> {
+        if ctx_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        // SQLite lacks array binding — build an `IN (?,?,?,…)` clause
+        // with one placeholder per id, then bind each id. Placeholder
+        // count is bounded by the caller's page size (default 200).
+        let placeholders = std::iter::repeat_n("?", ctx_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql =
+            format!("SELECT ctx_id, tenant_id FROM contexts WHERE ctx_id IN ({placeholders})");
+        let mut q = sqlx::query_as::<_, (String, String)>(&sql);
+        for id in ctx_ids {
+            q = q.bind(*id);
+        }
+        let rows = q
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| AcdpError::RegistryInternal(format!("tenants_of_ctxs: {e}")))?;
+        Ok(rows.into_iter().collect())
+    }
+
     async fn list_contexts(
         &self,
         limit: u32,

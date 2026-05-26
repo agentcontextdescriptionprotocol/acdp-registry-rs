@@ -438,6 +438,98 @@ async fn tenancy_default_when_no_publish_header() {
 }
 
 #[tokio::test]
+async fn search_filters_by_tenant() {
+    // Publish two rows under different tenants. Search with
+    // X-Tenant-Id=tenant-a returns only the tenant-a row; no header
+    // returns both; tenant-c returns neither.
+    let h = harness(true).await;
+    let req_a = producer(13)
+        .publish_request()
+        .title("alpha-search")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let req_b = producer(14)
+        .publish_request()
+        .title("bravo-search")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    publish_with_tenant(&h.router, &req_a, Some("tenant-a")).await;
+    publish_with_tenant(&h.router, &req_b, Some("tenant-b")).await;
+
+    async fn search_with_tenant(app: &axum::Router, q: &str, tenant: Option<&str>) -> Value {
+        let mut builder = Request::builder().uri(format!("/contexts/search?q={q}"));
+        if let Some(t) = tenant {
+            builder = builder.header("X-Tenant-Id", t);
+        }
+        let resp = app
+            .clone()
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        body_to_json(resp).await
+    }
+
+    // No header → both visible (V0 backward-compat).
+    let v = search_with_tenant(&h.router, "search", None).await;
+    assert_eq!(v["matches"].as_array().unwrap().len(), 2);
+
+    // tenant-a → only the alpha row.
+    let v = search_with_tenant(&h.router, "search", Some("tenant-a")).await;
+    let matches = v["matches"].as_array().unwrap();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0]["title"], "alpha-search");
+
+    // tenant-c → empty.
+    let v = search_with_tenant(&h.router, "search", Some("tenant-c")).await;
+    assert_eq!(v["matches"].as_array().unwrap().len(), 0);
+}
+
+#[cfg(feature = "playground")]
+#[tokio::test]
+async fn admin_list_filters_by_tenant() {
+    // The playground-mode admin endpoint also honors the tenant header.
+    let h = harness(true).await;
+    let req_a = producer(15)
+        .publish_request()
+        .title("admin-alpha")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let req_b = producer(16)
+        .publish_request()
+        .title("admin-bravo")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    publish_with_tenant(&h.router, &req_a, Some("tenant-a")).await;
+    publish_with_tenant(&h.router, &req_b, Some("tenant-b")).await;
+
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/admin/contexts")
+                .header("X-Tenant-Id", "tenant-a")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_to_json(resp).await;
+    let items = v["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["body"]["title"], "admin-alpha");
+}
+
+#[tokio::test]
 async fn publish_unverified_then_retrieve() {
     let h = harness(true).await;
     let app = &h.router;

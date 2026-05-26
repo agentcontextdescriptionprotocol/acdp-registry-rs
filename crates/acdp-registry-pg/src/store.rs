@@ -86,6 +86,25 @@ impl ExtendedRegistryStore for PgStore {
         Ok(())
     }
 
+    async fn tenants_of_ctxs(
+        &self,
+        ctx_ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, String>, AcdpError> {
+        if ctx_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        // Postgres-native batch: ANY($1::text[]) takes the whole list
+        // as a single bound parameter — beats N round-trips.
+        let owned: Vec<String> = ctx_ids.iter().map(|s| (*s).to_string()).collect();
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT ctx_id, tenant_id FROM contexts WHERE ctx_id = ANY($1)")
+                .bind(&owned)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| AcdpError::RegistryInternal(format!("tenants_of_ctxs: {e}")))?;
+        Ok(rows.into_iter().collect())
+    }
+
     async fn list_contexts(
         &self,
         limit: u32,

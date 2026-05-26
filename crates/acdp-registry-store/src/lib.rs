@@ -60,4 +60,22 @@ pub trait ExtendedRegistryStore: RegistryStore + Send + Sync {
     async fn set_tenant_of_ctx(&self, _ctx_id: &str, _tenant_id: &str) -> Result<(), AcdpError> {
         Ok(())
     }
+
+    /// Batch tenant lookup. Returns a map of `ctx_id → tenant_id`.
+    /// Used by handlers that filter result sets (search / lineage /
+    /// list) — one round-trip beats N. Default impl falls back to N
+    /// single-row queries via [`Self::tenant_of_ctx`] so untenanted
+    /// backends remain compatible.
+    async fn tenants_of_ctxs(
+        &self,
+        ctx_ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, String>, AcdpError> {
+        let mut out = std::collections::HashMap::with_capacity(ctx_ids.len());
+        for id in ctx_ids {
+            if let Some(t) = self.tenant_of_ctx(id).await? {
+                out.insert((*id).to_string(), t);
+            }
+        }
+        Ok(out)
+    }
 }
