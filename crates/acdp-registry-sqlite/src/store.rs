@@ -101,6 +101,29 @@ impl ExtendedRegistryStore for SqliteStore {
             .map_err(|e| AcdpError::RegistryInternal(format!("health: {e}")))
     }
 
+    async fn tenant_of_ctx(&self, ctx_id: &str) -> Result<Option<String>, AcdpError> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT tenant_id FROM contexts WHERE ctx_id = ?1")
+                .bind(ctx_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| AcdpError::RegistryInternal(format!("tenant_of_ctx: {e}")))?;
+        Ok(row.map(|(t,)| t))
+    }
+
+    async fn set_tenant_of_ctx(&self, ctx_id: &str, tenant_id: &str) -> Result<(), AcdpError> {
+        if tenant_id == "default" {
+            return Ok(());
+        }
+        sqlx::query("UPDATE contexts SET tenant_id = ?1 WHERE ctx_id = ?2")
+            .bind(tenant_id)
+            .bind(ctx_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AcdpError::RegistryInternal(format!("set_tenant_of_ctx: {e}")))?;
+        Ok(())
+    }
+
     async fn list_contexts(
         &self,
         limit: u32,

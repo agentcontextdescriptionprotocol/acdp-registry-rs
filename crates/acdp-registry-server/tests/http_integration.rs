@@ -338,6 +338,105 @@ async fn publish(
     (status, v)
 }
 
+async fn publish_with_tenant(
+    app: &axum::Router,
+    req: &acdp::types::publish::PublishRequest,
+    tenant: Option<&str>,
+) -> (StatusCode, Value) {
+    let body = serde_json::to_vec(req).unwrap();
+    let mut builder = Request::builder().method("POST").uri("/contexts");
+    if let Some(t) = tenant {
+        builder = builder.header("X-Tenant-Id", t);
+    }
+    let resp = app
+        .clone()
+        .oneshot(builder.body(Body::from(body)).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let v = body_to_json(resp).await;
+    (status, v)
+}
+
+async fn retrieve_with_tenant(
+    app: &axum::Router,
+    ctx_id: &str,
+    tenant: Option<&str>,
+) -> StatusCode {
+    let mut builder =
+        Request::builder().uri(format!("/contexts/{}", pct_encode_path_segment(ctx_id)));
+    if let Some(t) = tenant {
+        builder = builder.header("X-Tenant-Id", t);
+    }
+    let resp = app
+        .clone()
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    resp.status()
+}
+
+#[tokio::test]
+async fn tenancy_stamp_and_filter_roundtrip() {
+    // Publish under X-Tenant-Id=tenant-a; retrieving the same row with
+    // X-Tenant-Id=tenant-a → 200, with X-Tenant-Id=tenant-b → 404
+    // (same shape as not-found — no oracle that the row exists in a
+    // tenant the caller doesn't belong to).
+    let h = harness(true).await;
+    let req = producer(11)
+        .publish_request()
+        .title("tenant-a-row")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (status, v) = publish_with_tenant(&h.router, &req, Some("tenant-a")).await;
+    assert_eq!(status, StatusCode::OK, "publish body = {v}");
+    let ctx_id = v["ctx_id"].as_str().unwrap().to_string();
+
+    // Right tenant → 200.
+    assert_eq!(
+        retrieve_with_tenant(&h.router, &ctx_id, Some("tenant-a")).await,
+        StatusCode::OK,
+    );
+    // Wrong tenant → 404.
+    assert_eq!(
+        retrieve_with_tenant(&h.router, &ctx_id, Some("tenant-b")).await,
+        StatusCode::NOT_FOUND,
+    );
+    // No header (V0 backward compatibility) → 200 (no tenant filter).
+    assert_eq!(
+        retrieve_with_tenant(&h.router, &ctx_id, None).await,
+        StatusCode::OK,
+    );
+}
+
+#[tokio::test]
+async fn tenancy_default_when_no_publish_header() {
+    // Publish without X-Tenant-Id stamps 'default'; retrieving with
+    // X-Tenant-Id=default → 200, with X-Tenant-Id=tenant-a → 404.
+    let h = harness(true).await;
+    let req = producer(12)
+        .publish_request()
+        .title("default-tenant-row")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (status, v) = publish_with_tenant(&h.router, &req, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let ctx_id = v["ctx_id"].as_str().unwrap().to_string();
+
+    assert_eq!(
+        retrieve_with_tenant(&h.router, &ctx_id, Some("default")).await,
+        StatusCode::OK,
+    );
+    assert_eq!(
+        retrieve_with_tenant(&h.router, &ctx_id, Some("tenant-a")).await,
+        StatusCode::NOT_FOUND,
+    );
+}
+
 #[tokio::test]
 async fn publish_unverified_then_retrieve() {
     let h = harness(true).await;
