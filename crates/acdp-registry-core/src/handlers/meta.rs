@@ -17,6 +17,28 @@ pub async fn capabilities<S: ExtendedRegistryStore + 'static>(
     Json(serde_json::to_value(state.server.capabilities()).unwrap_or_else(|_| json!({})))
 }
 
+/// `GET /.well-known/jwks.json` — publish the public key(s) federated
+/// peers should use to verify tokens issued by this registry.
+///
+/// Returns:
+///   - EdDSA: `{ keys: [<OKP/Ed25519 JWK>] }`
+///   - HS256: `{ keys: [] }` (symmetric secrets are never published)
+///
+/// `Cache-Control: public, max-age=300` matches the typical JWKS-client
+/// cache TTL so peers can hold the response without hammering the registry.
+pub async fn jwks<S: ExtendedRegistryStore + 'static>(
+    State(state): State<Arc<AppState<S>>>,
+) -> impl IntoResponse {
+    let body = Json(state.auth.signer.jwks());
+    (
+        [
+            (axum::http::header::CACHE_CONTROL, "public, max-age=300"),
+            (axum::http::header::CONTENT_TYPE, "application/jwk-set+json"),
+        ],
+        body,
+    )
+}
+
 /// BUG-05: returns HTTP 503 when storage health fails so load balancers,
 /// Kubernetes readiness probes, and Prometheus blackbox exporters take the
 /// pod out of rotation. Returning 200 + `"status":"degraded"` (the prior

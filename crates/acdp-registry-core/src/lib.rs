@@ -39,6 +39,7 @@ pub fn build_router<S: ExtendedRegistryStore + 'static>(state: AppState<S>) -> R
     let mut router = Router::new()
         // Capabilities + health
         .route("/.well-known/acdp.json", get(handlers::capabilities::<S>))
+        .route("/.well-known/jwks.json", get(handlers::jwks::<S>))
         .route("/healthz", get(handlers::health::<S>))
         // Contexts
         .route("/contexts", post(handlers::publish::<S>))
