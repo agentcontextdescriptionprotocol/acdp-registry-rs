@@ -39,4 +39,25 @@ pub trait ExtendedRegistryStore: RegistryStore + Send + Sync {
 
     /// Run pending migrations. Called at server startup.
     async fn migrate(&self) -> Result<(), AcdpError>;
+
+    /// Tenant-aware lookup: returns the `tenant_id` recorded for a
+    /// ctx_id, or `None` if the row doesn't exist. The default
+    /// implementation returns `Some("default")` so backends that
+    /// haven't migrated to tenant tagging yet still satisfy the
+    /// trait without claiming a wrong answer. Production backends
+    /// override.
+    async fn tenant_of_ctx(&self, _ctx_id: &str) -> Result<Option<String>, AcdpError> {
+        Ok(Some("default".into()))
+    }
+
+    /// Stamp the tenant_id for a ctx_id. Called by the publish handler
+    /// AFTER the protocol-level publish succeeds (the protocol
+    /// `RegistryStore::upsert_context` doesn't carry tenancy). When the
+    /// requested tenant is `"default"`, this is a no-op since the
+    /// migration's default is already `'default'`. Returns Ok on
+    /// success; the default impl returns Ok so untenanted backends
+    /// stay compatible.
+    async fn set_tenant_of_ctx(&self, _ctx_id: &str, _tenant_id: &str) -> Result<(), AcdpError> {
+        Ok(())
+    }
 }
