@@ -64,6 +64,13 @@ pub struct BearerClaims {
     pub exp: i64,
     #[serde(default)]
     pub acdp: AcdpClaims,
+    /// Tenant the token was issued under. Authoritative for downstream
+    /// guards — preferred over the X-Tenant-Id header so a bearer can't
+    /// assert a tenant the issuer didn't actually bind. Optional for
+    /// backward compatibility with V0 tokens that pre-date tenant
+    /// binding (absent → 'default').
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -85,14 +85,14 @@ fn parse_visibility(s: &str) -> Option<Visibility> {
 
 /// Caller-asserted tenant id from the `X-Tenant-Id` request header.
 ///
-/// V1 tenancy is opt-in and trust-on-input: any caller can declare a
-/// tenant. Hardening into auth-bound enforcement (extracted from a
-/// signed JWT claim, or required from a trusted proxy) is plan §6
-/// follow-up. This extractor is the seam for that future work — its
-/// callers should NOT bypass it.
+/// Prefer [`tenant_for_request`] in handlers that have access to the
+/// AppState — it consults the JWT `tenant` claim first and falls back
+/// to this header. This raw header extractor is retained for early-
+/// publish call sites where the bearer hasn't been validated yet AND
+/// for tests; it should not be the primary tenant source on
+/// authenticated reads.
 ///
-/// Returns `None` when the header is absent, meaning "no tenant
-/// filter" — preserving the V0 behavior of seeing all rows.
+/// Returns `None` when the header is absent or empty.
 pub(crate) fn tenant_from_headers(headers: &HeaderMap) -> Option<String> {
     headers
         .get("x-tenant-id")
@@ -100,6 +100,66 @@ pub(crate) fn tenant_from_headers(headers: &HeaderMap) -> Option<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
+}
+
+/// Resolve the operative tenant for a request. Precedence:
+///
+///   1. JWT `tenant` claim — authoritative because the issuer signs
+///      it. A bearer can't assert a tenant they weren't actually
+///      bound to.
+///   2. `X-Tenant-Id` header — legacy / trust-on-input fallback.
+///   3. `None` — no tenant filter (V0 backward-compat).
+///
+/// When both 1 and 2 are present and disagree, returns
+/// `Err(AuthChallenge("tenant assertion mismatch"))` — the header is
+/// claiming a tenant the JWT didn't bind, which is either misconfig
+/// or hostile. Same shape as a failed-auth error so it surfaces as
+/// a clean 401/403 at the response layer.
+pub(crate) fn tenant_for_request<S: ExtendedRegistryStore + 'static>(
+    state: &AppState<S>,
+    headers: &HeaderMap,
+) -> Result<Option<String>, RegistryError> {
+    let header_tenant = tenant_from_headers(headers);
+    if !state.config.auth.enabled {
+        // Auth disabled — header is the only signal.
+        return Ok(header_tenant);
+    }
+    let Some(value) = headers.get("authorization").and_then(|v| v.to_str().ok()) else {
+        return Ok(header_tenant);
+    };
+    let Some(token) = extract_bearer(value) else {
+        return Ok(header_tenant);
+    };
+    let claim_tenant = match state.auth.validate_bearer_claims(token) {
+        Ok(claims) => claims.tenant,
+        Err(_) => {
+            // Token didn't validate. We do NOT short-circuit on a bad
+            // bearer here — `caller_from_headers` is the right place
+            // for that decision (it surfaces the 401). Treat the
+            // tenant resolution as header-only when claims can't be
+            // read.
+            return Ok(header_tenant);
+        }
+    };
+    reconcile_tenant_sources(claim_tenant, header_tenant)
+}
+
+/// Pure precedence: JWT claim > X-Tenant-Id header > None. Mismatch
+/// between the two surfaces as an auth-challenge error.
+pub(crate) fn reconcile_tenant_sources(
+    claim: Option<String>,
+    header: Option<String>,
+) -> Result<Option<String>, RegistryError> {
+    match (claim, header) {
+        (Some(c), Some(h)) if c != h => {
+            tracing::warn!(claim = %c, header = %h, "tenant assertion mismatch");
+            Err(RegistryError::AuthChallenge(
+                "X-Tenant-Id does not match the tenant the token was issued under".into(),
+            ))
+        }
+        (Some(c), _) => Ok(Some(c)),
+        (None, h) => Ok(h),
+    }
 }
 
 /// `POST /contexts`.
@@ -325,13 +385,11 @@ pub async fn retrieve<S: ExtendedRegistryStore + 'static>(
             "context not found".into(),
         )));
     };
-    // Tenant gate. When the caller sends X-Tenant-Id, the stored
-    // tenant MUST match — otherwise return the same not-found shape
-    // as a row that doesn't exist (no oracle: a caller can't probe
-    // whether ctx_id X exists in a tenant they don't belong to).
-    // No header → no filter (V0 backward compatibility; existing
-    // callers without tenant awareness still work).
-    if let Some(requested_tenant) = tenant_from_headers(&headers) {
+    // Tenant gate. JWT `tenant` claim is preferred over X-Tenant-Id;
+    // mismatch between the two → tenant_for_request returns Err
+    // (surfaces as 401/403, not a silent not-found). When neither is
+    // present → V0 behavior, no filter.
+    if let Some(requested_tenant) = tenant_for_request(&state, &headers)? {
         let stored = state
             .server
             .store()
@@ -360,7 +418,7 @@ pub async fn retrieve_body<S: ExtendedRegistryStore + 'static>(
     headers: HeaderMap,
     Path(ctx_id): Path<String>,
 ) -> Result<Json<acdp::types::body::Body>, RegistryError> {
-    let requested_tenant = tenant_from_headers(&headers);
+    let requested_tenant = tenant_for_request(&state, &headers)?;
     let requester = caller_from_headers(&state, &headers)?;
     // Tenant gate before fetching the body — saves work when the
     // caller can't see this row anyway.
@@ -419,7 +477,7 @@ pub async fn search<S: ExtendedRegistryStore + 'static>(
     // X-Tenant-Id → no filter (V0 backward-compat). Present → drop
     // any match whose row is tagged to a different tenant. Uses the
     // batch lookup so it's one extra query, not N.
-    if let Some(requested_tenant) = tenant_from_headers(&headers) {
+    if let Some(requested_tenant) = tenant_for_request(&state, &headers)? {
         if !resp.matches.is_empty() {
             let ids: Vec<&str> = resp.matches.iter().map(|m| m.ctx_id.as_str()).collect();
             let owners = state.server.store().tenants_of_ctxs(&ids).await?;
@@ -449,7 +507,7 @@ pub async fn lineage<S: ExtendedRegistryStore + 'static>(
     headers: HeaderMap,
     Path(lineage_id): Path<String>,
 ) -> Result<Json<Vec<acdp::types::body::FullContext>>, RegistryError> {
-    let requested_tenant = tenant_from_headers(&headers);
+    let requested_tenant = tenant_for_request(&state, &headers)?;
     let requester = caller_from_headers(&state, &headers)?;
     let server = state.server.clone();
     let id = LineageId(lineage_id);
@@ -477,7 +535,7 @@ pub async fn current<S: ExtendedRegistryStore + 'static>(
     headers: HeaderMap,
     Path(lineage_id): Path<String>,
 ) -> Result<Json<acdp::types::body::FullContext>, RegistryError> {
-    let requested_tenant = tenant_from_headers(&headers);
+    let requested_tenant = tenant_for_request(&state, &headers)?;
     let requester = caller_from_headers(&state, &headers)?;
     let server = state.server.clone();
     let id = LineageId(lineage_id);
@@ -529,4 +587,43 @@ pub(crate) fn caller_from_headers<S: ExtendedRegistryStore + 'static>(
         return Ok(None);
     };
     Ok(Some(state.auth.validate_bearer(token)?))
+}
+
+#[cfg(test)]
+mod tenant_precedence_tests {
+    use super::reconcile_tenant_sources;
+    use acdp_registry_types::RegistryError;
+
+    fn s(v: &str) -> Option<String> {
+        Some(v.to_string())
+    }
+
+    #[test]
+    fn claim_wins_when_both_present_and_agree() {
+        let out = reconcile_tenant_sources(s("a"), s("a")).unwrap();
+        assert_eq!(out, s("a"));
+    }
+
+    #[test]
+    fn claim_wins_when_header_absent() {
+        let out = reconcile_tenant_sources(s("a"), None).unwrap();
+        assert_eq!(out, s("a"));
+    }
+
+    #[test]
+    fn header_used_when_claim_absent_backward_compat() {
+        let out = reconcile_tenant_sources(None, s("legacy")).unwrap();
+        assert_eq!(out, s("legacy"));
+    }
+
+    #[test]
+    fn both_absent_returns_none() {
+        assert_eq!(reconcile_tenant_sources(None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn mismatch_errors_out() {
+        let err = reconcile_tenant_sources(s("a"), s("b")).unwrap_err();
+        assert!(matches!(err, RegistryError::AuthChallenge(_)));
+    }
 }
