@@ -9,7 +9,7 @@ use axum::http::HeaderMap;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use crate::handlers::context::{caller_from_headers, tenant_from_headers};
+use crate::handlers::context::{caller_from_headers, tenant_for_request};
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -30,7 +30,7 @@ pub async fn admin_list<S: ExtendedRegistryStore + 'static>(
     Query(q): Query<AdminListQuery>,
 ) -> Result<Json<AdminListResponse>, RegistryError> {
     let requester = caller_from_headers(&state, &headers)?;
-    let requested_tenant = tenant_from_headers(&headers);
+    let requested_tenant = tenant_for_request(&state, &headers)?;
     let mut page = state
         .server
         .store()
