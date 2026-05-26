@@ -396,11 +396,7 @@ impl PlaygroundConfig {
 
     /// `pinned_for` with an explicit `now` — for tests and audit jobs
     /// that need deterministic time.
-    pub fn pinned_for_at(
-        &self,
-        agent_did: &str,
-        now: i64,
-    ) -> Option<&PinnedAgentKey> {
+    pub fn pinned_for_at(&self, agent_did: &str, now: i64) -> Option<&PinnedAgentKey> {
         self.pinned_keys
             .iter()
             .filter(|p| p.agent_did == agent_did && p.is_valid_at(now))
@@ -443,7 +439,12 @@ mod tests {
         }
     }
 
-    fn pinned_window(did: &str, b64: &str, from: Option<i64>, until: Option<i64>) -> PinnedAgentKey {
+    fn pinned_window(
+        did: &str,
+        b64: &str,
+        from: Option<i64>,
+        until: Option<i64>,
+    ) -> PinnedAgentKey {
         PinnedAgentKey {
             agent_did: did.into(),
             public_key_b64: b64.into(),
@@ -569,11 +570,20 @@ pin_keys = []
             ],
         };
         // At t=120, only OLD is valid.
-        assert_eq!(cfg.pinned_for_at("did:web:x", 120).unwrap().public_key_b64, "OLD");
+        assert_eq!(
+            cfg.pinned_for_at("did:web:x", 120).unwrap().public_key_b64,
+            "OLD"
+        );
         // At t=175 (inside overlap), NEW wins because its valid_from is later.
-        assert_eq!(cfg.pinned_for_at("did:web:x", 175).unwrap().public_key_b64, "NEW");
+        assert_eq!(
+            cfg.pinned_for_at("did:web:x", 175).unwrap().public_key_b64,
+            "NEW"
+        );
         // At t=250, only NEW is valid.
-        assert_eq!(cfg.pinned_for_at("did:web:x", 250).unwrap().public_key_b64, "NEW");
+        assert_eq!(
+            cfg.pinned_for_at("did:web:x", 250).unwrap().public_key_b64,
+            "NEW"
+        );
     }
 
     #[test]
@@ -588,15 +598,30 @@ pin_keys = []
                 pinned_window("did:web:x", "K3", Some(180), None),
             ],
         };
-        assert_eq!(cfg.pinned_for_at("did:web:x", 50).unwrap().public_key_b64, "K1");
+        assert_eq!(
+            cfg.pinned_for_at("did:web:x", 50).unwrap().public_key_b64,
+            "K1"
+        );
         // Overlap K1+K2 → K2 (newer valid_from).
-        assert_eq!(cfg.pinned_for_at("did:web:x", 90).unwrap().public_key_b64, "K2");
+        assert_eq!(
+            cfg.pinned_for_at("did:web:x", 90).unwrap().public_key_b64,
+            "K2"
+        );
         // Only K2.
-        assert_eq!(cfg.pinned_for_at("did:web:x", 150).unwrap().public_key_b64, "K2");
+        assert_eq!(
+            cfg.pinned_for_at("did:web:x", 150).unwrap().public_key_b64,
+            "K2"
+        );
         // Overlap K2+K3 → K3 (newer valid_from).
-        assert_eq!(cfg.pinned_for_at("did:web:x", 190).unwrap().public_key_b64, "K3");
+        assert_eq!(
+            cfg.pinned_for_at("did:web:x", 190).unwrap().public_key_b64,
+            "K3"
+        );
         // Only K3.
-        assert_eq!(cfg.pinned_for_at("did:web:x", 500).unwrap().public_key_b64, "K3");
+        assert_eq!(
+            cfg.pinned_for_at("did:web:x", 500).unwrap().public_key_b64,
+            "K3"
+        );
     }
 
     #[test]
