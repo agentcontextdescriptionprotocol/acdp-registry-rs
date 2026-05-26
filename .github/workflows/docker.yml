@@ -17,10 +17,10 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           path: acdp-registry-rs
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: agentcontextdescriptionprotocol/acdp-rs
           path: acdp-rs

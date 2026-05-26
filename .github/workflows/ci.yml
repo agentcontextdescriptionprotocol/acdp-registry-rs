@@ -15,10 +15,10 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           path: acdp-registry-rs
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: agentcontextdescriptionprotocol/acdp-rs
           path: acdp-rs
@@ -33,10 +33,10 @@ jobs:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           path: acdp-registry-rs
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: agentcontextdescriptionprotocol/acdp-rs
           path: acdp-rs
@@ -80,10 +80,10 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           path: acdp-registry-rs
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: agentcontextdescriptionprotocol/acdp-rs
           path: acdp-rs
@@ -108,10 +108,10 @@ jobs:
     name: cargo-deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           path: acdp-registry-rs
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: agentcontextdescriptionprotocol/acdp-rs
           path: acdp-rs
