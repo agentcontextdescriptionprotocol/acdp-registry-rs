@@ -273,6 +273,8 @@ mod tests {
             agent_did: did.into(),
             public_key_b64: pub_b64,
             algorithm: "ed25519".into(),
+            valid_from: None,
+            valid_until: None,
         };
         let outcome = enforce_pinned_signature(&req, &cfg(vec![pinned], false)).unwrap();
         assert_eq!(outcome, PinOutcome::Verified);
@@ -291,6 +293,8 @@ mod tests {
             agent_did: did.into(),
             public_key_b64: wrong_pub,
             algorithm: "ed25519".into(),
+            valid_from: None,
+            valid_until: None,
         };
         let err = enforce_pinned_signature(&req, &cfg(vec![pinned], false)).unwrap_err();
         let msg = format!("{err:?}");
@@ -308,6 +312,8 @@ mod tests {
             agent_did: "did:web:x:agents:alice".into(),
             public_key_b64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
             algorithm: "ed25519".into(),
+            valid_from: None,
+            valid_until: None,
         };
         let outcome = enforce_pinned_signature(&req, &cfg(vec![pinned_for_other], false)).unwrap();
         assert_eq!(outcome, PinOutcome::Unpinned);
@@ -321,6 +327,8 @@ mod tests {
             agent_did: "did:web:x:agents:alice".into(),
             public_key_b64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
             algorithm: "ed25519".into(),
+            valid_from: None,
+            valid_until: None,
         };
         let err = enforce_pinned_signature(&req, &cfg(vec![pinned_for_other], true)).unwrap_err();
         let msg = format!("{err:?}");
@@ -337,6 +345,8 @@ mod tests {
             agent_did: did.into(),
             public_key_b64: pub_b64,
             algorithm: "ecdsa-p256".into(),
+            valid_from: None,
+            valid_until: None,
         };
         let outcome = enforce_pinned_signature(&req, &cfg(vec![pinned], false)).unwrap();
         assert_eq!(outcome, PinOutcome::Verified);
@@ -353,6 +363,8 @@ mod tests {
             agent_did: did.into(),
             public_key_b64: wrong_pub,
             algorithm: "ecdsa-p256".into(),
+            valid_from: None,
+            valid_until: None,
         };
         let err = enforce_pinned_signature(&req, &cfg(vec![pinned], false)).unwrap_err();
         let msg = format!("{err:?}");
@@ -372,6 +384,8 @@ mod tests {
             agent_did: did.into(),
             public_key_b64: too_short,
             algorithm: "ecdsa-p256".into(),
+            valid_from: None,
+            valid_until: None,
         };
         let err = enforce_pinned_signature(&req, &cfg(vec![pinned], false)).unwrap_err();
         let msg = format!("{err:?}");
@@ -394,6 +408,8 @@ mod tests {
             agent_did: did.into(),
             public_key_b64: bad_tag,
             algorithm: "ecdsa-p256".into(),
+            valid_from: None,
+            valid_until: None,
         };
         let err = enforce_pinned_signature(&req, &cfg(vec![pinned], false)).unwrap_err();
         let msg = format!("{err:?}");
@@ -417,6 +433,8 @@ mod tests {
             agent_did: did.into(),
             public_key_b64: pub_b64,
             algorithm: "ecdsa-p256".into(),
+            valid_from: None,
+            valid_until: None,
         };
         let err = enforce_pinned_signature(&req, &cfg(vec![pinned], false)).unwrap_err();
         let msg = format!("{err:?}");
@@ -439,6 +457,8 @@ mod tests {
             agent_did: did.into(),
             public_key_b64: ed_pub,
             algorithm: "ed25519".into(),
+            valid_from: None,
+            valid_until: None,
         };
         let err = enforce_pinned_signature(&req, &cfg(vec![pinned], false)).unwrap_err();
         let msg = format!("{err:?}");
@@ -459,6 +479,8 @@ mod tests {
             agent_did: did.into(),
             public_key_b64: pub_b64,
             algorithm: "rsa-sha256".into(),
+            valid_from: None,
+            valid_until: None,
         };
         let err = enforce_pinned_signature(&req, &cfg(vec![pinned], false)).unwrap_err();
         let msg = format!("{err:?}");
@@ -475,6 +497,8 @@ mod tests {
             agent_did: did.into(),
             public_key_b64: "not-base64!!!".into(),
             algorithm: "ed25519".into(),
+            valid_from: None,
+            valid_until: None,
         };
         let err = enforce_pinned_signature(&req, &cfg(vec![pinned], false)).unwrap_err();
         let msg = format!("{err:?}");
@@ -491,6 +515,8 @@ mod tests {
             agent_did: did.into(),
             public_key_b64: too_short,
             algorithm: "ed25519".into(),
+            valid_from: None,
+            valid_until: None,
         };
         let err = enforce_pinned_signature(&req, &cfg(vec![pinned], false)).unwrap_err();
         let msg = format!("{err:?}");
