@@ -130,13 +130,7 @@ async fn harness(playground: bool) -> Harness {
         resolver,
         AUTHORITY.into(),
     ));
-    let state = AppStateInner {
-        server,
-        auth,
-        webhook: None,
-        config: config(playground),
-        cross_registry: None,
-    };
+    let state = AppStateInner::new(server, auth, None, config(playground), None);
     Harness {
         router: build_router(state),
         _db: db,
@@ -266,13 +260,7 @@ async fn jwks_publishes_eddsa_public_key_in_eddsa_mode() {
         resolver,
         AUTHORITY.into(),
     ));
-    let state = AppStateInner {
-        server,
-        auth,
-        webhook: None,
-        config: config(true),
-        cross_registry: None,
-    };
+    let state = AppStateInner::new(server, auth, None, config(true), None);
     let router = build_router(state);
 
     let resp = router
@@ -853,13 +841,7 @@ async fn health_503_when_storage_pool_closed() {
         resolver,
         AUTHORITY.into(),
     ));
-    let state = AppStateInner {
-        server,
-        auth,
-        webhook: None,
-        config: config(true),
-        cross_registry: None,
-    };
+    let state = AppStateInner::new(server, auth, None, config(true), None);
     let app = build_router(state);
     let resp = app
         .oneshot(
@@ -911,13 +893,7 @@ async fn revoke_returns_503_when_revocations_not_configured() {
     ));
     let mut cfg = config(true);
     cfg.auth.enabled = true;
-    let state = AppStateInner {
-        server,
-        auth,
-        webhook: None,
-        config: cfg,
-        cross_registry: None,
-    };
+    let state = AppStateInner::new(server, auth, None, cfg, None);
     let app = build_router(state);
 
     let resp = app
@@ -1174,13 +1150,7 @@ async fn publish_payload_above_limit_rejected() {
     ));
     let mut cfg = config(true);
     cfg.limits.max_payload_bytes = 1024;
-    let state = AppStateInner {
-        server,
-        auth,
-        webhook: None,
-        config: cfg,
-        cross_registry: None,
-    };
+    let state = AppStateInner::new(server, auth, None, cfg, None);
     let app = build_router(state);
 
     let big = vec![b'x'; 4096];
@@ -1362,13 +1332,7 @@ async fn harness_with_playground(playground: PlaygroundConfig) -> Harness {
     ));
     let mut cfg = config(true);
     cfg.playground = playground;
-    let state = AppStateInner {
-        server,
-        auth,
-        webhook: None,
-        config: cfg,
-        cross_registry: None,
-    };
+    let state = AppStateInner::new(server, auth, None, cfg, None);
     Harness {
         router: build_router(state),
         _db: db,

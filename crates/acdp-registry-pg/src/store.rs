@@ -110,6 +110,7 @@ impl ExtendedRegistryStore for PgStore {
         limit: u32,
         cursor: Option<&str>,
         requester: Option<&AgentDid>,
+        tenant: Option<&str>,
     ) -> Result<Page<FullContext>, AcdpError> {
         let limit = limit.clamp(1, 200) as i64;
         let anchor = cursor.map(decode_cursor).transpose()?.flatten();
@@ -120,6 +121,14 @@ impl ExtendedRegistryStore for PgStore {
         // file and is fragile if the clamp is ever loosened.
         let mut q = String::from("SELECT body_json, status FROM contexts WHERE 1=1");
         let mut next_pos = 1usize;
+        // Plan §7: SQL-level tenant filter — see sqlite/list_contexts
+        // and store/lib.rs for rationale. The composite
+        // `idx_ctx_tenant_created` index from migration 006_tenant_id
+        // covers the (tenant_id, created_at) order this query uses.
+        if tenant.is_some() {
+            q.push_str(&format!(" AND tenant_id = ${}", next_pos));
+            next_pos += 1;
+        }
         if anchor.is_some() {
             q.push_str(&format!(
                 " AND (created_at < ${a} OR (created_at = ${a} AND ctx_id > ${b}))",
@@ -134,6 +143,9 @@ impl ExtendedRegistryStore for PgStore {
         ));
 
         let mut query = sqlx::query(&q);
+        if let Some(t) = tenant {
+            query = query.bind(t);
+        }
         if let Some((anchor_ts, anchor_ctx)) = anchor.as_ref() {
             query = query.bind(*anchor_ts).bind(anchor_ctx);
         }

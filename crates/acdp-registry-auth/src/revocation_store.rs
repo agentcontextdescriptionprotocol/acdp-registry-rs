@@ -59,6 +59,24 @@ pub trait RevocationStore: Send + Sync {
     /// Drop tombstones whose `expires_at` has elapsed. Bounded background
     /// task — keeps the table from growing forever.
     async fn evict_expired(&self, now: DateTime<Utc>) -> Result<(), AuthError>;
+
+    /// Read the persisted poll cursor for a federated `issuer`.
+    ///
+    /// `None` means the registry has never polled this peer (or the
+    /// row was never written) — the poller should start at 0. The
+    /// in-memory implementation always returns `None`, matching the
+    /// pre-§5 "refetch from 0 on restart" behavior.
+    ///
+    /// Plan §5.
+    async fn get_revocation_cursor(&self, issuer: &str) -> Result<Option<i64>, AuthError>;
+
+    /// Persist the poll cursor for a federated `issuer`. Idempotent —
+    /// callers write the cursor only after the corresponding batch
+    /// has been applied locally, so a partial-batch failure leaves
+    /// the prior cursor in place and the entries retry next interval.
+    ///
+    /// Plan §5.
+    async fn set_revocation_cursor(&self, issuer: &str, cursor_ms: i64) -> Result<(), AuthError>;
 }
 
 // ── In-memory ────────────────────────────────────────────────────────────────
@@ -66,6 +84,10 @@ pub trait RevocationStore: Send + Sync {
 #[derive(Default)]
 pub struct InMemoryRevocationStore {
     inner: Mutex<HashMap<String, InMemoryEntry>>,
+    /// Per-issuer revocation-feed cursor cache (plan §5). In-memory
+    /// only — disappears on restart, matching the pre-§5 behavior. Use
+    /// the SQLite or Postgres backends in production.
+    cursors: Mutex<HashMap<String, i64>>,
 }
 
 impl InMemoryRevocationStore {
@@ -140,6 +162,23 @@ impl RevocationStore for InMemoryRevocationStore {
             .lock()
             .map_err(|_| AuthError::Internal("lock poisoned".into()))?;
         g.retain(|_, e| e.record.expires_at > now);
+        Ok(())
+    }
+
+    async fn get_revocation_cursor(&self, issuer: &str) -> Result<Option<i64>, AuthError> {
+        let g = self
+            .cursors
+            .lock()
+            .map_err(|_| AuthError::Internal("cursor lock poisoned".into()))?;
+        Ok(g.get(issuer).copied())
+    }
+
+    async fn set_revocation_cursor(&self, issuer: &str, cursor_ms: i64) -> Result<(), AuthError> {
+        let mut g = self
+            .cursors
+            .lock()
+            .map_err(|_| AuthError::Internal("cursor lock poisoned".into()))?;
+        g.insert(issuer.to_string(), cursor_ms);
         Ok(())
     }
 }
@@ -239,6 +278,33 @@ impl RevocationStore for SqliteRevocationStore {
             .map(|_| ())
             .map_err(|e| AuthError::Storage(e.to_string()))
     }
+
+    async fn get_revocation_cursor(&self, issuer: &str) -> Result<Option<i64>, AuthError> {
+        use sqlx::Row;
+        let row =
+            sqlx::query("SELECT cursor_ms FROM auth_revocation_poll_cursors WHERE issuer = ?")
+                .bind(issuer)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| AuthError::Storage(e.to_string()))?;
+        Ok(row.and_then(|r| r.try_get::<i64, _>("cursor_ms").ok()))
+    }
+
+    async fn set_revocation_cursor(&self, issuer: &str, cursor_ms: i64) -> Result<(), AuthError> {
+        sqlx::query(
+            "INSERT INTO auth_revocation_poll_cursors (issuer, cursor_ms, updated_at) \
+             VALUES (?, ?, ?) \
+             ON CONFLICT(issuer) DO UPDATE SET cursor_ms = excluded.cursor_ms, \
+                                               updated_at = excluded.updated_at",
+        )
+        .bind(issuer)
+        .bind(cursor_ms)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|e| AuthError::Storage(e.to_string()))
+    }
 }
 
 // ── Postgres ─────────────────────────────────────────────────────────────────
@@ -329,6 +395,33 @@ impl RevocationStore for PgRevocationStore {
             .map(|_| ())
             .map_err(|e| AuthError::Storage(e.to_string()))
     }
+
+    async fn get_revocation_cursor(&self, issuer: &str) -> Result<Option<i64>, AuthError> {
+        use sqlx::Row;
+        let row =
+            sqlx::query("SELECT cursor_ms FROM auth_revocation_poll_cursors WHERE issuer = $1")
+                .bind(issuer)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| AuthError::Storage(e.to_string()))?;
+        Ok(row.and_then(|r| r.try_get::<i64, _>("cursor_ms").ok()))
+    }
+
+    async fn set_revocation_cursor(&self, issuer: &str, cursor_ms: i64) -> Result<(), AuthError> {
+        sqlx::query(
+            "INSERT INTO auth_revocation_poll_cursors (issuer, cursor_ms, updated_at) \
+             VALUES ($1, $2, $3) \
+             ON CONFLICT (issuer) DO UPDATE SET cursor_ms = EXCLUDED.cursor_ms, \
+                                                updated_at = EXCLUDED.updated_at",
+        )
+        .bind(issuer)
+        .bind(cursor_ms)
+        .bind(Utc::now())
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|e| AuthError::Storage(e.to_string()))
+    }
 }
 
 #[cfg(test)]
@@ -381,6 +474,61 @@ mod tests {
         let s = InMemoryRevocationStore::new();
         s.revoke(rec("t2")).await.unwrap();
         assert!(s.is_revoked("t2").unwrap());
+    }
+
+    #[tokio::test]
+    async fn in_memory_cursor_round_trip() {
+        let s = InMemoryRevocationStore::new();
+        assert_eq!(s.get_revocation_cursor("cp.local").await.unwrap(), None);
+        s.set_revocation_cursor("cp.local", 1_700_000_000_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            s.get_revocation_cursor("cp.local").await.unwrap(),
+            Some(1_700_000_000_000)
+        );
+        // Update for the same issuer overwrites.
+        s.set_revocation_cursor("cp.local", 1_700_000_005_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            s.get_revocation_cursor("cp.local").await.unwrap(),
+            Some(1_700_000_005_000)
+        );
+        // A different issuer has its own cell.
+        assert_eq!(s.get_revocation_cursor("other.local").await.unwrap(), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sqlite_cursor_round_trip() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE auth_revocation_poll_cursors (
+                issuer TEXT NOT NULL PRIMARY KEY,
+                cursor_ms INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let s = SqliteRevocationStore::new(pool);
+        assert_eq!(s.get_revocation_cursor("cp.local").await.unwrap(), None);
+        s.set_revocation_cursor("cp.local", 1_700_000_000_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            s.get_revocation_cursor("cp.local").await.unwrap(),
+            Some(1_700_000_000_000)
+        );
+        // Upsert path.
+        s.set_revocation_cursor("cp.local", 1_700_000_005_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            s.get_revocation_cursor("cp.local").await.unwrap(),
+            Some(1_700_000_005_000)
+        );
     }
 
     #[tokio::test]

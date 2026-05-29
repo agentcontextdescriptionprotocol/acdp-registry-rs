@@ -155,10 +155,18 @@ impl ExtendedRegistryStore for SqliteStore {
         limit: u32,
         cursor: Option<&str>,
         requester: Option<&AgentDid>,
+        tenant: Option<&str>,
     ) -> Result<Page<FullContext>, AcdpError> {
         let limit = limit.clamp(1, 200) as i64;
         let anchor = cursor.map(decode_cursor).transpose()?.flatten();
         let mut sql = String::from("SELECT body_json, status FROM contexts WHERE 1=1");
+        // Plan §7: push the tenant filter into SQL so a busy
+        // mixed-tenant registry doesn't return short pages caused by a
+        // post-query retain. The `idx_ctx_tenant_created` index lets
+        // this stay selective.
+        if tenant.is_some() {
+            sql.push_str(" AND tenant_id = ?");
+        }
         if anchor.is_some() {
             // RFC3339 strings compare lexicographically when the timezone is UTC,
             // so we can do the keyset compare directly on the stored TEXT column
@@ -169,6 +177,9 @@ impl ExtendedRegistryStore for SqliteStore {
         sql.push_str(" ORDER BY created_at DESC, ctx_id ASC LIMIT ?");
 
         let mut q = sqlx::query(&sql);
+        if let Some(t) = tenant {
+            q = q.bind(t);
+        }
         if let Some((anchor_ts, anchor_ctx)) = anchor.as_ref() {
             let anchor_rfc = anchor_ts.to_rfc3339();
             q = q.bind(anchor_rfc.clone()).bind(anchor_rfc).bind(anchor_ctx);

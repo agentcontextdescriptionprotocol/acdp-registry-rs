@@ -102,7 +102,12 @@ fn build_cors_layer(allowed_origins: &[String]) -> CorsLayer {
 
 #[cfg(feature = "playground")]
 fn admin_router<S: ExtendedRegistryStore + 'static>() -> Router<Arc<AppState<S>>> {
-    Router::new().route("/admin/contexts", get(handlers::admin_list::<S>))
+    Router::new()
+        .route("/admin/contexts", get(handlers::admin_list::<S>))
+        .route(
+            "/admin/pinned-keys/reload",
+            post(handlers::reload_pinned_keys::<S>),
+        )
 }
 
 #[cfg(not(feature = "playground"))]

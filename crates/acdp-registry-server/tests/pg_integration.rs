@@ -147,13 +147,7 @@ async fn harness(playground: bool, url: &str) -> axum::Router {
         resolver,
         AUTHORITY.into(),
     ));
-    let state = AppStateInner {
-        server,
-        auth,
-        webhook: None,
-        config: config(playground),
-        cross_registry: None,
-    };
+    let state = AppStateInner::new(server, auth, None, config(playground), None);
     build_router(state)
 }
 

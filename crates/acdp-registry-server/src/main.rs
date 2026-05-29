@@ -349,14 +349,10 @@ async fn serve_with_store<S: ExtendedRegistryStore + 'static>(
         None
     };
 
-    // Compose state + router.
-    let state = AppStateInner {
-        server,
-        auth,
-        webhook,
-        config: cfg.clone(),
-        cross_registry,
-    };
+    // Compose state + router. The constructor seeds `playground` —
+    // the live-mutable cell backing `POST /admin/pinned-keys/reload`
+    // (plan §2) — from `cfg.playground`.
+    let state = AppStateInner::new(server, auth, webhook, cfg.clone(), cross_registry);
     let router = build_router(state);
 
     // Bind. TLS is optional — production typically terminates upstream.
