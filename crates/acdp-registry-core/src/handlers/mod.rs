@@ -11,4 +11,4 @@ pub use meta::{capabilities, health, jwks};
 #[cfg(feature = "playground")]
 mod admin;
 #[cfg(feature = "playground")]
-pub use admin::admin_list;
+pub use admin::{admin_list, reload_pinned_keys};

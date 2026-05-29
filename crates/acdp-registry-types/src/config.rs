@@ -187,6 +187,42 @@ pub struct AuthConfig {
     /// registry trusts only its own revocation list.
     #[serde(default)]
     pub revocation_feeds: Vec<RevocationFeedConfig>,
+
+    /// API tokens accepted on admin endpoints (currently
+    /// `POST /admin/pinned-keys/reload`). Bearer the value verbatim in
+    /// the `Authorization` header. Empty (the default) means the admin
+    /// endpoints reject every caller — admin reload is opt-in per
+    /// deployment.
+    #[serde(default)]
+    pub admin_tokens: Vec<String>,
+
+    /// Agent→tenant bindings the registry stamps onto its own issued
+    /// JWTs. When an agent listed here completes a `/auth/token`
+    /// challenge, the resulting `BearerClaims.tenant` is set to the
+    /// configured tenant id — making downstream `tenant_for_request`
+    /// behave symmetrically with the CP's issuer. Empty (the default)
+    /// means registry-issued tokens carry `tenant: None`, preserving
+    /// V0 behavior. Plan §4.
+    #[serde(default)]
+    pub tenant_agents: Vec<TenantAgentBinding>,
+}
+
+/// One agent→tenant binding for registry-issued JWTs.
+///
+/// Wire format (TOML):
+///
+///   [[auth.tenant_agents]]
+///   agent_did = "did:web:agents.example:alice"
+///   tenant_id = "tenant-a"
+///
+/// Agents not listed here mint tokens with `tenant: None`. Operators
+/// who want every agent to be tenant-bound should ensure every
+/// challenge-completing agent has an entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TenantAgentBinding {
+    pub agent_did: String,
+    pub tenant_id: String,
 }
 
 /// One peer issuer whose revocation list this registry should mirror.
@@ -256,6 +292,8 @@ impl Default for AuthConfig {
             jwt_private_key_pem: String::new(),
             jwt_kid: String::new(),
             revocation_feeds: Vec::new(),
+            admin_tokens: Vec::new(),
+            tenant_agents: Vec::new(),
         }
     }
 }

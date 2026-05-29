@@ -5,17 +5,24 @@
 //! is admin-gated (`Authorization: Bearer <admin_token>`); a single
 //! shared admin api key per peer is the V1 trust model.
 //!
-//! Per-issuer cursor (in unix-ms) is held in-memory only — on restart
-//! the poller refetches the whole feed from `since=0`. The peer's
-//! cursor pagination is strict-greater-than so a full refetch is
-//! correct (just chatty). Persisting the cursor is plan-§9 follow-up.
+//! Per-issuer cursor (in unix-ms) is persisted via
+//! [`RevocationStore::get_revocation_cursor`] /
+//! [`set_revocation_cursor`] (plan §5). On startup the poller reads
+//! the persisted cursor; on a successfully-applied batch it writes
+//! the new cursor. A restart picks up exactly where the prior
+//! instance left off — no re-fetching the whole feed from `since=0`.
 //!
 //! Failure modes:
 //!   - Peer 4xx/5xx → log warn, retry next interval (don't crash).
 //!   - Peer payload malformed → log warn, drop the batch.
-//!   - Local store error → log warn, drop the batch (the entry will
-//!     be retried next interval since the cursor only advances on
-//!     successful local writes).
+//!   - Local revoke() error on any entry in a batch → log warn, drop
+//!     the batch AND leave the cursor unchanged so the failed entry
+//!     retries next interval. This is the cost of correctness: a
+//!     single failing entry replays the whole page once a tick.
+//!   - Cursor persistence error → log warn, advance the in-memory
+//!     cursor anyway (so the next poll within this process doesn't
+//!     refetch). A restart would re-fetch the page, but `revoke()`
+//!     is idempotent so the apply is harmless.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -64,23 +71,61 @@ async fn poll_loop(cfg: RevocationFeedConfig, store: Arc<dyn RevocationStore>) {
             return;
         }
     };
-    let mut cursor: i64 = 0;
+    // Restart-survival (plan §5): start from the persisted cursor.
+    // A None / error here is non-fatal — falling back to 0 just
+    // re-fetches the full feed once, which is correct (idempotent
+    // revoke + strict-greater-than pagination upstream).
+    let mut cursor: i64 = match store.get_revocation_cursor(&cfg.issuer).await {
+        Ok(Some(c)) => {
+            tracing::info!(
+                issuer = %cfg.issuer,
+                cursor = c,
+                "revocation poller resumed from persisted cursor"
+            );
+            c
+        }
+        Ok(None) => 0,
+        Err(e) => {
+            tracing::warn!(
+                issuer = %cfg.issuer,
+                error = %e,
+                "failed to load persisted revocation cursor, starting at 0"
+            );
+            0
+        }
+    };
     let mut interval = tokio::time::interval(Duration::from_secs(cfg.poll_seconds.max(1)));
     // Skip the first tick so we start polling immediately.
     interval.tick().await;
     loop {
         match fetch_once(&client, &cfg, cursor).await {
-            Ok((applied, next)) => {
+            Ok((entries, next)) => {
+                let count = entries.len();
+                let all_succeeded = apply_entries(&entries, &store, &cfg).await;
                 tracing::info!(
                     issuer = %cfg.issuer,
-                    count = applied.len(),
+                    count,
                     next_cursor = ?next,
+                    all_succeeded,
                     "revocation feed poll succeeded"
                 );
-                if let Some(c) = next {
-                    cursor = c;
+                // Plan §5: advance the cursor ONLY when every entry
+                // in the batch applied locally. A partial failure
+                // keeps the cursor where it is so the next tick
+                // refetches the failed entries.
+                if all_succeeded {
+                    if let Some(c) = next {
+                        cursor = c;
+                        if let Err(e) = store.set_revocation_cursor(&cfg.issuer, c).await {
+                            tracing::warn!(
+                                issuer = %cfg.issuer,
+                                cursor = c,
+                                error = %e,
+                                "failed to persist revocation cursor (will replay on restart)"
+                            );
+                        }
+                    }
                 }
-                apply_entries_or_log(applied, &store, &cfg).await;
             }
             Err(e) => {
                 tracing::warn!(
@@ -116,16 +161,25 @@ async fn fetch_once(
     Ok((body.entries, body.next_cursor))
 }
 
-async fn apply_entries_or_log(
-    entries: Vec<FeedEntry>,
+/// Apply each entry to the local store. Returns `true` only if every
+/// entry succeeded (the plan-§5 contract — partial failure keeps the
+/// cursor where it is so the failed entry retries next tick).
+///
+/// Entries with a malformed `exp` are *skipped* but still count as
+/// "applied": they're irrecoverable upstream errors (a broken peer
+/// payload), so refetching won't fix them. A future audit can grep
+/// for the warn log if these become frequent.
+async fn apply_entries(
+    entries: &[FeedEntry],
     store: &Arc<dyn RevocationStore>,
     cfg: &RevocationFeedConfig,
-) {
+) -> bool {
+    let mut all_succeeded = true;
     for e in entries {
         let expires_at = match Utc.timestamp_opt(e.exp, 0).single() {
             Some(t) => t,
             None => {
-                tracing::warn!(jti = %e.jti, exp = e.exp, "feed entry has malformed exp");
+                tracing::warn!(jti = %e.jti, exp = e.exp, "feed entry has malformed exp; skipping");
                 continue;
             }
         };
@@ -142,10 +196,12 @@ async fn apply_entries_or_log(
                 issuer = %cfg.issuer,
                 jti = %e.jti,
                 error = %err,
-                "failed to apply propagated revocation"
+                "failed to apply propagated revocation; cursor will not advance this tick"
             );
+            all_succeeded = false;
         }
     }
+    all_succeeded
 }
 
 fn revoked_at_from_ms(ms: i64) -> Option<DateTime<Utc>> {

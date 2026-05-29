@@ -201,7 +201,17 @@ pub async fn publish<S: ExtendedRegistryStore + 'static>(
 
     let server = state.server.clone();
     let resolver = state.auth.resolver.clone();
-    let response: PublishResponse = if state.config.playground.enabled {
+    // Snapshot the playground config once per request. The cell is
+    // mutable (plan §2: `POST /admin/pinned-keys/reload` swaps it
+    // live) so a clone here is the cheapest way to keep an internally
+    // consistent view for the duration of this request without holding
+    // the read lock across `.await` boundaries below.
+    let playground_snapshot = state
+        .playground
+        .read()
+        .expect("playground RwLock poisoned")
+        .clone();
+    let response: PublishResponse = if playground_snapshot.enabled {
         // Playground: skip DID verification — stop after schema + size + hash.
         // `publish_unverified_for_tests` doesn't accept an idempotency key,
         // so we run idempotency lookup/record around it via the store to
@@ -212,8 +222,7 @@ pub async fn publish<S: ExtendedRegistryStore + 'static>(
         // claiming a pinned DID unless the signature verifies against the
         // pinned public key. In strict mode (`pinned_only = true`), every
         // publishing agent must be listed.
-        let pin_outcome =
-            crate::playground::enforce_pinned_signature(&req, &state.config.playground)?;
+        let pin_outcome = crate::playground::enforce_pinned_signature(&req, &playground_snapshot)?;
         tracing::debug!(
             agent_did = req.agent_id.as_str(),
             pin_outcome = ?pin_outcome,
@@ -448,7 +457,32 @@ pub async fn retrieve_body<S: ExtendedRegistryStore + 'static>(
         )))
 }
 
+/// Maximum inner pages the §7 refill loop walks before returning what
+/// it has. Caps the cost of a tenant whose results are sparse-or-absent
+/// inside the upstream's ordered scan — without the cap, a tenant with
+/// zero matches against a busy registry would walk the whole table.
+const SEARCH_REFILL_MAX_PAGES: usize = 6;
+
 /// `GET /contexts/search`.
+///
+/// When the caller asserts a tenant (JWT claim or `X-Tenant-Id` header)
+/// and the registry serves multiple tenants, the upstream
+/// `RegistryStore::search` returns a single page of up-to-N rows that
+/// the handler must then narrow to the caller's tenant. Pre-§7 the
+/// narrowing happened *after* pagination, so a `?limit=20` request
+/// against a busy mixed-tenant registry could return 2 rows even though
+/// many more exist for that tenant just beyond the page.
+///
+/// §7 fix: bounded refill. The handler asks the store for successive
+/// pages along the cursor and accumulates only rows that match the
+/// caller's tenant until `target` is reached. The loop is capped at
+/// [`SEARCH_REFILL_MAX_PAGES`] so a tenant with zero matches doesn't
+/// turn one HTTP request into an unbounded backend scan.
+///
+/// SQL-level filtering for `search` would be cleaner but requires
+/// extending the upstream `RegistryStore::search` trait — out of
+/// scope for this PR. The `admin_list` endpoint took the SQL path
+/// (see `ExtendedRegistryStore::list_contexts(..., tenant)`).
 pub async fn search<S: ExtendedRegistryStore + 'static>(
     State(state): State<Arc<AppState<S>>>,
     headers: HeaderMap,
@@ -457,38 +491,16 @@ pub async fn search<S: ExtendedRegistryStore + 'static>(
     let requester = caller_from_headers(&state, &headers)?;
     let query_text = q.q.clone();
     let (params, visibility_filter) = q.into_params();
-    let server = state.server.clone();
-    let req_owned = requester.clone();
-    let mut resp = tokio::task::spawn_blocking(move || server.search(&params, req_owned.as_ref()))
-        .await
-        .map_err(|e| RegistryError::Internal(format!("join: {e}")))??;
+    let requested_tenant = tenant_for_request(&state, &headers)?;
 
-    // FEAT-07: client-supplied visibility filter applied at the handler
-    // boundary because the upstream `SearchParams` shape has no such field.
-    // The visibility-gate in the store still runs first (RFC-ACDP-0008
-    // §4.5 disclosure rules), so this only narrows results the caller is
-    // already permitted to see.
-    if let Some(want) = visibility_filter {
-        resp.matches
-            .retain(|m| m.visibility.as_ref() == Some(&want));
-    }
-
-    // Tenant filter — same opt-in semantics as retrieve. Absent
-    // X-Tenant-Id → no filter (V0 backward-compat). Present → drop
-    // any match whose row is tagged to a different tenant. Uses the
-    // batch lookup so it's one extra query, not N.
-    if let Some(requested_tenant) = tenant_for_request(&state, &headers)? {
-        if !resp.matches.is_empty() {
-            let ids: Vec<&str> = resp.matches.iter().map(|m| m.ctx_id.as_str()).collect();
-            let owners = state.server.store().tenants_of_ctxs(&ids).await?;
-            resp.matches.retain(|m| {
-                owners
-                    .get(m.ctx_id.as_str())
-                    .map(|t| t == &requested_tenant)
-                    .unwrap_or(false)
-            });
-        }
-    }
+    let resp = run_search_with_refill(
+        &state,
+        requester.clone(),
+        params,
+        visibility_filter,
+        requested_tenant,
+    )
+    .await?;
 
     if let Some(emitter) = &state.webhook {
         emitter.emit(WebhookEvent::SearchExecuted {
@@ -499,6 +511,102 @@ pub async fn search<S: ExtendedRegistryStore + 'static>(
         });
     }
     Ok(Json(resp))
+}
+
+/// Drive `server.search` with handler-side post-filters (visibility +
+/// tenant). When a tenant is asserted, walks the cursor across up to
+/// [`SEARCH_REFILL_MAX_PAGES`] inner pages so a busy mixed-tenant
+/// registry can still return a non-trivial page worth of matches.
+///
+/// `matches.len()` may end up slightly above `target` on the final
+/// inner page (we don't truncate to avoid skipping the surplus on the
+/// next user request — the cursor encodes positions at the page level,
+/// not the row level). Callers treat `limit` as a hint, not a strict
+/// cap. The `next_cursor` returned is the *last inner page's*
+/// `next_cursor`, so resuming pagination is correct.
+async fn run_search_with_refill<S: ExtendedRegistryStore + 'static>(
+    state: &Arc<AppState<S>>,
+    requester: Option<acdp::types::primitives::AgentDid>,
+    mut params: SearchParams,
+    visibility_filter: Option<Visibility>,
+    requested_tenant: Option<String>,
+) -> Result<SearchResponse, RegistryError> {
+    let target = params.limit.unwrap_or(20).max(1) as usize;
+    // Inner pages always ask for `target` rows so a healthy tenant gets
+    // close to the right page in a single hop. Set once; only `cursor`
+    // changes per iteration. The fan-out is capped by
+    // SEARCH_REFILL_MAX_PAGES regardless.
+    params.limit = Some(target as u32);
+
+    let mut accumulated: Vec<acdp::types::search::SearchResult> = Vec::with_capacity(target);
+    let mut cursor = params.cursor.clone();
+    let mut total_estimate: Option<u64> = None;
+    let mut iterations = 0usize;
+
+    loop {
+        iterations += 1;
+        params.cursor = cursor.clone();
+
+        let server = state.server.clone();
+        let req_owned = requester.clone();
+        // `server.search` is synchronous, so it runs on the blocking pool.
+        // We move `params` in and hand it back out with the result, which
+        // lets the loop reuse it next iteration without requiring
+        // `SearchParams: Clone` — keeps this crate decoupled from an
+        // upstream derive.
+        let (result, returned_params) = tokio::task::spawn_blocking(move || {
+            let r = server.search(&params, req_owned.as_ref());
+            (r, params)
+        })
+        .await
+        .map_err(|e| RegistryError::Internal(format!("join: {e}")))?;
+        params = returned_params;
+        let resp = result?;
+
+        // First page sets the estimate; we don't try to aggregate across
+        // pages because the upstream estimate is already a hint.
+        if total_estimate.is_none() {
+            total_estimate = resp.total_estimate;
+        }
+
+        let mut matches = resp.matches;
+        if let Some(want) = &visibility_filter {
+            matches.retain(|m| m.visibility.as_ref() == Some(want));
+        }
+        if let Some(tenant) = &requested_tenant {
+            if !matches.is_empty() {
+                let ids: Vec<&str> = matches.iter().map(|m| m.ctx_id.as_str()).collect();
+                let owners = state.server.store().tenants_of_ctxs(&ids).await?;
+                matches.retain(|m| {
+                    owners
+                        .get(m.ctx_id.as_str())
+                        .map(|t| t == tenant)
+                        .unwrap_or(false)
+                });
+            }
+        }
+        accumulated.extend(matches);
+
+        // Refill only when a tenant is asserted. Without a tenant
+        // filter the original single-page behavior is preserved
+        // bit-for-bit — no behavior change for non-multitenant
+        // deployments.
+        let should_refill = requested_tenant.is_some()
+            && accumulated.len() < target
+            && resp.next_cursor.is_some()
+            && iterations < SEARCH_REFILL_MAX_PAGES;
+
+        cursor = resp.next_cursor;
+        if !should_refill {
+            break;
+        }
+    }
+
+    Ok(SearchResponse {
+        matches: accumulated,
+        total_estimate,
+        next_cursor: cursor,
+    })
 }
 
 /// `GET /lineages/{lineage_id}`.

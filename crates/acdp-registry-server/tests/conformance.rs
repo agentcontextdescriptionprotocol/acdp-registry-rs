@@ -124,13 +124,7 @@ async fn harness() -> axum::Router {
         resolver,
         AUTHORITY.into(),
     ));
-    let state = AppStateInner {
-        server,
-        auth,
-        webhook: None,
-        config: config(),
-        cross_registry: None,
-    };
+    let state = AppStateInner::new(server, auth, None, config(), None);
     build_router(state)
 }
 
@@ -352,13 +346,7 @@ async fn playground_compiled_in_but_runtime_disabled_keeps_admin_route() {
     ));
     let mut cfg = config();
     cfg.playground.enabled = false;
-    let state = AppStateInner {
-        server,
-        auth,
-        webhook: None,
-        config: cfg,
-        cross_registry: None,
-    };
+    let state = AppStateInner::new(server, auth, None, cfg, None);
     let app = build_router(state);
     let resp = app
         .oneshot(

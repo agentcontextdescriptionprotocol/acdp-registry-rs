@@ -6,7 +6,9 @@ use std::sync::Arc;
 use acdp::did::WebResolver;
 use acdp::types::primitives::AgentDid;
 use acdp_registry_types::auth::AcdpClaims;
-use acdp_registry_types::{AuthChallenge, AuthConfig, BearerClaims, TokenRequest, TokenResponse};
+use acdp_registry_types::{
+    AuthChallenge, AuthConfig, BearerClaims, TenantAgentBinding, TokenRequest, TokenResponse,
+};
 use chrono::{Duration, Utc};
 use rand::RngCore;
 use uuid::Uuid;
@@ -229,10 +231,13 @@ impl AuthService {
                 registry: self.authority.clone(),
                 key_id: req.key_id.clone(),
             },
-            // Tenant binding for registry-issued tokens is plan-§6
-            // follow-up — the registry doesn't yet maintain an
-            // agent→tenant map. None here preserves V0 behavior.
-            tenant: None,
+            // Tenant binding (plan §4): when the agent is listed in
+            // `auth.tenant_agents`, stamp the configured tenant id so
+            // downstream `tenant_for_request` (and federated peers'
+            // AuthGuards) see the same authoritative binding the CP
+            // already emits. Agents not in the map carry `None`,
+            // matching V0 behavior — backward compatible.
+            tenant: tenant_for_agent(&self.config.tenant_agents, &req.agent_id),
         };
         let token = self.signer.sign(&claims)?;
         // SEC-01 (post-798cb34): record the issued jti so the revocation
@@ -335,6 +340,21 @@ pub fn extract_bearer(value: &str) -> Option<&str> {
         .map(str::trim)
 }
 
+/// Resolve an `agent_did` against the configured agent→tenant bindings.
+///
+/// Returns the matching `tenant_id` (cloned) or `None` if the agent
+/// isn't bound. Linear scan is fine — the binding list is bounded by
+/// operator-managed config; we don't expect thousands of entries.
+/// When multiple entries match the same DID, the first wins; this
+/// mirrors how the CP's `parseTenantAgents` reports a duplicate as a
+/// config error rather than silently merging.
+pub(crate) fn tenant_for_agent(bindings: &[TenantAgentBinding], agent_did: &str) -> Option<String> {
+    bindings
+        .iter()
+        .find(|b| b.agent_did == agent_did)
+        .map(|b| b.tenant_id.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,6 +435,65 @@ mod tests {
             AuthError::AlgorithmNotSupported(s) => assert_eq!(s, "rsa"),
             other => panic!("expected AlgorithmNotSupported, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tenant_for_agent_returns_bound_tenant() {
+        let bindings = vec![
+            TenantAgentBinding {
+                agent_did: "did:web:agents.example:alice".into(),
+                tenant_id: "tenant-a".into(),
+            },
+            TenantAgentBinding {
+                agent_did: "did:web:agents.example:bob".into(),
+                tenant_id: "tenant-b".into(),
+            },
+        ];
+        assert_eq!(
+            tenant_for_agent(&bindings, "did:web:agents.example:alice"),
+            Some("tenant-a".into())
+        );
+        assert_eq!(
+            tenant_for_agent(&bindings, "did:web:agents.example:bob"),
+            Some("tenant-b".into())
+        );
+    }
+
+    #[test]
+    fn tenant_for_agent_returns_none_for_unlisted_agent() {
+        let bindings = vec![TenantAgentBinding {
+            agent_did: "did:web:agents.example:alice".into(),
+            tenant_id: "tenant-a".into(),
+        }];
+        assert_eq!(
+            tenant_for_agent(&bindings, "did:web:agents.example:carol"),
+            None
+        );
+    }
+
+    #[test]
+    fn tenant_for_agent_handles_empty_list() {
+        assert_eq!(tenant_for_agent(&[], "did:web:agents.example:alice"), None);
+    }
+
+    #[test]
+    fn tenant_for_agent_takes_first_when_duplicate() {
+        // Duplicate-DID config is operator error, but the lookup must
+        // remain deterministic; first wins.
+        let bindings = vec![
+            TenantAgentBinding {
+                agent_did: "did:web:dup".into(),
+                tenant_id: "first".into(),
+            },
+            TenantAgentBinding {
+                agent_did: "did:web:dup".into(),
+                tenant_id: "second".into(),
+            },
+        ];
+        assert_eq!(
+            tenant_for_agent(&bindings, "did:web:dup"),
+            Some("first".into())
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

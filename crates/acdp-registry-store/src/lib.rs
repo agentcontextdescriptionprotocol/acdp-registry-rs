@@ -27,11 +27,26 @@ pub struct Page<T> {
 pub trait ExtendedRegistryStore: RegistryStore + Send + Sync {
     /// Paginated listing for admin / debug. Visibility rules apply: if
     /// `requester` is `None`, only public bodies are returned.
+    ///
+    /// `tenant` (plan §7): when `Some`, the backend MUST filter rows
+    /// at the storage layer so the returned page contains only that
+    /// tenant's contexts. This eliminates the "short pages" wart of
+    /// the prior post-query filter — a caller asking for `?limit=20`
+    /// against a mixed-tenant registry now receives `min(20, available)`
+    /// rows for their tenant, not `min(20, available_across_all_tenants)`
+    /// reduced by an in-Rust retain.
+    ///
+    /// `None` preserves V0 behavior (no tenant filter). Implementations
+    /// SHOULD pair this with a composite `(tenant_id, created_at)`
+    /// index so the WHERE clause stays selective on busy registries —
+    /// `idx_ctx_tenant_created` from migration 006/007 (PG/SQLite) is
+    /// already in place.
     async fn list_contexts(
         &self,
         limit: u32,
         cursor: Option<&str>,
         requester: Option<&AgentDid>,
+        tenant: Option<&str>,
     ) -> Result<Page<FullContext>, AcdpError>;
 
     /// Storage backend health check. `Ok(())` on success.
