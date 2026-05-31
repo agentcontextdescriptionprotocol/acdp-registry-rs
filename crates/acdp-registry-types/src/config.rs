@@ -56,6 +56,7 @@ impl RegistryConfig {
                 tls: TlsConfig::default(),
                 cross_registry_resolution: true,
                 cors: CorsConfig::default(),
+                base_url: String::new(),
             },
             storage: StorageConfig {
                 backend: StorageBackend::Sqlite,
@@ -96,6 +97,25 @@ pub struct RegistrySection {
     /// CORS configuration. Defaults to no allowed origins (CORS disabled).
     #[serde(default)]
     pub cors: CorsConfig,
+    /// Public base URL advertised to downstream consumers (the control plane
+    /// uses it to route federation proxy calls). When empty, the registry
+    /// derives `https://{authority}` — set this explicitly when the registry
+    /// is served on a non-default port or path.
+    #[serde(default)]
+    pub base_url: String,
+}
+
+impl RegistrySection {
+    /// Effective public base URL: the explicit `base_url` if configured,
+    /// otherwise `https://{authority}`. Never carries a trailing slash.
+    pub fn effective_base_url(&self) -> String {
+        let raw = if self.base_url.trim().is_empty() {
+            format!("https://{}", self.authority)
+        } else {
+            self.base_url.trim().to_string()
+        };
+        raw.trim_end_matches('/').to_string()
+    }
 }
 
 fn default_bind() -> String {

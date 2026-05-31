@@ -6,6 +6,10 @@
 [registry]
 # Bare DNS hostname. Used to mint `ctx_id` and as the `did:web` registry id.
 authority = "registry.example.com"
+# Public base URL advertised to downstream consumers (the control plane uses
+# it to route federation proxy calls). When omitted, derived as
+# `https://{authority}`. Set explicitly behind a non-default port/path.
+# base_url = "https://registry.example.com"
 # TCP port to listen on.
 port      = 8443
 # Bind address. 0.0.0.0 accepts traffic on every interface.

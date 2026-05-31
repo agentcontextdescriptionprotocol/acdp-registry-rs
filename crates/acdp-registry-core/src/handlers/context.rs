@@ -288,37 +288,45 @@ pub async fn publish<S: ExtendedRegistryStore + 'static>(
     // across implementations); we apply it here via the extended
     // trait. A `None` from tenant_from_headers means "no tenant
     // header was sent" → the column's default ('default') is kept.
-    if let Some(tenant_id) = tenant_from_headers(&headers) {
+    let publish_tenant = tenant_from_headers(&headers);
+    if let Some(tenant_id) = &publish_tenant {
         state
             .server
             .store()
-            .set_tenant_of_ctx(response.ctx_id.as_str(), &tenant_id)
+            .set_tenant_of_ctx(response.ctx_id.as_str(), tenant_id)
             .await?;
     }
 
     if let Some(emitter) = &state.webhook {
-        emitter.emit(WebhookEvent::ContextPublished {
-            ctx_id: response.ctx_id.as_str().to_string(),
-            lineage_id: response.lineage_id.as_str().to_string(),
-            agent_id: req.agent_id.as_str().to_string(),
-            context_type: context_type_str(&req.context_type),
-            visibility: match req.visibility {
-                acdp::types::Visibility::Public => "public",
-                acdp::types::Visibility::Restricted => "restricted",
-                acdp::types::Visibility::Private => "private",
-            }
-            .into(),
-            version: response.version,
-            created_at: response.created_at,
-            // FEAT-05: lineage graphs need `derived_from`; without it the
-            // control plane can only reconstruct intra-lineage history.
-            derived_from: req
-                .derived_from
-                .iter()
-                .map(|c| c.as_str().to_string())
-                .collect(),
-            run_id,
-        });
+        // REG-P2-4: forward the publishing agent's tenant as `X-Tenant-Id`
+        // so a multi-tenant control plane attributes the event correctly.
+        emitter.emit_with_tenant(
+            WebhookEvent::ContextPublished {
+                registry_authority: state.config.registry.authority.clone(),
+                registry_base_url: state.config.registry.effective_base_url(),
+                ctx_id: response.ctx_id.as_str().to_string(),
+                lineage_id: response.lineage_id.as_str().to_string(),
+                agent_id: req.agent_id.as_str().to_string(),
+                context_type: context_type_str(&req.context_type),
+                visibility: match req.visibility {
+                    acdp::types::Visibility::Public => "public",
+                    acdp::types::Visibility::Restricted => "restricted",
+                    acdp::types::Visibility::Private => "private",
+                }
+                .into(),
+                version: response.version,
+                created_at: response.created_at,
+                // FEAT-05: lineage graphs need `derived_from`; without it the
+                // control plane can only reconstruct intra-lineage history.
+                derived_from: req
+                    .derived_from
+                    .iter()
+                    .map(|c| c.as_str().to_string())
+                    .collect(),
+                run_id,
+            },
+            publish_tenant.clone(),
+        );
     }
 
     Ok(Json(response))
@@ -374,6 +382,7 @@ pub async fn retrieve<S: ExtendedRegistryStore + 'static>(
         };
         if let Some(emitter) = &state.webhook {
             emitter.emit(WebhookEvent::ContextRetrieved {
+                registry_authority: state.config.registry.authority.clone(),
                 ctx_id: ctx.body.ctx_id.as_str().to_string(),
                 requester_did: requester.as_ref().map(|d| d.as_str().to_string()),
                 at: Utc::now(),
@@ -413,6 +422,7 @@ pub async fn retrieve<S: ExtendedRegistryStore + 'static>(
     }
     if let Some(emitter) = &state.webhook {
         emitter.emit(WebhookEvent::ContextRetrieved {
+            registry_authority: state.config.registry.authority.clone(),
             ctx_id: ctx.body.ctx_id.as_str().to_string(),
             requester_did: requester.as_ref().map(|d| d.as_str().to_string()),
             at: Utc::now(),
@@ -504,6 +514,7 @@ pub async fn search<S: ExtendedRegistryStore + 'static>(
 
     if let Some(emitter) = &state.webhook {
         emitter.emit(WebhookEvent::SearchExecuted {
+            registry_authority: state.config.registry.authority.clone(),
             query: query_text,
             result_count: resp.matches.len(),
             requester_did: requester.as_ref().map(|d| d.as_str().to_string()),

@@ -26,11 +26,22 @@ pub enum WebhookError {
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// An event plus out-of-band routing metadata carried to the worker. The
+/// `tenant_id` travels as the `X-Tenant-Id` request header — NOT in the
+/// signed JSON body — so the GitHub-compatible signature scheme and the
+/// stable event schema are both preserved while still letting a
+/// multi-tenant control plane attribute the delivery.
+#[derive(Debug, Clone)]
+struct Delivery {
+    event: WebhookEvent,
+    tenant_id: Option<String>,
+}
+
 /// Handle held by the HTTP layer. `emit` is non-blocking; the worker
 /// drains events asynchronously.
 #[derive(Clone)]
 pub struct WebhookEmitter {
-    tx: mpsc::Sender<WebhookEvent>,
+    tx: mpsc::Sender<Delivery>,
 }
 
 impl WebhookEmitter {
@@ -74,7 +85,7 @@ impl WebhookEmitter {
     /// validated the config.
     pub fn spawn(config: WebhookConfig) -> Self {
         let capacity = config.queue_capacity.max(1);
-        let (tx, rx) = mpsc::channel::<WebhookEvent>(capacity);
+        let (tx, rx) = mpsc::channel::<Delivery>(capacity);
         tokio::spawn(worker(config, rx));
         Self { tx }
     }
@@ -83,7 +94,15 @@ impl WebhookEmitter {
     /// up, the event is dropped with a warn log rather than blocking the
     /// HTTP handler.
     pub fn emit(&self, event: WebhookEvent) {
-        match self.tx.try_send(event) {
+        self.emit_with_tenant(event, None);
+    }
+
+    /// Like [`emit`](Self::emit) but tags the delivery with a tenant id,
+    /// forwarded as the `X-Tenant-Id` header so a multi-tenant control
+    /// plane can attribute the event. The id never enters the signed body.
+    pub fn emit_with_tenant(&self, event: WebhookEvent, tenant_id: Option<String>) {
+        let delivery = Delivery { event, tenant_id };
+        match self.tx.try_send(delivery) {
             Ok(_) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
                 tracing::warn!("webhook queue full; event dropped");
@@ -95,7 +114,7 @@ impl WebhookEmitter {
     }
 }
 
-async fn worker(config: WebhookConfig, mut rx: mpsc::Receiver<WebhookEvent>) {
+async fn worker(config: WebhookConfig, mut rx: mpsc::Receiver<Delivery>) {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(config.timeout_seconds))
         .build()
@@ -106,12 +125,12 @@ async fn worker(config: WebhookConfig, mut rx: mpsc::Receiver<WebhookEvent>) {
             return;
         }
     };
-    while let Some(event) = rx.recv().await {
+    while let Some(delivery) = rx.recv().await {
         if !config.enabled || config.url.is_empty() {
             continue;
         }
-        if let Err(e) = deliver(&client, &config, &event).await {
-            tracing::warn!(error = %e, event = event.name(), "webhook delivery failed");
+        if let Err(e) = deliver(&client, &config, &delivery).await {
+            tracing::warn!(error = %e, event = delivery.event.name(), "webhook delivery failed");
         }
     }
 }
@@ -119,8 +138,9 @@ async fn worker(config: WebhookConfig, mut rx: mpsc::Receiver<WebhookEvent>) {
 async fn deliver(
     client: &reqwest::Client,
     config: &WebhookConfig,
-    event: &WebhookEvent,
+    delivery: &Delivery,
 ) -> Result<(), WebhookError> {
+    let event = &delivery.event;
     let body = serde_json::to_vec(event).map_err(|e| WebhookError::Encode(e.to_string()))?;
     let sig = sign(&config.secret, &body);
 
@@ -128,14 +148,15 @@ async fn deliver(
     let mut attempt = 0u32;
     loop {
         attempt += 1;
-        let resp = client
+        let mut builder = client
             .post(&config.url)
             .header("Content-Type", "application/json")
             .header("X-ACDP-Signature", &sig)
-            .header("X-ACDP-Event", event.name())
-            .body(body.clone())
-            .send()
-            .await;
+            .header("X-ACDP-Event", event.name());
+        if let Some(tenant) = &delivery.tenant_id {
+            builder = builder.header("X-Tenant-Id", tenant);
+        }
+        let resp = builder.body(body.clone()).send().await;
         match resp {
             Ok(r) if r.status().is_success() => return Ok(()),
             Ok(r) => {
@@ -176,4 +197,133 @@ pub fn sign(secret: &str, body: &[u8]) -> String {
     mac.update(body);
     let digest = mac.finalize().into_bytes();
     format!("sha256={}", hex::encode(digest))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Accept exactly one HTTP/1.1 request, return its raw bytes, and
+    /// reply `200 OK`. Enough to assert on the delivered headers + body
+    /// without pulling in an HTTP server dependency.
+    async fn capture_one_request(listener: TcpListener) -> String {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 1024];
+        // Read until we've seen the header terminator and the full body.
+        loop {
+            let n = socket.read(&mut chunk).await.expect("read");
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&buf);
+            if let Some(header_end) = text.find("\r\n\r\n") {
+                let content_len = text
+                    .lines()
+                    .find_map(|l| {
+                        l.strip_prefix("content-length: ")
+                            .or_else(|| l.strip_prefix("Content-Length: "))
+                    })
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if buf.len() >= header_end + 4 + content_len {
+                    break;
+                }
+            }
+        }
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .expect("write response");
+        socket.flush().await.ok();
+        String::from_utf8_lossy(&buf).to_string()
+    }
+
+    fn published_event() -> WebhookEvent {
+        WebhookEvent::ContextPublished {
+            registry_authority: "registry.example.com".into(),
+            registry_base_url: "https://registry.example.com".into(),
+            ctx_id: "acdp://registry.example.com/abc".into(),
+            lineage_id: "lin-1".into(),
+            agent_id: "did:web:agent.example.com".into(),
+            context_type: "analysis".into(),
+            visibility: "public".into(),
+            version: 1,
+            created_at: Utc::now(),
+            derived_from: Vec::new(),
+            run_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn forwards_tenant_header_and_authority_in_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let capture = tokio::spawn(capture_one_request(listener));
+
+        let config = WebhookConfig {
+            enabled: true,
+            url: format!("http://{addr}/hook"),
+            secret: "shhh".into(),
+            timeout_seconds: 5,
+            max_retries: 1,
+            queue_capacity: 8,
+        };
+        let emitter = WebhookEmitter::spawn(config);
+        emitter.emit_with_tenant(published_event(), Some("tenant-x".into()));
+
+        let raw = capture.await.expect("join");
+        // Routing metadata travels as a header, not in the signed body.
+        assert!(
+            raw.contains("x-tenant-id: tenant-x") || raw.contains("X-Tenant-Id: tenant-x"),
+            "expected X-Tenant-Id header, got:\n{raw}"
+        );
+        assert!(
+            raw.contains("x-acdp-event: context.published")
+                || raw.contains("X-ACDP-Event: context.published"),
+            "expected X-ACDP-Event header, got:\n{raw}"
+        );
+        // Attribution fields land in the JSON body.
+        assert!(
+            raw.contains("\"registry_authority\":\"registry.example.com\""),
+            "expected registry_authority in body, got:\n{raw}"
+        );
+        assert!(
+            raw.contains("\"registry_base_url\":\"https://registry.example.com\""),
+            "expected registry_base_url in body, got:\n{raw}"
+        );
+        // Tenant id must NOT pollute the signed body.
+        assert!(
+            !raw.contains("tenant-x\""),
+            "tenant id leaked into JSON body:\n{raw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn omits_tenant_header_when_absent() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let capture = tokio::spawn(capture_one_request(listener));
+
+        let config = WebhookConfig {
+            enabled: true,
+            url: format!("http://{addr}/hook"),
+            secret: "shhh".into(),
+            timeout_seconds: 5,
+            max_retries: 1,
+            queue_capacity: 8,
+        };
+        let emitter = WebhookEmitter::spawn(config);
+        emitter.emit(published_event());
+
+        let raw = capture.await.expect("join");
+        assert!(
+            !raw.to_ascii_lowercase().contains("x-tenant-id"),
+            "did not expect X-Tenant-Id header, got:\n{raw}"
+        );
+    }
 }

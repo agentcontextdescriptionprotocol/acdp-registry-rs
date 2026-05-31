@@ -10,6 +10,16 @@ use serde::{Deserialize, Serialize};
 pub enum WebhookEvent {
     /// A new context body was persisted.
     ContextPublished {
+        /// Authority (bare DNS hostname) of the registry that emitted this
+        /// event. The control plane attributes every event to a registry by
+        /// this field; without it `ContextRetrieved` / `SearchExecuted` (which
+        /// carry no `ctx_id` to parse an authority out of) are unattributable.
+        registry_authority: String,
+        /// Public base URL of the emitting registry, e.g.
+        /// `https://registry.example.com`. The control plane bootstraps its
+        /// `registries.base_url` from this so it can route federation proxy
+        /// calls (`GET /contexts/:ctxId`).
+        registry_base_url: String,
         ctx_id: String,
         lineage_id: String,
         agent_id: String,
@@ -30,12 +40,16 @@ pub enum WebhookEvent {
     },
     /// A context was retrieved by an authenticated caller (visibility-filtered).
     ContextRetrieved {
+        /// Authority of the emitting registry — see `ContextPublished`.
+        registry_authority: String,
         ctx_id: String,
         requester_did: Option<String>,
         at: DateTime<Utc>,
     },
     /// A search query was executed.
     SearchExecuted {
+        /// Authority of the emitting registry — see `ContextPublished`.
+        registry_authority: String,
         query: Option<String>,
         result_count: usize,
         requester_did: Option<String>,

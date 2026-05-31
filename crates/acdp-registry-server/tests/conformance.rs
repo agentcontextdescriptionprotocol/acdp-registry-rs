@@ -89,6 +89,7 @@ fn config() -> RegistryConfig {
             tls: Default::default(),
             cross_registry_resolution: false,
             cors: Default::default(),
+            base_url: String::new(),
         },
         storage: StorageConfig {
             backend: StorageBackend::Sqlite,

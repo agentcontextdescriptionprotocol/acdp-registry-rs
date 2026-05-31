@@ -89,6 +89,7 @@ fn config(playground: bool) -> RegistryConfig {
             tls: Default::default(),
             cross_registry_resolution: true,
             cors: Default::default(),
+            base_url: String::new(),
         },
         storage: StorageConfig {
             backend: StorageBackend::Postgres,
