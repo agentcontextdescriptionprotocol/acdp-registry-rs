@@ -36,6 +36,11 @@ pub struct AppStateInner<S: ExtendedRegistryStore> {
     /// REG-P1-3: per-agent `POST /contexts` limiter (RFC-ACDP-0008 §4.3).
     /// `None` when `limits.publish_rate_per_minute == 0` (disabled).
     pub rate_limiter: Option<Arc<AgentRateLimiter>>,
+    /// Per-agent `POST /auth/challenge` limiter. The challenge endpoint is
+    /// unauthenticated; without this an attacker can flood it to amplify
+    /// writes and grow the nonce store. `None` when
+    /// `limits.challenge_rate_per_minute == 0` (disabled).
+    pub challenge_rate_limiter: Option<Arc<AgentRateLimiter>>,
 }
 
 impl<S: ExtendedRegistryStore> AppStateInner<S> {
@@ -54,6 +59,10 @@ impl<S: ExtendedRegistryStore> AppStateInner<S> {
             0 => None,
             n => Some(Arc::new(AgentRateLimiter::new(n))),
         };
+        let challenge_rate_limiter = match config.limits.challenge_rate_per_minute {
+            0 => None,
+            n => Some(Arc::new(AgentRateLimiter::new(n))),
+        };
         Self {
             server,
             auth,
@@ -62,6 +71,7 @@ impl<S: ExtendedRegistryStore> AppStateInner<S> {
             cross_registry,
             playground,
             rate_limiter,
+            challenge_rate_limiter,
         }
     }
 }

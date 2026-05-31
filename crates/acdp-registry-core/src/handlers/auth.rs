@@ -23,6 +23,19 @@ pub async fn issue_challenge<S: ExtendedRegistryStore + 'static>(
     State(state): State<Arc<AppState<S>>>,
     Json(req): Json<ChallengeRequest>,
 ) -> Result<Json<AuthChallenge>, RegistryError> {
+    // Rate-limit the unauthenticated challenge endpoint per requested
+    // `agent_id`. Without this, a caller can flood `/auth/challenge` to
+    // amplify nonce-store writes (and grow an in-memory store toward OOM
+    // across the challenge TTL window). Keyed by `agent_id` to mirror the
+    // publish limiter; per-process, so front a multi-replica deployment with
+    // a shared limiter for a global bound.
+    if let Some(limiter) = &state.challenge_rate_limiter {
+        if let Err(retry_after_seconds) = limiter.check(req.agent_id.as_str()) {
+            return Err(RegistryError::RateLimited {
+                retry_after_seconds,
+            });
+        }
+    }
     // SEC-05: agent_id format is checked inside `AuthService::issue_challenge`.
     let challenge = state.auth.issue_challenge(&req.agent_id).await?;
     Ok(Json(challenge))

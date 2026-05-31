@@ -124,24 +124,57 @@ pub(crate) fn tenant_for_request<S: ExtendedRegistryStore + 'static>(
         // Auth disabled — header is the only signal.
         return Ok(header_tenant);
     }
-    let Some(value) = headers.get("authorization").and_then(|v| v.to_str().ok()) else {
-        return Ok(header_tenant);
+    // Strict mode: a multi-tenant deployment that mandates every request be
+    // scoped to a tenant, with the JWT claim as the sole authority for an
+    // authenticated caller.
+    let strict = state.config.auth.require_tenant;
+
+    let bearer = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(extract_bearer);
+
+    let resolved = match bearer {
+        // A valid bearer is present: the JWT claim is authoritative.
+        Some(token) => match state.auth.validate_bearer_claims(token) {
+            Ok(claims) => match claims.tenant {
+                // Bound token — claim wins; a disagreeing header is rejected.
+                Some(c) => reconcile_tenant_sources(Some(c), header_tenant)?,
+                // Unbound token. In strict mode the spoofable header must NOT
+                // be allowed to assert a tenant the issuer never bound, so we
+                // ignore it (and fall to the default-deny check below). In
+                // lax mode we preserve V0 behavior and honor the header.
+                None => {
+                    if strict {
+                        None
+                    } else {
+                        header_tenant
+                    }
+                }
+            },
+            Err(_) => {
+                // Token didn't validate. We do NOT short-circuit on a bad
+                // bearer here — `caller_from_headers` is the right place for
+                // that decision (it surfaces the 401). Treat tenant
+                // resolution as header-only when claims can't be read.
+                header_tenant
+            }
+        },
+        // No bearer (e.g. a producer-signed publish): header is the only
+        // signal available.
+        None => header_tenant,
     };
-    let Some(token) = extract_bearer(value) else {
-        return Ok(header_tenant);
-    };
-    let claim_tenant = match state.auth.validate_bearer_claims(token) {
-        Ok(claims) => claims.tenant,
-        Err(_) => {
-            // Token didn't validate. We do NOT short-circuit on a bad
-            // bearer here — `caller_from_headers` is the right place
-            // for that decision (it surfaces the 401). Treat the
-            // tenant resolution as header-only when claims can't be
-            // read.
-            return Ok(header_tenant);
-        }
-    };
-    reconcile_tenant_sources(claim_tenant, header_tenant)
+
+    if strict && resolved.is_none() {
+        // Default-deny: an enforced multi-tenant registry will not serve a
+        // request that resolves to no tenant — that would run with the tenant
+        // filter disabled and surface cross-tenant rows.
+        return Err(RegistryError::AuthChallenge(
+            "this registry requires a tenant scope: send X-Tenant-Id or use a tenant-bound token"
+                .into(),
+        ));
+    }
+    Ok(resolved)
 }
 
 /// Pure precedence: JWT claim > X-Tenant-Id header > None. Mismatch
@@ -210,6 +243,16 @@ pub async fn publish<S: ExtendedRegistryStore + 'static>(
             });
         }
     }
+
+    // Resolve the tenant this publish writes into using the SAME authoritative
+    // precedence every read path uses (`tenant_for_request`): the JWT `tenant`
+    // claim wins, and an `X-Tenant-Id` header that disagrees with a bound claim
+    // is rejected. The earlier code stamped the row from the raw, spoofable
+    // header (`tenant_from_headers`), which let a token bound to tenant A write
+    // a context into tenant B's namespace — a cross-tenant write that
+    // contradicted the read-side isolation. Resolved here, before the expensive
+    // verify/persist pipeline, so a spoofed mismatch is rejected up front.
+    let publish_tenant = tenant_for_request(&state, &headers)?;
 
     let server = state.server.clone();
     let resolver = state.auth.resolver.clone();
@@ -298,9 +341,8 @@ pub async fn publish<S: ExtendedRegistryStore + 'static>(
     // Stamp tenant_id post-publish. The protocol-level upsert path
     // doesn't carry tenancy (acdp::registry::RegistryStore is shared
     // across implementations); we apply it here via the extended
-    // trait. A `None` from tenant_from_headers means "no tenant
-    // header was sent" → the column's default ('default') is kept.
-    let publish_tenant = tenant_from_headers(&headers);
+    // trait. A `None` from `tenant_for_request` means "no tenant was
+    // asserted" → the column's default ('default') is kept.
     if let Some(tenant_id) = &publish_tenant {
         state
             .server
@@ -415,6 +457,11 @@ pub async fn retrieve<S: ExtendedRegistryStore + 'static>(
         return Ok(Json(ctx));
     }
 
+    // Resolve the tenant scope up front (before the DB read) so a strict-mode
+    // default-deny fails fast and doesn't create a 404-vs-401 existence oracle
+    // between a missing row and an unscoped request.
+    let requested_tenant = tenant_for_request(&state, &headers)?;
+
     let server = state.server.clone();
     let ctx_id_typed = CtxId(ctx_id.clone());
     let req_owned = requester.clone();
@@ -431,7 +478,7 @@ pub async fn retrieve<S: ExtendedRegistryStore + 'static>(
     // mismatch between the two → tenant_for_request returns Err
     // (surfaces as 401/403, not a silent not-found). When neither is
     // present → V0 behavior, no filter.
-    if let Some(requested_tenant) = tenant_for_request(&state, &headers)? {
+    if let Some(requested_tenant) = requested_tenant {
         let stored = state
             .server
             .store()
