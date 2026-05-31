@@ -6,6 +6,10 @@
 [registry]
 # Bare DNS hostname. Used to mint `ctx_id` and as the `did:web` registry id.
 authority = "registry.example.com"
+# Public base URL advertised to downstream consumers (the control plane uses
+# it to route federation proxy calls). When omitted, derived as
+# `https://{authority}`. Set explicitly behind a non-default port/path.
+# base_url = "https://registry.example.com"
 # TCP port to listen on.
 port      = 8443
 # Bind address. 0.0.0.0 accepts traffic on every interface.
@@ -40,8 +44,14 @@ did_methods          = ["did:web"]
 # Base64-encoded ≥32-byte random secret. Generate with:
 #   openssl rand -base64 32
 # Override per environment via ACDP_REGISTRY_AUTH__JWT_SECRET.
-# The startup-time validator refuses to launch with the literal `changeme`.
+# The startup-time validator refuses to launch with the literal `changeme`,
+# and (with auth enabled + HS256) refuses an EMPTY secret unless
+# allow_ephemeral_secret = true below.
 jwt_secret           = ""
+# Local dev only: boot with a random process-lifetime HS256 key when
+# jwt_secret is empty. Tokens won't survive a restart. MUST stay false in
+# production — set a real jwt_secret instead.
+allow_ephemeral_secret = false
 token_ttl_seconds    = 3600
 challenge_ttl_seconds = 300
 # Clock-skew leeway applied to JWT exp validation.
@@ -68,6 +78,10 @@ max_payload_bytes  = 1048576
 max_embedded_bytes = 65536
 # TTL advertised to producers for Idempotency-Key replay (seconds).
 idempotency_key_ttl_seconds = 86400
+# Max POST /contexts per minute per signing agent_id (RFC-ACDP-0008 §4.3).
+# 0 disables. In-memory + per-process; front multi-replica deployments with a
+# shared limiter for a global bound.
+publish_rate_per_minute = 60
 
 [playground]
 # When true, the publish handler skips DID-signature verification. NEVER

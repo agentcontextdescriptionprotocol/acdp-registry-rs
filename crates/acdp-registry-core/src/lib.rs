@@ -6,6 +6,7 @@
 
 pub mod handlers;
 pub mod playground;
+pub mod rate_limit;
 pub mod state;
 
 pub use state::{AppState, AppStateInner};
@@ -48,7 +49,9 @@ pub fn build_router<S: ExtendedRegistryStore + 'static>(state: AppState<S>) -> R
         .route("/contexts/:ctx_id/body", get(handlers::retrieve_body::<S>))
         // Lineages
         .route("/lineages/:lineage_id", get(handlers::lineage::<S>))
-        .route("/lineages/:lineage_id/current", get(handlers::current::<S>));
+        .route("/lineages/:lineage_id/current", get(handlers::current::<S>))
+        // Admin status (auth-gated by auth.admin_tokens; ships in every build)
+        .route("/admin/status", get(handlers::admin_status::<S>));
 
     if auth_enabled {
         router = router

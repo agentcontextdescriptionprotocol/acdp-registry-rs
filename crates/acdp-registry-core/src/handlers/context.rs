@@ -199,6 +199,18 @@ pub async fn publish<S: ExtendedRegistryStore + 'static>(
         }
     }
 
+    // REG-P1-3: per-agent publish rate limit (RFC-ACDP-0008 §4.3). Checked
+    // here — after the body parses so we know the signing agent, before the
+    // expensive verify/persist pipeline. The limiter is keyed by the signing
+    // `agent_id`, so one noisy producer can't starve others.
+    if let Some(limiter) = &state.rate_limiter {
+        if let Err(retry_after_seconds) = limiter.check(req.agent_id.as_str()) {
+            return Err(RegistryError::RateLimited {
+                retry_after_seconds,
+            });
+        }
+    }
+
     let server = state.server.clone();
     let resolver = state.auth.resolver.clone();
     // Snapshot the playground config once per request. The cell is
@@ -288,37 +300,45 @@ pub async fn publish<S: ExtendedRegistryStore + 'static>(
     // across implementations); we apply it here via the extended
     // trait. A `None` from tenant_from_headers means "no tenant
     // header was sent" → the column's default ('default') is kept.
-    if let Some(tenant_id) = tenant_from_headers(&headers) {
+    let publish_tenant = tenant_from_headers(&headers);
+    if let Some(tenant_id) = &publish_tenant {
         state
             .server
             .store()
-            .set_tenant_of_ctx(response.ctx_id.as_str(), &tenant_id)
+            .set_tenant_of_ctx(response.ctx_id.as_str(), tenant_id)
             .await?;
     }
 
     if let Some(emitter) = &state.webhook {
-        emitter.emit(WebhookEvent::ContextPublished {
-            ctx_id: response.ctx_id.as_str().to_string(),
-            lineage_id: response.lineage_id.as_str().to_string(),
-            agent_id: req.agent_id.as_str().to_string(),
-            context_type: context_type_str(&req.context_type),
-            visibility: match req.visibility {
-                acdp::types::Visibility::Public => "public",
-                acdp::types::Visibility::Restricted => "restricted",
-                acdp::types::Visibility::Private => "private",
-            }
-            .into(),
-            version: response.version,
-            created_at: response.created_at,
-            // FEAT-05: lineage graphs need `derived_from`; without it the
-            // control plane can only reconstruct intra-lineage history.
-            derived_from: req
-                .derived_from
-                .iter()
-                .map(|c| c.as_str().to_string())
-                .collect(),
-            run_id,
-        });
+        // REG-P2-4: forward the publishing agent's tenant as `X-Tenant-Id`
+        // so a multi-tenant control plane attributes the event correctly.
+        emitter.emit_with_tenant(
+            WebhookEvent::ContextPublished {
+                registry_authority: state.config.registry.authority.clone(),
+                registry_base_url: state.config.registry.effective_base_url(),
+                ctx_id: response.ctx_id.as_str().to_string(),
+                lineage_id: response.lineage_id.as_str().to_string(),
+                agent_id: req.agent_id.as_str().to_string(),
+                context_type: context_type_str(&req.context_type),
+                visibility: match req.visibility {
+                    acdp::types::Visibility::Public => "public",
+                    acdp::types::Visibility::Restricted => "restricted",
+                    acdp::types::Visibility::Private => "private",
+                }
+                .into(),
+                version: response.version,
+                created_at: response.created_at,
+                // FEAT-05: lineage graphs need `derived_from`; without it the
+                // control plane can only reconstruct intra-lineage history.
+                derived_from: req
+                    .derived_from
+                    .iter()
+                    .map(|c| c.as_str().to_string())
+                    .collect(),
+                run_id,
+            },
+            publish_tenant.clone(),
+        );
     }
 
     Ok(Json(response))
@@ -345,6 +365,18 @@ fn context_type_str(t: &acdp::types::primitives::ContextType) -> String {
 /// content hash, and verifies the producer's signature via the local
 /// `WebResolver`. Foreign retrieval is gated by
 /// `registry.cross_registry_resolution`.
+///
+/// REG-P2-5 — federation auth mode is **public-only by design.** The resolver
+/// fetches the foreign body anonymously: it forwards NO caller credentials to
+/// the upstream registry. A remote `restricted`/`private` context therefore
+/// returns 404 from the foreign registry (its visibility gate hides it from an
+/// anonymous requester), so this registry can only ever surface remote *public*
+/// contexts — it never proxies privileged remote data on a caller's behalf.
+/// Authenticated federation (minting scoped credentials per trusted authority)
+/// is intentionally out of scope for v0.1; revisit if cross-tenant private
+/// federation is required. SSRF on this path is gated by the resolver's
+/// `SsrfPolicy` (REG-P2-3): private/internal authorities fail with 502
+/// `cross_registry_resolution_failed`, never an internal fetch.
 pub async fn retrieve<S: ExtendedRegistryStore + 'static>(
     State(state): State<Arc<AppState<S>>>,
     headers: HeaderMap,
@@ -374,6 +406,7 @@ pub async fn retrieve<S: ExtendedRegistryStore + 'static>(
         };
         if let Some(emitter) = &state.webhook {
             emitter.emit(WebhookEvent::ContextRetrieved {
+                registry_authority: state.config.registry.authority.clone(),
                 ctx_id: ctx.body.ctx_id.as_str().to_string(),
                 requester_did: requester.as_ref().map(|d| d.as_str().to_string()),
                 at: Utc::now(),
@@ -413,6 +446,7 @@ pub async fn retrieve<S: ExtendedRegistryStore + 'static>(
     }
     if let Some(emitter) = &state.webhook {
         emitter.emit(WebhookEvent::ContextRetrieved {
+            registry_authority: state.config.registry.authority.clone(),
             ctx_id: ctx.body.ctx_id.as_str().to_string(),
             requester_did: requester.as_ref().map(|d| d.as_str().to_string()),
             at: Utc::now(),
@@ -504,6 +538,7 @@ pub async fn search<S: ExtendedRegistryStore + 'static>(
 
     if let Some(emitter) = &state.webhook {
         emitter.emit(WebhookEvent::SearchExecuted {
+            registry_authority: state.config.registry.authority.clone(),
             query: query_text,
             result_count: resp.matches.len(),
             requester_did: requester.as_ref().map(|d| d.as_str().to_string()),
@@ -514,9 +549,10 @@ pub async fn search<S: ExtendedRegistryStore + 'static>(
 }
 
 /// Drive `server.search` with handler-side post-filters (visibility +
-/// tenant). When a tenant is asserted, walks the cursor across up to
-/// [`SEARCH_REFILL_MAX_PAGES`] inner pages so a busy mixed-tenant
-/// registry can still return a non-trivial page worth of matches.
+/// tenant). When either post-filter is active, walks the cursor across up
+/// to [`SEARCH_REFILL_MAX_PAGES`] inner pages so a busy registry can still
+/// return a non-trivial page worth of matches even when the leading raw
+/// pages are mostly hidden by the filter.
 ///
 /// `matches.len()` may end up slightly above `target` on the final
 /// inner page (we don't truncate to avoid skipping the surplus on the
@@ -587,11 +623,13 @@ async fn run_search_with_refill<S: ExtendedRegistryStore + 'static>(
         }
         accumulated.extend(matches);
 
-        // Refill only when a tenant is asserted. Without a tenant
-        // filter the original single-page behavior is preserved
-        // bit-for-bit — no behavior change for non-multitenant
-        // deployments.
-        let should_refill = requested_tenant.is_some()
+        // Refill whenever a handler-side post-filter could have dropped rows
+        // below `target` — i.e. a tenant is asserted OR a `?visibility=` narrow
+        // is active (REG-P2-8). When neither filter is set the store already
+        // returned a full page, so the original single-page behavior is
+        // preserved bit-for-bit for non-multitenant, unfiltered deployments.
+        let post_filtered = requested_tenant.is_some() || visibility_filter.is_some();
+        let should_refill = post_filtered
             && accumulated.len() < target
             && resp.next_cursor.is_some()
             && iterations < SEARCH_REFILL_MAX_PAGES;

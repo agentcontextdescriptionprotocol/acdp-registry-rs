@@ -52,6 +52,14 @@ pub trait ExtendedRegistryStore: RegistryStore + Send + Sync {
     /// Storage backend health check. `Ok(())` on success.
     async fn health(&self) -> Result<(), AcdpError>;
 
+    /// Count of currently-stored idempotency records (including not-yet-evicted
+    /// expired ones). Surfaced by the admin status endpoint for operational
+    /// visibility. The default returns `None` ("not tracked") so backends
+    /// without an idempotency table stay compatible; SQL backends override.
+    async fn count_idempotency_records(&self) -> Result<Option<u64>, AcdpError> {
+        Ok(None)
+    }
+
     /// Run pending migrations. Called at server startup.
     async fn migrate(&self) -> Result<(), AcdpError>;
 

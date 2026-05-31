@@ -84,6 +84,7 @@ fn config(playground: bool) -> RegistryConfig {
             tls: Default::default(),
             cross_registry_resolution: true,
             cors: Default::default(),
+            base_url: String::new(),
         },
         storage: StorageConfig {
             backend: StorageBackend::Sqlite,
@@ -107,10 +108,40 @@ fn config(playground: bool) -> RegistryConfig {
 /// deleted) when the harness is dropped.
 struct Harness {
     router: axum::Router,
-    _db: tempfile::NamedTempFile,
+    db: tempfile::NamedTempFile,
+}
+
+impl Harness {
+    /// Path to the backing SQLite file, for tests that need to reach past
+    /// the HTTP surface (e.g. ageing an idempotency record to simulate
+    /// expiry without sleeping).
+    fn db_path(&self) -> &std::path::Path {
+        self.db.path()
+    }
 }
 
 async fn harness(playground: bool) -> Harness {
+    harness_from_config(config(playground)).await
+}
+
+async fn harness_from_config(cfg: RegistryConfig) -> Harness {
+    build_harness(cfg, None).await
+}
+
+/// Like [`harness_from_config`] but wires a real `CrossRegistryResolver` so
+/// federation (`GET /contexts/:foreign_ctx_id`) is exercised.
+async fn harness_with_federation(cfg: RegistryConfig) -> Harness {
+    build_harness(
+        cfg,
+        Some(Arc::new(acdp::client::CrossRegistryResolver::new())),
+    )
+    .await
+}
+
+async fn build_harness(
+    cfg: RegistryConfig,
+    cross_registry: Option<Arc<acdp::client::CrossRegistryResolver>>,
+) -> Harness {
     let db = tempfile::Builder::new()
         .prefix("acdp-test-")
         .suffix(".sqlite")
@@ -130,10 +161,10 @@ async fn harness(playground: bool) -> Harness {
         resolver,
         AUTHORITY.into(),
     ));
-    let state = AppStateInner::new(server, auth, None, config(playground), None);
+    let state = AppStateInner::new(server, auth, None, cfg, cross_registry);
     Harness {
         router: build_router(state),
-        _db: db,
+        db,
     }
 }
 
@@ -300,6 +331,13 @@ async fn capabilities_round_trips() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    // RFC-ACDP-0006 §4.2.1: capabilities are cacheable.
+    assert_eq!(
+        resp.headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("public, max-age=300"),
+    );
     let v = body_to_json(resp).await;
     assert_eq!(v["acdp_version"], "0.1.0");
     assert_eq!(v["registry_did"], format!("did:web:{AUTHORITY}"));
@@ -670,6 +708,307 @@ async fn idempotency_key_too_long_rejected() {
     let huge = "x".repeat(256);
     let (status, _) = publish(app, &req, Some(&huge)).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// REG-P1-2: the idempotency lookup checks `expires_at > now` in Rust (the
+/// SQL only matches on `(agent_id, key)`). An expired record must therefore
+/// be treated as a fresh publish, not a replay.
+#[tokio::test]
+async fn expired_idempotency_key_is_not_matched() {
+    let h = harness(true).await;
+    let app = &h.router;
+    let req = producer(11)
+        .publish_request()
+        .title("idem-expiry")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (s1, v1) = publish(app, &req, Some("expiry-key")).await;
+    assert_eq!(s1, StatusCode::OK);
+
+    // Age the stored record so its TTL is in the past — cheaper and more
+    // deterministic than sleeping out a real TTL.
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", h.db_path().display()))
+        .await
+        .unwrap();
+    let aged = sqlx::query(
+        "UPDATE idempotency_records \
+         SET expires_at_ms = 0, expires_at = '1970-01-01T00:00:00Z'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap()
+    .rows_affected();
+    assert_eq!(aged, 1, "expected exactly one idempotency record to age");
+    pool.close().await;
+
+    let (s2, v2) = publish(app, &req, Some("expiry-key")).await;
+    assert_eq!(s2, StatusCode::OK);
+    assert_ne!(
+        v1["ctx_id"], v2["ctx_id"],
+        "an expired idempotency key must yield a fresh publish, not a replay"
+    );
+}
+
+/// REG-P1-2: idempotency records are keyed by `(agent_id, key)` only — NOT
+/// subdivided by `X-Tenant-Id`. Safe because tenant-bound tokens (#21) pin an
+/// agent to a single tenant, so a key can't legitimately be reused across
+/// tenants. This locks the contract: a change to per-tenant idempotency must
+/// update both the key and this assertion deliberately.
+#[tokio::test]
+async fn idempotency_key_is_agent_scoped_not_tenant_scoped() {
+    let h = harness(true).await;
+    let app = &h.router;
+    let req = producer(12)
+        .publish_request()
+        .title("idem-tenant")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let body = serde_json::to_vec(&req).unwrap();
+    let mk = |tenant: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/contexts")
+            .header("Idempotency-Key", "tenant-scope-key")
+            .header("X-Tenant-Id", tenant)
+            .body(Body::from(body.clone()))
+            .unwrap()
+    };
+
+    let r1 = app.clone().oneshot(mk("tenant-a")).await.unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+    let v1 = body_to_json(r1).await;
+    let r2 = app.clone().oneshot(mk("tenant-b")).await.unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+    let v2 = body_to_json(r2).await;
+    assert_eq!(
+        v1["ctx_id"], v2["ctx_id"],
+        "idempotency is (agent,key)-scoped; same key replays regardless of X-Tenant-Id"
+    );
+}
+
+/// REG-P2-8: a search page whose raw rows are all hidden by the disclosure
+/// filter must still advance the cursor (anchored on the last RAW row), so a
+/// visible row further down the ordered scan stays reachable via pagination
+/// instead of being stranded behind a premature `next_cursor: null`.
+#[tokio::test]
+async fn search_paginates_past_fully_hidden_pages() {
+    let h = harness(true).await;
+    let app = &h.router;
+
+    // The only public context is the OLDEST; everything newer is restricted
+    // (hidden from an anonymous searcher in-store). Publish the public row
+    // first, then sleep so the restricted batch gets strictly-later
+    // millisecond-precision `created_at` and sorts ahead of it (DESC).
+    let pubreq = producer(30)
+        .publish_request()
+        .title("visible-oldest")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (s, pub_v) = publish(app, &pubreq, None).await;
+    assert_eq!(s, StatusCode::OK);
+    let public_ctx = pub_v["ctx_id"].as_str().unwrap().to_string();
+
+    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+    for i in 0..4 {
+        let r = producer(31)
+            .publish_request()
+            .title(format!("hidden-{i}"))
+            .context_type(ContextType::DataSnapshot)
+            .visibility(Visibility::Restricted)
+            .audience(vec![AgentDid::new("did:web:agents.test:nobody")])
+            .build()
+            .unwrap();
+        let (s, _) = publish(app, &r, None).await;
+        assert_eq!(s, StatusCode::OK);
+    }
+
+    // Anonymous search, small page size; follow the cursor to exhaustion.
+    // Page 1 is entirely restricted → matches empty; the OLD code emitted
+    // next_cursor=null here and stranded the public row.
+    let mut seen: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..10 {
+        let uri = match &cursor {
+            Some(c) => format!(
+                "/contexts/search?limit=2&cursor={}",
+                pct_encode_path_segment(c)
+            ),
+            None => "/contexts/search?limit=2".to_string(),
+        };
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_to_json(resp).await;
+        for m in v["matches"].as_array().unwrap() {
+            seen.push(m["ctx_id"].as_str().unwrap().to_string());
+        }
+        match v["next_cursor"].as_str() {
+            Some(c) => cursor = Some(c.to_string()),
+            None => break,
+        }
+    }
+    assert!(
+        seen.contains(&public_ctx),
+        "public ctx must be reachable past fully-hidden pages; saw {seen:?}"
+    );
+    assert_eq!(
+        seen.len(),
+        1,
+        "exactly the one public ctx should surface to anonymous; saw {seen:?}"
+    );
+}
+
+/// REG-P1-3 / REG-P2-1: per-agent publish limit returns 429 + Retry-After,
+/// and the limit is scoped per signing agent.
+#[tokio::test]
+async fn publish_rate_limited_per_agent_with_retry_after() {
+    let mut cfg = config(true);
+    cfg.limits.publish_rate_per_minute = 2;
+    let h = harness_from_config(cfg).await;
+    let app = &h.router;
+
+    async fn send(app: &axum::Router, seed: u8, title: &str) -> axum::response::Response {
+        let req = producer(seed)
+            .publish_request()
+            .title(title)
+            .context_type(ContextType::DataSnapshot)
+            .visibility(Visibility::Public)
+            .build()
+            .unwrap();
+        let body = serde_json::to_vec(&req).unwrap();
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/contexts")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    // Agent 20: two publishes within budget, third over budget.
+    assert_eq!(send(app, 20, "a").await.status(), StatusCode::OK);
+    assert_eq!(send(app, 20, "b").await.status(), StatusCode::OK);
+    let limited = send(app, 20, "c").await;
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry = limited
+        .headers()
+        .get(axum::http::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .expect("Retry-After header present and numeric");
+    assert!(
+        (1..=60).contains(&retry),
+        "Retry-After out of range: {retry}"
+    );
+    let v = body_to_json(limited).await;
+    assert_eq!(v["error"]["code"], "rate_limited");
+
+    // A different agent is unaffected by agent 20's exhausted budget.
+    assert_eq!(send(app, 21, "a").await.status(), StatusCode::OK);
+}
+
+/// REG-P2-3: a foreign `ctx_id` pointing at a private/internal IP must be
+/// refused by the SSRF policy on the cross-registry resolution path — never
+/// fetched. The registry stays healthy, so the gateway-hop failure is a 502.
+#[tokio::test]
+async fn cross_registry_private_ip_authority_is_blocked() {
+    let h = harness_with_federation(config(true)).await;
+    let app = &h.router;
+    // Authority is an RFC1918 literal; uuid is well-formed so CtxId parses.
+    let foreign = "acdp://192.168.1.10/00000000-0000-4000-8000-000000000001";
+    let uri = format!("/contexts/{}", pct_encode_path_segment(foreign));
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_GATEWAY,
+        "SSRF-blocked cross-registry resolution should surface as 502"
+    );
+    let v = body_to_json(resp).await;
+    assert_eq!(
+        v["error"]["code"], "cross_registry_resolution_failed",
+        "body = {v}"
+    );
+}
+
+/// REG-P2-5: federation is public-only and opt-in. With cross-registry
+/// resolution DISABLED, a foreign `ctx_id` is never proxied — it returns a
+/// plain 404 (indistinguishable from a missing local context), so a restricted
+/// remote context can't be reached through this registry.
+#[tokio::test]
+async fn cross_registry_disabled_does_not_proxy_foreign_ctx() {
+    // Default harness wires cross_registry = None.
+    let h = harness(true).await;
+    let app = &h.router;
+    let foreign = "acdp://other.example.com/00000000-0000-4000-8000-000000000002";
+    let uri = format!("/contexts/{}", pct_encode_path_segment(foreign));
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let v = body_to_json(resp).await;
+    assert_eq!(v["error"]["code"], "not_found", "body = {v}");
+}
+
+/// REG-P2-7: `/admin/status` is auth-gated by `auth.admin_tokens` and reports
+/// storage health, idempotency size, webhook queue, and backend.
+#[tokio::test]
+async fn admin_status_requires_token_and_reports_health() {
+    let mut cfg = config(true);
+    cfg.auth.admin_tokens = vec!["secret-admin".into()];
+    let h = harness_from_config(cfg).await;
+    let app = &h.router;
+
+    // No / wrong token → 403.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/admin/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Valid admin bearer → 200 with a populated snapshot.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/admin/status")
+                .header("authorization", "Bearer secret-admin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_to_json(resp).await;
+    assert_eq!(v["storage"]["healthy"], true, "body = {v}");
+    assert_eq!(v["migrations"]["backend"], "Sqlite", "body = {v}");
+    assert_eq!(v["migrations"]["applied"], true, "body = {v}");
+    assert_eq!(v["webhook"]["enabled"], false, "body = {v}");
+    assert_eq!(v["idempotency"]["records"], 0, "body = {v}");
+    assert_eq!(v["revocation"]["configured_feeds"], 0, "body = {v}");
 }
 
 #[tokio::test]
@@ -1335,6 +1674,6 @@ async fn harness_with_playground(playground: PlaygroundConfig) -> Harness {
     let state = AppStateInner::new(server, auth, None, cfg, None);
     Harness {
         router: build_router(state),
-        _db: db,
+        db,
     }
 }

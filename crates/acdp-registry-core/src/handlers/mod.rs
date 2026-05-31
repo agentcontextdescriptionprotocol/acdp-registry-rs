@@ -8,7 +8,7 @@ pub use auth::{issue_challenge, issue_token, revoke_token};
 pub use context::{current, lineage, publish, retrieve, retrieve_body, search};
 pub use meta::{capabilities, health, jwks};
 
-#[cfg(feature = "playground")]
 mod admin;
+pub use admin::admin_status;
 #[cfg(feature = "playground")]
 pub use admin::{admin_list, reload_pinned_keys};

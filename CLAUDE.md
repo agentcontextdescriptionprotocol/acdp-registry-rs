@@ -103,3 +103,9 @@ ACDP_REGISTRY_CONFIG=config/registry.example.toml cargo run -p acdp-registry-ser
 - Anonymous public reads are off by default for new registries unless the
   config explicitly opts in.
 - Migrations are idempotent (`CREATE TABLE IF NOT EXISTS`).
+- Cross-registry federation is **public-only**: foreign contexts are fetched
+  anonymously (no caller-credential forwarding), so only remote `public`
+  contexts are ever surfaced. The `SsrfPolicy` on the resolver rejects
+  private/internal authorities (502 `cross_registry_resolution_failed`).
+- Per-agent `POST /contexts` rate limit (`limits.publish_rate_per_minute`,
+  default 60; 429 + `Retry-After`).

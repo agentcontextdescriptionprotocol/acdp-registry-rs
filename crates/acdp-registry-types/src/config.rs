@@ -56,6 +56,7 @@ impl RegistryConfig {
                 tls: TlsConfig::default(),
                 cross_registry_resolution: true,
                 cors: CorsConfig::default(),
+                base_url: String::new(),
             },
             storage: StorageConfig {
                 backend: StorageBackend::Sqlite,
@@ -96,6 +97,25 @@ pub struct RegistrySection {
     /// CORS configuration. Defaults to no allowed origins (CORS disabled).
     #[serde(default)]
     pub cors: CorsConfig,
+    /// Public base URL advertised to downstream consumers (the control plane
+    /// uses it to route federation proxy calls). When empty, the registry
+    /// derives `https://{authority}` — set this explicitly when the registry
+    /// is served on a non-default port or path.
+    #[serde(default)]
+    pub base_url: String,
+}
+
+impl RegistrySection {
+    /// Effective public base URL: the explicit `base_url` if configured,
+    /// otherwise `https://{authority}`. Never carries a trailing slash.
+    pub fn effective_base_url(&self) -> String {
+        let raw = if self.base_url.trim().is_empty() {
+            format!("https://{}", self.authority)
+        } else {
+            self.base_url.trim().to_string()
+        };
+        raw.trim_end_matches('/').to_string()
+    }
 }
 
 fn default_bind() -> String {
@@ -181,6 +201,14 @@ pub struct AuthConfig {
     /// fingerprint (stable across restarts when the key bytes are stable).
     #[serde(default)]
     pub jwt_kid: String,
+
+    /// Permit booting with an ephemeral (process-lifetime) HS256 secret when
+    /// `auth.enabled` and `jwt_secret` is empty. Defaults to `false`: a
+    /// production registry with auth on but no secret fails startup rather
+    /// than silently minting tokens that don't survive a restart. Set to
+    /// `true` only for local dev / tests.
+    #[serde(default)]
+    pub allow_ephemeral_secret: bool,
 
     /// Cross-issuer revocation feeds the registry polls for propagated
     /// revocations (plan §9). Empty (default) = no federation; the
@@ -291,6 +319,7 @@ impl Default for AuthConfig {
             jwt_signing_alg: default_jwt_alg(),
             jwt_private_key_pem: String::new(),
             jwt_kid: String::new(),
+            allow_ephemeral_secret: false,
             revocation_feeds: Vec::new(),
             admin_tokens: Vec::new(),
             tenant_agents: Vec::new(),
@@ -353,6 +382,12 @@ pub struct LimitsConfig {
     /// the window; older keys may be evicted.
     #[serde(default = "default_idempotency_ttl")]
     pub idempotency_key_ttl_seconds: u64,
+    /// RFC-ACDP-0008 §4.3 (REQUIRED): max `POST /contexts` per minute per
+    /// signing `agent_id`. `0` disables per-agent limiting. In-memory and
+    /// per-process — front a multi-replica deployment with a shared limiter
+    /// (e.g. at the gateway) for a global bound.
+    #[serde(default = "default_publish_rate_per_minute")]
+    pub publish_rate_per_minute: u32,
 }
 
 fn default_payload_bytes() -> u64 {
@@ -364,6 +399,9 @@ fn default_embedded_bytes() -> u64 {
 fn default_idempotency_ttl() -> u64 {
     86_400
 }
+fn default_publish_rate_per_minute() -> u32 {
+    60
+}
 
 impl Default for LimitsConfig {
     fn default() -> Self {
@@ -371,6 +409,7 @@ impl Default for LimitsConfig {
             max_payload_bytes: default_payload_bytes(),
             max_embedded_bytes: default_embedded_bytes(),
             idempotency_key_ttl_seconds: default_idempotency_ttl(),
+            publish_rate_per_minute: default_publish_rate_per_minute(),
         }
     }
 }

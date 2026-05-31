@@ -1,30 +1,43 @@
-//! Admin endpoints — compiled only with the `playground` feature.
+//! Admin endpoints.
+//!
+//! `admin_status` ships in every build (auth-gated by `auth.admin_tokens`).
+//! The mutating playground helpers (`admin_list`, `reload_pinned_keys`) are
+//! compiled only with the `playground` feature.
 
 use std::sync::Arc;
 
 use acdp_registry_store::ExtendedRegistryStore;
-use acdp_registry_types::{RegistryConfig, RegistryError};
-use axum::extract::{Query, State};
+use acdp_registry_types::RegistryConfig;
+use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
-use crate::handlers::context::{caller_from_headers, tenant_for_request};
 use crate::state::AppState;
 
-#[derive(Debug, Deserialize)]
+#[cfg(feature = "playground")]
+use crate::handlers::context::{caller_from_headers, tenant_for_request};
+#[cfg(feature = "playground")]
+use acdp_registry_types::RegistryError;
+#[cfg(feature = "playground")]
+use axum::extract::Query;
+
+#[cfg(feature = "playground")]
+#[derive(Debug, serde::Deserialize)]
 pub struct AdminListQuery {
     pub limit: Option<u32>,
     pub cursor: Option<String>,
 }
 
+#[cfg(feature = "playground")]
 #[derive(Debug, Serialize)]
 pub struct AdminListResponse {
     pub items: Vec<acdp::types::body::FullContext>,
     pub next_cursor: Option<String>,
 }
 
+#[cfg(feature = "playground")]
 pub async fn admin_list<S: ExtendedRegistryStore + 'static>(
     State(state): State<Arc<AppState<S>>>,
     headers: HeaderMap,
@@ -53,6 +66,7 @@ pub async fn admin_list<S: ExtendedRegistryStore + 'static>(
     }))
 }
 
+#[cfg(feature = "playground")]
 #[derive(Debug, Serialize)]
 pub struct ReloadPinnedKeysResponse {
     pub ok: bool,
@@ -73,6 +87,7 @@ pub struct ReloadPinnedKeysResponse {
 /// open connections; those still require a restart.
 ///
 /// Plan §2.
+#[cfg(feature = "playground")]
 pub async fn reload_pinned_keys<S: ExtendedRegistryStore + 'static>(
     State(state): State<Arc<AppState<S>>>,
     headers: HeaderMap,
@@ -94,6 +109,100 @@ pub async fn reload_pinned_keys<S: ExtendedRegistryStore + 'static>(
     }
     tracing::info!(count, "pinned-keys reloaded via admin endpoint");
     Ok(Json(ReloadPinnedKeysResponse { ok: true, count }))
+}
+
+/// Operational snapshot returned by `GET /admin/status`.
+#[derive(Debug, Serialize)]
+pub struct AdminStatusResponse {
+    pub storage: StorageStatus,
+    pub idempotency: IdempotencyStatus,
+    pub webhook: WebhookStatus,
+    pub revocation: RevocationStatus,
+    pub migrations: MigrationStatus,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StorageStatus {
+    pub healthy: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IdempotencyStatus {
+    /// `None` when the backend doesn't track an idempotency table.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub records: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WebhookStatus {
+    pub enabled: bool,
+    /// Events buffered but not yet delivered; nearing `queue_capacity` means
+    /// the worker is falling behind and events are at risk of being dropped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_in_flight: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_capacity: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RevocationStatus {
+    pub configured_feeds: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MigrationStatus {
+    pub backend: String,
+    /// Always `true` for a running server — migrations run at startup and the
+    /// process aborts on failure, so a live `/admin/status` implies success.
+    pub applied: bool,
+}
+
+/// `GET /admin/status` — auth-gated operational snapshot (storage health,
+/// idempotency table size, webhook queue depth, configured revocation feeds,
+/// storage backend). Ships in every build; gated by `auth.admin_tokens` like
+/// the other admin endpoints. Not playground-gated — it's production
+/// observability.
+pub async fn admin_status<S: ExtendedRegistryStore + 'static>(
+    State(state): State<Arc<AppState<S>>>,
+    headers: HeaderMap,
+) -> Result<Json<AdminStatusResponse>, AdminAuthError> {
+    require_admin_bearer(&state.config, &headers)?;
+
+    let healthy = state.server.store().health().await.is_ok();
+    let records = state
+        .server
+        .store()
+        .count_idempotency_records()
+        .await
+        .ok()
+        .flatten();
+    let webhook = match &state.webhook {
+        Some(w) => {
+            let (in_flight, capacity) = w.queue_status();
+            WebhookStatus {
+                enabled: true,
+                queue_in_flight: Some(in_flight),
+                queue_capacity: Some(capacity),
+            }
+        }
+        None => WebhookStatus {
+            enabled: false,
+            queue_in_flight: None,
+            queue_capacity: None,
+        },
+    };
+    Ok(Json(AdminStatusResponse {
+        storage: StorageStatus { healthy },
+        idempotency: IdempotencyStatus { records },
+        webhook,
+        revocation: RevocationStatus {
+            configured_feeds: state.config.auth.revocation_feeds.len(),
+        },
+        migrations: MigrationStatus {
+            backend: format!("{:?}", state.config.storage.backend),
+            applied: true,
+        },
+    }))
 }
 
 /// Reject the request unless `Authorization: Bearer <token>` matches

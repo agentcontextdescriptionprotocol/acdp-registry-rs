@@ -76,6 +76,21 @@ fn validate_config(cfg: &RegistryConfig) -> anyhow::Result<()> {
     }
     if cfg.auth.enabled
         && cfg.auth.jwt_signing_alg.as_str() != "EdDSA"
+        && cfg.auth.jwt_secret.trim().is_empty()
+        && !cfg.auth.allow_ephemeral_secret
+    {
+        // REG-P1-4: with auth on and HS256 selected, an empty secret would
+        // otherwise fall through to an ephemeral process-lifetime key —
+        // tokens silently stop validating after a restart / across replicas.
+        // Fail fast unless the operator explicitly opted into ephemeral mode.
+        anyhow::bail!(
+            "auth.enabled with HS256 but auth.jwt_secret is empty; set \
+             ACDP_REGISTRY_AUTH__JWT_SECRET (base64, ≥32 bytes) or set \
+             auth.allow_ephemeral_secret=true for local dev"
+        );
+    }
+    if cfg.auth.enabled
+        && cfg.auth.jwt_signing_alg.as_str() != "EdDSA"
         && !cfg.auth.jwt_secret.is_empty()
     {
         // OPS-02 stronger guard: the docker-compose default placeholder
@@ -276,9 +291,14 @@ async fn serve_with_store<S: ExtendedRegistryStore + 'static>(
         // Default (HS256, backward-compatible).
         _ => {
             let jwt_secret = if cfg.auth.jwt_secret.is_empty() {
-                // Ephemeral secret — tokens won't survive a restart. Operators
-                // running in production MUST set ACDP_REGISTRY_AUTH__JWT_SECRET.
-                tracing::warn!("auth.jwt_secret not set — generating an ephemeral key");
+                // Ephemeral secret — tokens won't survive a restart. Only
+                // reachable when auth.allow_ephemeral_secret=true (REG-P1-4);
+                // validate_config bails otherwise. Production MUST set
+                // ACDP_REGISTRY_AUTH__JWT_SECRET.
+                tracing::warn!(
+                    "auth.jwt_secret not set and allow_ephemeral_secret=true — \
+                     generating an ephemeral key; tokens will not survive a restart"
+                );
                 use rand::RngCore;
                 let mut bytes = [0u8; 32];
                 rand::thread_rng().fill_bytes(&mut bytes);
@@ -469,5 +489,56 @@ fn init_tracing() {
             .with_level(true)
             .json()
             .init();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use acdp_registry_types::RegistryConfig;
+    use base64::Engine as _;
+
+    fn cfg_with_auth(secret: &str, allow_ephemeral: bool) -> RegistryConfig {
+        let mut cfg = RegistryConfig::defaults();
+        cfg.auth.enabled = true;
+        cfg.auth.jwt_signing_alg = "HS256".into();
+        cfg.auth.jwt_secret = secret.into();
+        cfg.auth.allow_ephemeral_secret = allow_ephemeral;
+        cfg
+    }
+
+    #[test]
+    fn auth_enabled_empty_secret_fails_without_dev_flag() {
+        let cfg = cfg_with_auth("", false);
+        let err = validate_config(&cfg).expect_err("empty HS256 secret must fail startup");
+        assert!(
+            err.to_string().contains("jwt_secret is empty"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn auth_enabled_empty_secret_allowed_with_dev_flag() {
+        let cfg = cfg_with_auth("", true);
+        assert!(
+            validate_config(&cfg).is_ok(),
+            "ephemeral secret should be permitted when allow_ephemeral_secret=true"
+        );
+    }
+
+    #[test]
+    fn auth_enabled_with_valid_secret_passes() {
+        // 32 bytes base64-encoded.
+        let secret = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        let cfg = cfg_with_auth(&secret, false);
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn auth_disabled_empty_secret_passes() {
+        let mut cfg = RegistryConfig::defaults();
+        cfg.auth.enabled = false;
+        cfg.auth.jwt_secret = String::new();
+        assert!(validate_config(&cfg).is_ok());
     }
 }
