@@ -11,10 +11,20 @@ use serde_json::json;
 
 use crate::state::AppState;
 
+/// `GET /.well-known/acdp.json` — the registry capabilities document.
+///
+/// RFC-ACDP-0006 §4.2.1: registries SHOULD emit `Cache-Control: max-age=300`
+/// or higher. The document changes rarely, so a 5-minute TTL lets clients and
+/// CDNs hold it without re-fetching on every discovery probe.
 pub async fn capabilities<S: ExtendedRegistryStore + 'static>(
     State(state): State<Arc<AppState<S>>>,
-) -> Json<serde_json::Value> {
-    Json(serde_json::to_value(state.server.capabilities()).unwrap_or_else(|_| json!({})))
+) -> impl IntoResponse {
+    let body =
+        Json(serde_json::to_value(state.server.capabilities()).unwrap_or_else(|_| json!({})));
+    (
+        [(axum::http::header::CACHE_CONTROL, "public, max-age=300")],
+        body,
+    )
 }
 
 /// `GET /.well-known/jwks.json` — publish the public key(s) federated

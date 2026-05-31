@@ -108,7 +108,16 @@ fn config(playground: bool) -> RegistryConfig {
 /// deleted) when the harness is dropped.
 struct Harness {
     router: axum::Router,
-    _db: tempfile::NamedTempFile,
+    db: tempfile::NamedTempFile,
+}
+
+impl Harness {
+    /// Path to the backing SQLite file, for tests that need to reach past
+    /// the HTTP surface (e.g. ageing an idempotency record to simulate
+    /// expiry without sleeping).
+    fn db_path(&self) -> &std::path::Path {
+        self.db.path()
+    }
 }
 
 async fn harness(playground: bool) -> Harness {
@@ -134,7 +143,7 @@ async fn harness(playground: bool) -> Harness {
     let state = AppStateInner::new(server, auth, None, config(playground), None);
     Harness {
         router: build_router(state),
-        _db: db,
+        db,
     }
 }
 
@@ -301,6 +310,13 @@ async fn capabilities_round_trips() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    // RFC-ACDP-0006 §4.2.1: capabilities are cacheable.
+    assert_eq!(
+        resp.headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("public, max-age=300"),
+    );
     let v = body_to_json(resp).await;
     assert_eq!(v["acdp_version"], "0.1.0");
     assert_eq!(v["registry_did"], format!("did:web:{AUTHORITY}"));
@@ -671,6 +687,86 @@ async fn idempotency_key_too_long_rejected() {
     let huge = "x".repeat(256);
     let (status, _) = publish(app, &req, Some(&huge)).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// REG-P1-2: the idempotency lookup checks `expires_at > now` in Rust (the
+/// SQL only matches on `(agent_id, key)`). An expired record must therefore
+/// be treated as a fresh publish, not a replay.
+#[tokio::test]
+async fn expired_idempotency_key_is_not_matched() {
+    let h = harness(true).await;
+    let app = &h.router;
+    let req = producer(11)
+        .publish_request()
+        .title("idem-expiry")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (s1, v1) = publish(app, &req, Some("expiry-key")).await;
+    assert_eq!(s1, StatusCode::OK);
+
+    // Age the stored record so its TTL is in the past — cheaper and more
+    // deterministic than sleeping out a real TTL.
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", h.db_path().display()))
+        .await
+        .unwrap();
+    let aged = sqlx::query(
+        "UPDATE idempotency_records \
+         SET expires_at_ms = 0, expires_at = '1970-01-01T00:00:00Z'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap()
+    .rows_affected();
+    assert_eq!(aged, 1, "expected exactly one idempotency record to age");
+    pool.close().await;
+
+    let (s2, v2) = publish(app, &req, Some("expiry-key")).await;
+    assert_eq!(s2, StatusCode::OK);
+    assert_ne!(
+        v1["ctx_id"], v2["ctx_id"],
+        "an expired idempotency key must yield a fresh publish, not a replay"
+    );
+}
+
+/// REG-P1-2: idempotency records are keyed by `(agent_id, key)` only — NOT
+/// subdivided by `X-Tenant-Id`. Safe because tenant-bound tokens (#21) pin an
+/// agent to a single tenant, so a key can't legitimately be reused across
+/// tenants. This locks the contract: a change to per-tenant idempotency must
+/// update both the key and this assertion deliberately.
+#[tokio::test]
+async fn idempotency_key_is_agent_scoped_not_tenant_scoped() {
+    let h = harness(true).await;
+    let app = &h.router;
+    let req = producer(12)
+        .publish_request()
+        .title("idem-tenant")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let body = serde_json::to_vec(&req).unwrap();
+    let mk = |tenant: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/contexts")
+            .header("Idempotency-Key", "tenant-scope-key")
+            .header("X-Tenant-Id", tenant)
+            .body(Body::from(body.clone()))
+            .unwrap()
+    };
+
+    let r1 = app.clone().oneshot(mk("tenant-a")).await.unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+    let v1 = body_to_json(r1).await;
+    let r2 = app.clone().oneshot(mk("tenant-b")).await.unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+    let v2 = body_to_json(r2).await;
+    assert_eq!(
+        v1["ctx_id"], v2["ctx_id"],
+        "idempotency is (agent,key)-scoped; same key replays regardless of X-Tenant-Id"
+    );
 }
 
 #[tokio::test]
@@ -1336,6 +1432,6 @@ async fn harness_with_playground(playground: PlaygroundConfig) -> Harness {
     let state = AppStateInner::new(server, auth, None, cfg, None);
     Harness {
         router: build_router(state),
-        _db: db,
+        db,
     }
 }
