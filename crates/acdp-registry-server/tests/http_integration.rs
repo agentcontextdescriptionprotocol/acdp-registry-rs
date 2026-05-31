@@ -36,8 +36,10 @@ use acdp_registry_core::{build_router, AppStateInner};
 use acdp_registry_sqlite::SqliteStore;
 use acdp_registry_store::ExtendedRegistryStore;
 use acdp_registry_types::{
-    config::PinnedAgentKey, AuthConfig, LimitsConfig, PlaygroundConfig, RegistryConfig,
-    RegistrySection, StorageBackend, StorageConfig, WebhookConfig,
+    auth::{AcdpClaims, BearerClaims},
+    config::PinnedAgentKey,
+    AuthConfig, LimitsConfig, PlaygroundConfig, RegistryConfig, RegistrySection, StorageBackend,
+    StorageConfig, WebhookConfig,
 };
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -460,6 +462,246 @@ async fn tenancy_default_when_no_publish_header() {
     assert_eq!(
         retrieve_with_tenant(&h.router, &ctx_id, Some("tenant-a")).await,
         StatusCode::NOT_FOUND,
+    );
+}
+
+/// Mint a bearer token bound to `tenant`, signed by the same HS256 secret
+/// the default harness wires (`[42u8; 32]` under `AUTHORITY`), so it validates
+/// against that harness's `AuthService`.
+fn tenant_bound_token(tenant: Option<&str>) -> String {
+    let secret = JwtSecret::from_bytes(&[42u8; 32]);
+    let signer = JwtSigner::new(secret, format!("did:web:{AUTHORITY}"), AUTHORITY.into(), 30);
+    let now = chrono::Utc::now().timestamp();
+    let claims = BearerClaims {
+        iss: format!("did:web:{AUTHORITY}"),
+        sub: format!("did:web:{AUTHORITY}:agents:bound"),
+        jti: "tenant-bound-jti".into(),
+        iat: now,
+        exp: now + 3600,
+        acdp: AcdpClaims {
+            registry: AUTHORITY.into(),
+            key_id: format!("did:web:{AUTHORITY}:agents:bound#key-1"),
+        },
+        tenant: tenant.map(str::to_string),
+    };
+    signer.sign(&claims).unwrap()
+}
+
+#[tokio::test]
+async fn publish_rejects_tenant_header_that_contradicts_bound_token() {
+    // A token bound to tenant-a must NOT be able to write a context into
+    // tenant-b by spoofing X-Tenant-Id. Before the fix, publish stamped the
+    // row from the raw header (`tenant_from_headers`), ignoring the
+    // authoritative JWT claim — a cross-tenant write. Now publish resolves the
+    // tenant via `tenant_for_request`, which rejects the mismatch.
+    let mut cfg = config(true);
+    cfg.auth.enabled = true;
+    let h = harness_from_config(cfg).await;
+
+    let req = producer(31)
+        .publish_request()
+        .title("bound-to-tenant-a")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let token = tenant_bound_token(Some("tenant-a"));
+
+    // Mismatch: claim=tenant-a, header=tenant-b → rejected before persisting.
+    let body = serde_json::to_vec(&req).unwrap();
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/contexts")
+                .header("authorization", format!("Bearer {token}"))
+                .header("X-Tenant-Id", "tenant-b")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        resp.status() == StatusCode::UNAUTHORIZED || resp.status() == StatusCode::FORBIDDEN,
+        "spoofed X-Tenant-Id must be rejected, got {}",
+        resp.status()
+    );
+}
+
+#[tokio::test]
+async fn publish_stamps_tenant_from_bound_token_claim() {
+    // With a bound token and no X-Tenant-Id header, the row is stamped from the
+    // JWT claim (tenant-a) — not from the absent header. Retrieval is then only
+    // visible under tenant-a.
+    let mut cfg = config(true);
+    cfg.auth.enabled = true;
+    let h = harness_from_config(cfg).await;
+
+    let req = producer(32)
+        .publish_request()
+        .title("claim-stamped-row")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let token = tenant_bound_token(Some("tenant-a"));
+
+    let body = serde_json::to_vec(&req).unwrap();
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/contexts")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ctx_id = body_to_json(resp).await["ctx_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Stamped under the claim's tenant, not 'default'.
+    assert_eq!(
+        retrieve_with_tenant(&h.router, &ctx_id, Some("tenant-a")).await,
+        StatusCode::OK,
+    );
+    assert_eq!(
+        retrieve_with_tenant(&h.router, &ctx_id, Some("tenant-b")).await,
+        StatusCode::NOT_FOUND,
+    );
+}
+
+async fn get_with_auth(
+    app: &axum::Router,
+    ctx_id: &str,
+    bearer: Option<&str>,
+    tenant: Option<&str>,
+) -> StatusCode {
+    let mut builder =
+        Request::builder().uri(format!("/contexts/{}", pct_encode_path_segment(ctx_id)));
+    if let Some(t) = bearer {
+        builder = builder.header("authorization", format!("Bearer {t}"));
+    }
+    if let Some(t) = tenant {
+        builder = builder.header("X-Tenant-Id", t);
+    }
+    app.clone()
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn strict_tenant_mode_rejects_unscoped_read() {
+    // With `auth.require_tenant = true`, a read that resolves to no tenant
+    // (no header, no tenant-bound token) is default-denied instead of running
+    // with the tenant filter disabled.
+    let mut cfg = config(true);
+    cfg.auth.enabled = true;
+    cfg.auth.require_tenant = true;
+    let h = harness_from_config(cfg).await;
+
+    let req = producer(33)
+        .publish_request()
+        .title("strict-row")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    // Publish carries a tenant via the header (no bearer) — allowed.
+    let (status, v) = publish_with_tenant(&h.router, &req, Some("tenant-a")).await;
+    assert_eq!(status, StatusCode::OK, "publish body = {v}");
+    let ctx_id = v["ctx_id"].as_str().unwrap().to_string();
+
+    // No tenant signal at all → default-deny (401), NOT an unfiltered read.
+    assert_eq!(
+        get_with_auth(&h.router, &ctx_id, None, None).await,
+        StatusCode::UNAUTHORIZED,
+    );
+    // Correct tenant header → 200.
+    assert_eq!(
+        get_with_auth(&h.router, &ctx_id, None, Some("tenant-a")).await,
+        StatusCode::OK,
+    );
+}
+
+#[tokio::test]
+async fn strict_tenant_mode_ignores_spoofed_header_on_unbound_token() {
+    // An authenticated-but-unbound token must not be able to assert a tenant
+    // via X-Tenant-Id under strict mode — the claim is the sole authority, so
+    // the spoofed header is ignored and the request default-denies. A token
+    // bound to the tenant works.
+    let mut cfg = config(true);
+    cfg.auth.enabled = true;
+    cfg.auth.require_tenant = true;
+    let h = harness_from_config(cfg).await;
+
+    let req = producer(34)
+        .publish_request()
+        .title("strict-bound-row")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (status, v) = publish_with_tenant(&h.router, &req, Some("tenant-a")).await;
+    assert_eq!(status, StatusCode::OK, "publish body = {v}");
+    let ctx_id = v["ctx_id"].as_str().unwrap().to_string();
+
+    // Unbound token + spoofed X-Tenant-Id=tenant-a → header ignored → 401.
+    let unbound = tenant_bound_token(None);
+    assert_eq!(
+        get_with_auth(&h.router, &ctx_id, Some(&unbound), Some("tenant-a")).await,
+        StatusCode::UNAUTHORIZED,
+    );
+    // Token bound to tenant-a → authorized, no header needed.
+    let bound = tenant_bound_token(Some("tenant-a"));
+    assert_eq!(
+        get_with_auth(&h.router, &ctx_id, Some(&bound), None).await,
+        StatusCode::OK,
+    );
+}
+
+#[tokio::test]
+async fn challenge_endpoint_is_rate_limited() {
+    // `POST /auth/challenge` is unauthenticated; a per-agent rate limit caps
+    // flooding. Set the budget to 2/min and confirm the 3rd request is 429
+    // with a Retry-After header.
+    let mut cfg = config(false);
+    cfg.auth.enabled = true;
+    cfg.limits.challenge_rate_per_minute = 2;
+    let h = harness_from_config(cfg).await;
+
+    let challenge = |app: axum::Router| async move {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/challenge")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"agent_id": "did:web:agents.test:flooder"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    };
+
+    assert_eq!(challenge(h.router.clone()).await.status(), StatusCode::OK);
+    assert_eq!(challenge(h.router.clone()).await.status(), StatusCode::OK);
+    let limited = challenge(h.router.clone()).await;
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        limited.headers().get("retry-after").is_some(),
+        "429 must carry a Retry-After header"
     );
 }
 

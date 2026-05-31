@@ -60,6 +60,13 @@ token_leeway_seconds = 30
 # the registry hosts world-readable public contexts (developer registries,
 # discovery hubs).
 anonymous_public_reads = true
+# Enforce tenant scoping on every authenticated request. Default false keeps
+# V0 behavior (a request that asserts no tenant runs with the tenant filter
+# disabled, gated only by visibility). Set true on a multi-tenant deployment:
+# a request that resolves to no tenant is rejected (401), and an
+# authenticated caller's tenant is taken ONLY from the JWT `tenant` claim, so
+# an unbound token can't assert a tenant via the X-Tenant-Id header.
+require_tenant = false
 
 [webhook]
 enabled         = false
@@ -82,6 +89,10 @@ idempotency_key_ttl_seconds = 86400
 # 0 disables. In-memory + per-process; front multi-replica deployments with a
 # shared limiter for a global bound.
 publish_rate_per_minute = 60
+# Max POST /auth/challenge per minute per requested agent_id. The challenge
+# endpoint is unauthenticated, so this bounds flooding that would amplify
+# nonce-store writes. 0 disables. Same in-memory + per-process caveat.
+challenge_rate_per_minute = 60
 
 [playground]
 # When true, the publish handler skips DID-signature verification. NEVER

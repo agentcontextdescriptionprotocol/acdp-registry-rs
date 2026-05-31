@@ -233,6 +233,18 @@ pub struct AuthConfig {
     /// V0 behavior. Plan §4.
     #[serde(default)]
     pub tenant_agents: Vec<TenantAgentBinding>,
+
+    /// Enforce tenant scoping on every authenticated request. When `false`
+    /// (the default, V0-compatible) a request that resolves to no tenant —
+    /// no `X-Tenant-Id` header and a token without a `tenant` claim — runs
+    /// with no tenant filter (gated only by visibility). When `true`, a
+    /// multi-tenant deployment is hardened:
+    ///   * a request that resolves to no tenant is rejected (default-deny);
+    ///   * when a valid bearer is present, the tenant is taken ONLY from the
+    ///     JWT `tenant` claim — a token the issuer did not bind to a tenant
+    ///     can no longer assert one via the spoofable `X-Tenant-Id` header.
+    #[serde(default)]
+    pub require_tenant: bool,
 }
 
 /// One agent→tenant binding for registry-issued JWTs.
@@ -323,6 +335,7 @@ impl Default for AuthConfig {
             revocation_feeds: Vec::new(),
             admin_tokens: Vec::new(),
             tenant_agents: Vec::new(),
+            require_tenant: false,
         }
     }
 }
@@ -388,6 +401,13 @@ pub struct LimitsConfig {
     /// (e.g. at the gateway) for a global bound.
     #[serde(default = "default_publish_rate_per_minute")]
     pub publish_rate_per_minute: u32,
+    /// Max `POST /auth/challenge` per minute per requested `agent_id`. The
+    /// challenge endpoint is unauthenticated, so without a bound an attacker
+    /// can flood it to amplify writes / grow the nonce store. `0` disables
+    /// the limit. In-memory and per-process — same caveat as
+    /// `publish_rate_per_minute`.
+    #[serde(default = "default_challenge_rate_per_minute")]
+    pub challenge_rate_per_minute: u32,
 }
 
 fn default_payload_bytes() -> u64 {
@@ -402,6 +422,9 @@ fn default_idempotency_ttl() -> u64 {
 fn default_publish_rate_per_minute() -> u32 {
     60
 }
+fn default_challenge_rate_per_minute() -> u32 {
+    60
+}
 
 impl Default for LimitsConfig {
     fn default() -> Self {
@@ -410,6 +433,7 @@ impl Default for LimitsConfig {
             max_embedded_bytes: default_embedded_bytes(),
             idempotency_key_ttl_seconds: default_idempotency_ttl(),
             publish_rate_per_minute: default_publish_rate_per_minute(),
+            challenge_rate_per_minute: default_challenge_rate_per_minute(),
         }
     }
 }
