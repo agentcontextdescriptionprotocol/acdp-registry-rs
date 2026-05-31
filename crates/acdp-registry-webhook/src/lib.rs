@@ -10,9 +10,16 @@ use std::time::Duration;
 
 use acdp_registry_types::{WebhookConfig, WebhookEvent};
 use hmac::{Hmac, Mac};
+use serde::Serialize;
 use sha2::Sha256;
 use thiserror::Error;
 use tokio::sync::mpsc;
+use uuid::Uuid;
+
+/// Wire schema version of the webhook envelope. Bump on any
+/// backwards-incompatible change to the serialized event shape so the control
+/// plane can branch on it.
+pub const WEBHOOK_SCHEMA_VERSION: &str = "1.0";
 
 #[derive(Debug, Error)]
 pub enum WebhookError {
@@ -31,10 +38,26 @@ type HmacSha256 = Hmac<Sha256>;
 /// signed JSON body — so the GitHub-compatible signature scheme and the
 /// stable event schema are both preserved while still letting a
 /// multi-tenant control plane attribute the delivery.
+///
+/// `event_id` is minted once at emit time (REG-P2-6) and reused across every
+/// delivery retry, so the control plane can dedupe re-deliveries.
 #[derive(Debug, Clone)]
 struct Delivery {
+    event_id: String,
     event: WebhookEvent,
     tenant_id: Option<String>,
+}
+
+/// What actually goes on the wire: the event flattened under a small envelope
+/// carrying `event_id` + `schema_version`. Flattening keeps the historical
+/// shape (top-level `type` + variant fields) so existing consumers keep
+/// working while gaining the two dedupe/versioning fields.
+#[derive(Debug, Serialize)]
+struct WireEnvelope<'a> {
+    event_id: &'a str,
+    schema_version: &'a str,
+    #[serde(flatten)]
+    event: &'a WebhookEvent,
 }
 
 /// Handle held by the HTTP layer. `emit` is non-blocking; the worker
@@ -101,7 +124,11 @@ impl WebhookEmitter {
     /// forwarded as the `X-Tenant-Id` header so a multi-tenant control
     /// plane can attribute the event. The id never enters the signed body.
     pub fn emit_with_tenant(&self, event: WebhookEvent, tenant_id: Option<String>) {
-        let delivery = Delivery { event, tenant_id };
+        let delivery = Delivery {
+            event_id: Uuid::new_v4().to_string(),
+            event,
+            tenant_id,
+        };
         match self.tx.try_send(delivery) {
             Ok(_) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -141,7 +168,12 @@ async fn deliver(
     delivery: &Delivery,
 ) -> Result<(), WebhookError> {
     let event = &delivery.event;
-    let body = serde_json::to_vec(event).map_err(|e| WebhookError::Encode(e.to_string()))?;
+    let envelope = WireEnvelope {
+        event_id: &delivery.event_id,
+        schema_version: WEBHOOK_SCHEMA_VERSION,
+        event,
+    };
+    let body = serde_json::to_vec(&envelope).map_err(|e| WebhookError::Encode(e.to_string()))?;
     let sig = sign(&config.secret, &body);
 
     let mut backoff = Duration::from_millis(250);
@@ -152,7 +184,8 @@ async fn deliver(
             .post(&config.url)
             .header("Content-Type", "application/json")
             .header("X-ACDP-Signature", &sig)
-            .header("X-ACDP-Event", event.name());
+            .header("X-ACDP-Event", event.name())
+            .header("X-ACDP-Event-Id", &delivery.event_id);
         if let Some(tenant) = &delivery.tenant_id {
             builder = builder.header("X-Tenant-Id", tenant);
         }
@@ -301,6 +334,54 @@ mod tests {
             !raw.contains("tenant-x\""),
             "tenant id leaked into JSON body:\n{raw}"
         );
+        // REG-P2-6: envelope carries event_id + schema_version, and event_id
+        // is echoed in a header for cheap dedup.
+        assert!(
+            raw.contains("\"schema_version\":\"1.0\""),
+            "expected schema_version in body, got:\n{raw}"
+        );
+        assert!(
+            raw.contains("\"event_id\":\""),
+            "expected event_id in body, got:\n{raw}"
+        );
+        assert!(
+            raw.to_ascii_lowercase().contains("x-acdp-event-id:"),
+            "expected X-ACDP-Event-Id header, got:\n{raw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn distinct_emits_get_distinct_event_ids() {
+        fn event_id_of(raw: &str) -> String {
+            let needle = "\"event_id\":\"";
+            let start = raw.find(needle).expect("event_id present") + needle.len();
+            let rest = &raw[start..];
+            let end = rest.find('"').expect("event_id terminated");
+            rest[..end].to_string()
+        }
+        async fn capture_once(emitter: &WebhookEmitter, addr: std::net::SocketAddr) -> String {
+            let listener = TcpListener::bind(addr).await.expect("rebind");
+            let cap = tokio::spawn(capture_one_request(listener));
+            emitter.emit(published_event());
+            cap.await.expect("join")
+        }
+
+        // First listener to learn a free port, then reuse it sequentially.
+        let probe = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = probe.local_addr().expect("addr");
+        drop(probe);
+        let config = WebhookConfig {
+            enabled: true,
+            url: format!("http://{addr}/hook"),
+            secret: "shhh".into(),
+            timeout_seconds: 5,
+            max_retries: 1,
+            queue_capacity: 8,
+        };
+        let emitter = WebhookEmitter::spawn(config);
+        let a = event_id_of(&capture_once(&emitter, addr).await);
+        let b = event_id_of(&capture_once(&emitter, addr).await);
+        assert_ne!(a, b, "each emit must mint a fresh event_id");
     }
 
     #[tokio::test]
