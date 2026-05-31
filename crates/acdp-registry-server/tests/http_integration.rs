@@ -125,6 +125,23 @@ async fn harness(playground: bool) -> Harness {
 }
 
 async fn harness_from_config(cfg: RegistryConfig) -> Harness {
+    build_harness(cfg, None).await
+}
+
+/// Like [`harness_from_config`] but wires a real `CrossRegistryResolver` so
+/// federation (`GET /contexts/:foreign_ctx_id`) is exercised.
+async fn harness_with_federation(cfg: RegistryConfig) -> Harness {
+    build_harness(
+        cfg,
+        Some(Arc::new(acdp::client::CrossRegistryResolver::new())),
+    )
+    .await
+}
+
+async fn build_harness(
+    cfg: RegistryConfig,
+    cross_registry: Option<Arc<acdp::client::CrossRegistryResolver>>,
+) -> Harness {
     let db = tempfile::Builder::new()
         .prefix("acdp-test-")
         .suffix(".sqlite")
@@ -144,7 +161,7 @@ async fn harness_from_config(cfg: RegistryConfig) -> Harness {
         resolver,
         AUTHORITY.into(),
     ));
-    let state = AppStateInner::new(server, auth, None, cfg, None);
+    let state = AppStateInner::new(server, auth, None, cfg, cross_registry);
     Harness {
         router: build_router(state),
         db,
@@ -900,6 +917,54 @@ async fn publish_rate_limited_per_agent_with_retry_after() {
 
     // A different agent is unaffected by agent 20's exhausted budget.
     assert_eq!(send(app, 21, "a").await.status(), StatusCode::OK);
+}
+
+/// REG-P2-3: a foreign `ctx_id` pointing at a private/internal IP must be
+/// refused by the SSRF policy on the cross-registry resolution path — never
+/// fetched. The registry stays healthy, so the gateway-hop failure is a 502.
+#[tokio::test]
+async fn cross_registry_private_ip_authority_is_blocked() {
+    let h = harness_with_federation(config(true)).await;
+    let app = &h.router;
+    // Authority is an RFC1918 literal; uuid is well-formed so CtxId parses.
+    let foreign = "acdp://192.168.1.10/00000000-0000-4000-8000-000000000001";
+    let uri = format!("/contexts/{}", pct_encode_path_segment(foreign));
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_GATEWAY,
+        "SSRF-blocked cross-registry resolution should surface as 502"
+    );
+    let v = body_to_json(resp).await;
+    assert_eq!(
+        v["error"]["code"], "cross_registry_resolution_failed",
+        "body = {v}"
+    );
+}
+
+/// REG-P2-5: federation is public-only and opt-in. With cross-registry
+/// resolution DISABLED, a foreign `ctx_id` is never proxied — it returns a
+/// plain 404 (indistinguishable from a missing local context), so a restricted
+/// remote context can't be reached through this registry.
+#[tokio::test]
+async fn cross_registry_disabled_does_not_proxy_foreign_ctx() {
+    // Default harness wires cross_registry = None.
+    let h = harness(true).await;
+    let app = &h.router;
+    let foreign = "acdp://other.example.com/00000000-0000-4000-8000-000000000002";
+    let uri = format!("/contexts/{}", pct_encode_path_segment(foreign));
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let v = body_to_json(resp).await;
+    assert_eq!(v["error"]["code"], "not_found", "body = {v}");
 }
 
 #[tokio::test]

@@ -365,6 +365,18 @@ fn context_type_str(t: &acdp::types::primitives::ContextType) -> String {
 /// content hash, and verifies the producer's signature via the local
 /// `WebResolver`. Foreign retrieval is gated by
 /// `registry.cross_registry_resolution`.
+///
+/// REG-P2-5 — federation auth mode is **public-only by design.** The resolver
+/// fetches the foreign body anonymously: it forwards NO caller credentials to
+/// the upstream registry. A remote `restricted`/`private` context therefore
+/// returns 404 from the foreign registry (its visibility gate hides it from an
+/// anonymous requester), so this registry can only ever surface remote *public*
+/// contexts — it never proxies privileged remote data on a caller's behalf.
+/// Authenticated federation (minting scoped credentials per trusted authority)
+/// is intentionally out of scope for v0.1; revisit if cross-tenant private
+/// federation is required. SSRF on this path is gated by the resolver's
+/// `SsrfPolicy` (REG-P2-3): private/internal authorities fail with 502
+/// `cross_registry_resolution_failed`, never an internal fetch.
 pub async fn retrieve<S: ExtendedRegistryStore + 'static>(
     State(state): State<Arc<AppState<S>>>,
     headers: HeaderMap,
