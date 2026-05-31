@@ -202,6 +202,14 @@ pub struct AuthConfig {
     #[serde(default)]
     pub jwt_kid: String,
 
+    /// Permit booting with an ephemeral (process-lifetime) HS256 secret when
+    /// `auth.enabled` and `jwt_secret` is empty. Defaults to `false`: a
+    /// production registry with auth on but no secret fails startup rather
+    /// than silently minting tokens that don't survive a restart. Set to
+    /// `true` only for local dev / tests.
+    #[serde(default)]
+    pub allow_ephemeral_secret: bool,
+
     /// Cross-issuer revocation feeds the registry polls for propagated
     /// revocations (plan §9). Empty (default) = no federation; the
     /// registry trusts only its own revocation list.
@@ -311,6 +319,7 @@ impl Default for AuthConfig {
             jwt_signing_alg: default_jwt_alg(),
             jwt_private_key_pem: String::new(),
             jwt_kid: String::new(),
+            allow_ephemeral_secret: false,
             revocation_feeds: Vec::new(),
             admin_tokens: Vec::new(),
             tenant_agents: Vec::new(),
