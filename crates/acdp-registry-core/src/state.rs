@@ -9,6 +9,8 @@ use acdp_registry_store::ExtendedRegistryStore;
 use acdp_registry_types::{PlaygroundConfig, RegistryConfig};
 use acdp_registry_webhook::WebhookEmitter;
 
+use crate::rate_limit::AgentRateLimiter;
+
 /// Public alias — the value axum actually carries is `Arc<AppState<S>>`.
 pub type AppState<S> = AppStateInner<S>;
 
@@ -31,6 +33,9 @@ pub struct AppStateInner<S: ExtendedRegistryStore> {
     /// (small + Clone), so no read ever blocks on a writer. Writers
     /// hold the lock for the duration of the env-driven swap.
     pub playground: Arc<RwLock<PlaygroundConfig>>,
+    /// REG-P1-3: per-agent `POST /contexts` limiter (RFC-ACDP-0008 §4.3).
+    /// `None` when `limits.publish_rate_per_minute == 0` (disabled).
+    pub rate_limiter: Option<Arc<AgentRateLimiter>>,
 }
 
 impl<S: ExtendedRegistryStore> AppStateInner<S> {
@@ -45,6 +50,10 @@ impl<S: ExtendedRegistryStore> AppStateInner<S> {
         cross_registry: Option<Arc<CrossRegistryResolver>>,
     ) -> Self {
         let playground = Arc::new(RwLock::new(config.playground.clone()));
+        let rate_limiter = match config.limits.publish_rate_per_minute {
+            0 => None,
+            n => Some(Arc::new(AgentRateLimiter::new(n))),
+        };
         Self {
             server,
             auth,
@@ -52,6 +61,7 @@ impl<S: ExtendedRegistryStore> AppStateInner<S> {
             config,
             cross_registry,
             playground,
+            rate_limiter,
         }
     }
 }

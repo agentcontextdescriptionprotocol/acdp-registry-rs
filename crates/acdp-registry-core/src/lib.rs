@@ -6,6 +6,7 @@
 
 pub mod handlers;
 pub mod playground;
+pub mod rate_limit;
 pub mod state;
 
 pub use state::{AppState, AppStateInner};

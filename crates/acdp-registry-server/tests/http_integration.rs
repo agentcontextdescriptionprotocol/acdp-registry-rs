@@ -121,6 +121,10 @@ impl Harness {
 }
 
 async fn harness(playground: bool) -> Harness {
+    harness_from_config(config(playground)).await
+}
+
+async fn harness_from_config(cfg: RegistryConfig) -> Harness {
     let db = tempfile::Builder::new()
         .prefix("acdp-test-")
         .suffix(".sqlite")
@@ -140,7 +144,7 @@ async fn harness(playground: bool) -> Harness {
         resolver,
         AUTHORITY.into(),
     ));
-    let state = AppStateInner::new(server, auth, None, config(playground), None);
+    let state = AppStateInner::new(server, auth, None, cfg, None);
     Harness {
         router: build_router(state),
         db,
@@ -767,6 +771,58 @@ async fn idempotency_key_is_agent_scoped_not_tenant_scoped() {
         v1["ctx_id"], v2["ctx_id"],
         "idempotency is (agent,key)-scoped; same key replays regardless of X-Tenant-Id"
     );
+}
+
+/// REG-P1-3 / REG-P2-1: per-agent publish limit returns 429 + Retry-After,
+/// and the limit is scoped per signing agent.
+#[tokio::test]
+async fn publish_rate_limited_per_agent_with_retry_after() {
+    let mut cfg = config(true);
+    cfg.limits.publish_rate_per_minute = 2;
+    let h = harness_from_config(cfg).await;
+    let app = &h.router;
+
+    async fn send(app: &axum::Router, seed: u8, title: &str) -> axum::response::Response {
+        let req = producer(seed)
+            .publish_request()
+            .title(title)
+            .context_type(ContextType::DataSnapshot)
+            .visibility(Visibility::Public)
+            .build()
+            .unwrap();
+        let body = serde_json::to_vec(&req).unwrap();
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/contexts")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    // Agent 20: two publishes within budget, third over budget.
+    assert_eq!(send(app, 20, "a").await.status(), StatusCode::OK);
+    assert_eq!(send(app, 20, "b").await.status(), StatusCode::OK);
+    let limited = send(app, 20, "c").await;
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry = limited
+        .headers()
+        .get(axum::http::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .expect("Retry-After header present and numeric");
+    assert!(
+        (1..=60).contains(&retry),
+        "Retry-After out of range: {retry}"
+    );
+    let v = body_to_json(limited).await;
+    assert_eq!(v["error"]["code"], "rate_limited");
+
+    // A different agent is unaffected by agent 20's exhausted budget.
+    assert_eq!(send(app, 21, "a").await.status(), StatusCode::OK);
 }
 
 #[tokio::test]

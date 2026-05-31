@@ -36,6 +36,11 @@ pub enum RegistryError {
     #[error("jwt error: {0}")]
     Jwt(String),
 
+    /// Per-agent publish rate limit exceeded (RFC-ACDP-0008 §4.3). Carries
+    /// the bounded retry window surfaced as a `Retry-After` header.
+    #[error("rate limited; retry after {retry_after_seconds}s")]
+    RateLimited { retry_after_seconds: u64 },
+
     /// Webhook delivery failure (for the worker; not surfaced to API callers).
     #[error("webhook delivery error: {0}")]
     WebhookDelivery(String),
@@ -53,6 +58,7 @@ impl RegistryError {
             Self::Storage(_) => "internal_error",
             Self::Config(_) => "internal_error",
             Self::AuthChallenge(_) | Self::AuthToken(_) | Self::Jwt(_) => "not_authorized",
+            Self::RateLimited { .. } => "rate_limited",
             Self::WebhookDelivery(_) | Self::Internal(_) => "internal_error",
         }
     }
@@ -62,6 +68,7 @@ impl RegistryError {
         match self {
             Self::Acdp(e) => http_status_for_acdp(e),
             Self::AuthChallenge(_) | Self::AuthToken(_) | Self::Jwt(_) => 401,
+            Self::RateLimited { .. } => 429,
             Self::Storage(_) | Self::WebhookDelivery(_) | Self::Internal(_) | Self::Config(_) => {
                 500
             }
@@ -148,10 +155,21 @@ fn http_status_for_acdp(err: &AcdpError) -> u16 {
 #[cfg(feature = "axum")]
 impl axum::response::IntoResponse for RegistryError {
     fn into_response(self) -> axum::response::Response {
-        use axum::http::StatusCode;
+        use axum::http::{header::RETRY_AFTER, HeaderValue, StatusCode};
         let status =
             StatusCode::from_u16(self.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let body = WireError::from(&self);
+        // RFC-ACDP-0008 §4.3 SHOULD: bound 429s with a Retry-After header.
+        if let Self::RateLimited {
+            retry_after_seconds,
+        } = &self
+        {
+            let mut resp = (status, axum::Json(body)).into_response();
+            if let Ok(v) = HeaderValue::from_str(&retry_after_seconds.to_string()) {
+                resp.headers_mut().insert(RETRY_AFTER, v);
+            }
+            return resp;
+        }
         (status, axum::Json(body)).into_response()
     }
 }

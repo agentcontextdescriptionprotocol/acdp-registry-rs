@@ -78,6 +78,10 @@ max_payload_bytes  = 1048576
 max_embedded_bytes = 65536
 # TTL advertised to producers for Idempotency-Key replay (seconds).
 idempotency_key_ttl_seconds = 86400
+# Max POST /contexts per minute per signing agent_id (RFC-ACDP-0008 §4.3).
+# 0 disables. In-memory + per-process; front multi-replica deployments with a
+# shared limiter for a global bound.
+publish_rate_per_minute = 60
 
 [playground]
 # When true, the publish handler skips DID-signature verification. NEVER

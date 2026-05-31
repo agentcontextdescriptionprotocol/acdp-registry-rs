@@ -199,6 +199,18 @@ pub async fn publish<S: ExtendedRegistryStore + 'static>(
         }
     }
 
+    // REG-P1-3: per-agent publish rate limit (RFC-ACDP-0008 §4.3). Checked
+    // here — after the body parses so we know the signing agent, before the
+    // expensive verify/persist pipeline. The limiter is keyed by the signing
+    // `agent_id`, so one noisy producer can't starve others.
+    if let Some(limiter) = &state.rate_limiter {
+        if let Err(retry_after_seconds) = limiter.check(req.agent_id.as_str()) {
+            return Err(RegistryError::RateLimited {
+                retry_after_seconds,
+            });
+        }
+    }
+
     let server = state.server.clone();
     let resolver = state.auth.resolver.clone();
     // Snapshot the playground config once per request. The cell is

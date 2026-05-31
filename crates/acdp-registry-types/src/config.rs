@@ -382,6 +382,12 @@ pub struct LimitsConfig {
     /// the window; older keys may be evicted.
     #[serde(default = "default_idempotency_ttl")]
     pub idempotency_key_ttl_seconds: u64,
+    /// RFC-ACDP-0008 §4.3 (REQUIRED): max `POST /contexts` per minute per
+    /// signing `agent_id`. `0` disables per-agent limiting. In-memory and
+    /// per-process — front a multi-replica deployment with a shared limiter
+    /// (e.g. at the gateway) for a global bound.
+    #[serde(default = "default_publish_rate_per_minute")]
+    pub publish_rate_per_minute: u32,
 }
 
 fn default_payload_bytes() -> u64 {
@@ -393,6 +399,9 @@ fn default_embedded_bytes() -> u64 {
 fn default_idempotency_ttl() -> u64 {
     86_400
 }
+fn default_publish_rate_per_minute() -> u32 {
+    60
+}
 
 impl Default for LimitsConfig {
     fn default() -> Self {
@@ -400,6 +409,7 @@ impl Default for LimitsConfig {
             max_payload_bytes: default_payload_bytes(),
             max_embedded_bytes: default_embedded_bytes(),
             idempotency_key_ttl_seconds: default_idempotency_ttl(),
+            publish_rate_per_minute: default_publish_rate_per_minute(),
         }
     }
 }
