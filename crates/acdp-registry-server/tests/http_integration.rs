@@ -773,6 +773,83 @@ async fn idempotency_key_is_agent_scoped_not_tenant_scoped() {
     );
 }
 
+/// REG-P2-8: a search page whose raw rows are all hidden by the disclosure
+/// filter must still advance the cursor (anchored on the last RAW row), so a
+/// visible row further down the ordered scan stays reachable via pagination
+/// instead of being stranded behind a premature `next_cursor: null`.
+#[tokio::test]
+async fn search_paginates_past_fully_hidden_pages() {
+    let h = harness(true).await;
+    let app = &h.router;
+
+    // The only public context is the OLDEST; everything newer is restricted
+    // (hidden from an anonymous searcher in-store). Publish the public row
+    // first, then sleep so the restricted batch gets strictly-later
+    // millisecond-precision `created_at` and sorts ahead of it (DESC).
+    let pubreq = producer(30)
+        .publish_request()
+        .title("visible-oldest")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (s, pub_v) = publish(app, &pubreq, None).await;
+    assert_eq!(s, StatusCode::OK);
+    let public_ctx = pub_v["ctx_id"].as_str().unwrap().to_string();
+
+    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+    for i in 0..4 {
+        let r = producer(31)
+            .publish_request()
+            .title(format!("hidden-{i}"))
+            .context_type(ContextType::DataSnapshot)
+            .visibility(Visibility::Restricted)
+            .audience(vec![AgentDid::new("did:web:agents.test:nobody")])
+            .build()
+            .unwrap();
+        let (s, _) = publish(app, &r, None).await;
+        assert_eq!(s, StatusCode::OK);
+    }
+
+    // Anonymous search, small page size; follow the cursor to exhaustion.
+    // Page 1 is entirely restricted → matches empty; the OLD code emitted
+    // next_cursor=null here and stranded the public row.
+    let mut seen: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..10 {
+        let uri = match &cursor {
+            Some(c) => format!(
+                "/contexts/search?limit=2&cursor={}",
+                pct_encode_path_segment(c)
+            ),
+            None => "/contexts/search?limit=2".to_string(),
+        };
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_to_json(resp).await;
+        for m in v["matches"].as_array().unwrap() {
+            seen.push(m["ctx_id"].as_str().unwrap().to_string());
+        }
+        match v["next_cursor"].as_str() {
+            Some(c) => cursor = Some(c.to_string()),
+            None => break,
+        }
+    }
+    assert!(
+        seen.contains(&public_ctx),
+        "public ctx must be reachable past fully-hidden pages; saw {seen:?}"
+    );
+    assert_eq!(
+        seen.len(),
+        1,
+        "exactly the one public ctx should surface to anonymous; saw {seen:?}"
+    );
+}
+
 /// REG-P1-3 / REG-P2-1: per-agent publish limit returns 429 + Retry-After,
 /// and the limit is scoped per signing agent.
 #[tokio::test]

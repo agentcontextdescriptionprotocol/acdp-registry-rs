@@ -733,6 +733,12 @@ impl RegistryStore for SqliteStore {
             let want_status = params.status.as_deref().unwrap_or("active");
 
             let mut matches: Vec<FullContext> = Vec::new();
+            // REG-P2-8: anchor the next cursor on the last RAW scanned row,
+            // not the last visible match. A page whose rows are all dropped by
+            // the disclosure / status / tag / derived_from filters below would
+            // otherwise yield no cursor (`matches.last() == None`) and stop
+            // pagination early, hiding visible rows further down the scan.
+            let mut last_scanned: Option<(i64, String)> = None;
             for row in rows.iter().take(limit) {
                 let body_json: String = row.try_get("body_json").map_err(map_sqlx_err)?;
                 let status: String = row.try_get("status").map_err(map_sqlx_err)?;
@@ -741,6 +747,10 @@ impl RegistryStore for SqliteStore {
                 let mut ctx = full_context(body, parse_status(&status));
                 ctx.registry_state.status =
                     project_status_inline(&ctx.registry_state.status, ctx.body.expires_at, now);
+                last_scanned = Some((
+                    ctx.body.created_at.timestamp_millis(),
+                    ctx.body.ctx_id.as_str().to_string(),
+                ));
 
                 // Search disclosure (RFC-ACDP-0008 §4.5).
                 if !can_surface_in_search(&ctx, requester, anonymous_public_reads) {
@@ -771,9 +781,7 @@ impl RegistryStore for SqliteStore {
             }
 
             let next_cursor = if has_more_in_db {
-                matches.last().map(|c| {
-                    encode_cursor(c.body.created_at.timestamp_millis(), c.body.ctx_id.as_str())
-                })
+                last_scanned.as_ref().map(|(ts, id)| encode_cursor(*ts, id))
             } else {
                 None
             };

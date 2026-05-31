@@ -537,9 +537,10 @@ pub async fn search<S: ExtendedRegistryStore + 'static>(
 }
 
 /// Drive `server.search` with handler-side post-filters (visibility +
-/// tenant). When a tenant is asserted, walks the cursor across up to
-/// [`SEARCH_REFILL_MAX_PAGES`] inner pages so a busy mixed-tenant
-/// registry can still return a non-trivial page worth of matches.
+/// tenant). When either post-filter is active, walks the cursor across up
+/// to [`SEARCH_REFILL_MAX_PAGES`] inner pages so a busy registry can still
+/// return a non-trivial page worth of matches even when the leading raw
+/// pages are mostly hidden by the filter.
 ///
 /// `matches.len()` may end up slightly above `target` on the final
 /// inner page (we don't truncate to avoid skipping the surplus on the
@@ -610,11 +611,13 @@ async fn run_search_with_refill<S: ExtendedRegistryStore + 'static>(
         }
         accumulated.extend(matches);
 
-        // Refill only when a tenant is asserted. Without a tenant
-        // filter the original single-page behavior is preserved
-        // bit-for-bit — no behavior change for non-multitenant
-        // deployments.
-        let should_refill = requested_tenant.is_some()
+        // Refill whenever a handler-side post-filter could have dropped rows
+        // below `target` — i.e. a tenant is asserted OR a `?visibility=` narrow
+        // is active (REG-P2-8). When neither filter is set the store already
+        // returned a full page, so the original single-page behavior is
+        // preserved bit-for-bit for non-multitenant, unfiltered deployments.
+        let post_filtered = requested_tenant.is_some() || visibility_filter.is_some();
+        let should_refill = post_filtered
             && accumulated.len() < target
             && resp.next_cursor.is_some()
             && iterations < SEARCH_REFILL_MAX_PAGES;
