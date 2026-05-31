@@ -61,6 +61,14 @@ impl ExtendedRegistryStore for PgStore {
             .map_err(|e| AcdpError::RegistryInternal(format!("health: {e}")))
     }
 
+    async fn count_idempotency_records(&self) -> Result<Option<u64>, AcdpError> {
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM idempotency_records")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| AcdpError::RegistryInternal(format!("count_idempotency: {e}")))?;
+        Ok(Some(n.max(0) as u64))
+    }
+
     async fn tenant_of_ctx(&self, ctx_id: &str) -> Result<Option<String>, AcdpError> {
         let row: Option<(String,)> =
             sqlx::query_as("SELECT tenant_id FROM contexts WHERE ctx_id = $1")

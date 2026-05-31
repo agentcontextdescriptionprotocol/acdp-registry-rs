@@ -113,6 +113,16 @@ impl WebhookEmitter {
         Self { tx }
     }
 
+    /// Snapshot of the delivery queue for the admin status endpoint:
+    /// `(in_flight, capacity)`. `in_flight` is how many events are buffered
+    /// and not yet delivered; nearing `capacity` means the worker is falling
+    /// behind and events are at risk of being dropped.
+    pub fn queue_status(&self) -> (usize, usize) {
+        let capacity = self.tx.max_capacity();
+        let in_flight = capacity.saturating_sub(self.tx.capacity());
+        (in_flight, capacity)
+    }
+
     /// Fire and forget. The channel is bounded; if the worker can't keep
     /// up, the event is dropped with a warn log rather than blocking the
     /// HTTP handler.

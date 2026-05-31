@@ -967,6 +967,50 @@ async fn cross_registry_disabled_does_not_proxy_foreign_ctx() {
     assert_eq!(v["error"]["code"], "not_found", "body = {v}");
 }
 
+/// REG-P2-7: `/admin/status` is auth-gated by `auth.admin_tokens` and reports
+/// storage health, idempotency size, webhook queue, and backend.
+#[tokio::test]
+async fn admin_status_requires_token_and_reports_health() {
+    let mut cfg = config(true);
+    cfg.auth.admin_tokens = vec!["secret-admin".into()];
+    let h = harness_from_config(cfg).await;
+    let app = &h.router;
+
+    // No / wrong token → 403.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/admin/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Valid admin bearer → 200 with a populated snapshot.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/admin/status")
+                .header("authorization", "Bearer secret-admin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_to_json(resp).await;
+    assert_eq!(v["storage"]["healthy"], true, "body = {v}");
+    assert_eq!(v["migrations"]["backend"], "Sqlite", "body = {v}");
+    assert_eq!(v["migrations"]["applied"], true, "body = {v}");
+    assert_eq!(v["webhook"]["enabled"], false, "body = {v}");
+    assert_eq!(v["idempotency"]["records"], 0, "body = {v}");
+    assert_eq!(v["revocation"]["configured_feeds"], 0, "body = {v}");
+}
+
 #[tokio::test]
 async fn search_filters_by_schema_uri() {
     let h = harness(true).await;
