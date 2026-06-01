@@ -41,3 +41,6 @@ Cargo.lock.bak
 # Plans / scratch (mirrors acdp-rs convention)
 plans/
 temp/
+
+CLAUDE.md
+.claude/
