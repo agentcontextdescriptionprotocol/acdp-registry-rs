@@ -8,6 +8,7 @@
 
 use std::time::Duration;
 
+use acdp::safe_http::SsrfPolicy;
 use acdp_registry_types::{WebhookConfig, WebhookEvent};
 use hmac::{Hmac, Mac};
 use serde::Serialize;
@@ -105,11 +106,19 @@ impl WebhookEmitter {
 
     /// Spawn without configuration validation. Prefer `try_spawn` —
     /// retained for tests and for cases where the caller has already
-    /// validated the config.
+    /// validated the config. Uses the strict default SSRF policy.
     pub fn spawn(config: WebhookConfig) -> Self {
+        Self::spawn_with_policy(config, acdp::safe_http::SsrfPolicy::default())
+    }
+
+    /// Like [`spawn`](Self::spawn) but with an explicit SSRF policy for the
+    /// delivery client. Production uses the strict default (via `spawn` /
+    /// `try_spawn`); tests that POST to a local listener pass
+    /// `SsrfPolicy::allow_test_loopback()`.
+    pub fn spawn_with_policy(config: WebhookConfig, policy: acdp::safe_http::SsrfPolicy) -> Self {
         let capacity = config.queue_capacity.max(1);
         let (tx, rx) = mpsc::channel::<Delivery>(capacity);
-        tokio::spawn(worker(config, rx));
+        tokio::spawn(worker(config, rx, policy));
         Self { tx }
     }
 
@@ -151,17 +160,19 @@ impl WebhookEmitter {
     }
 }
 
-async fn worker(config: WebhookConfig, mut rx: mpsc::Receiver<Delivery>) {
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(config.timeout_seconds))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!(error = %e, "webhook: cannot build HTTP client; disabling");
-            return;
-        }
-    };
+async fn worker(config: WebhookConfig, mut rx: mpsc::Receiver<Delivery>, policy: SsrfPolicy) {
+    // SEC (#6): the delivery client filters every resolved IP through the SSRF
+    // policy at DNS time and refuses redirects, so a webhook URL whose DNS
+    // answers (or 3xx redirects to) a private/IMDS address cannot turn the
+    // registry into an SSRF proxy. The earlier plain client did neither.
+    let client =
+        match acdp::safe_http::safe_client(&policy, Duration::from_secs(config.timeout_seconds)) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, "webhook: cannot build HTTP client; disabling");
+                return;
+            }
+        };
     while let Some(delivery) = rx.recv().await {
         if !config.enabled || config.url.is_empty() {
             continue;
@@ -316,7 +327,7 @@ mod tests {
             max_retries: 1,
             queue_capacity: 8,
         };
-        let emitter = WebhookEmitter::spawn(config);
+        let emitter = WebhookEmitter::spawn_with_policy(config, SsrfPolicy::allow_test_loopback());
         emitter.emit_with_tenant(published_event(), Some("tenant-x".into()));
 
         let raw = capture.await.expect("join");
@@ -388,7 +399,7 @@ mod tests {
             max_retries: 1,
             queue_capacity: 8,
         };
-        let emitter = WebhookEmitter::spawn(config);
+        let emitter = WebhookEmitter::spawn_with_policy(config, SsrfPolicy::allow_test_loopback());
         let a = event_id_of(&capture_once(&emitter, addr).await);
         let b = event_id_of(&capture_once(&emitter, addr).await);
         assert_ne!(a, b, "each emit must mint a fresh event_id");
@@ -408,7 +419,7 @@ mod tests {
             max_retries: 1,
             queue_capacity: 8,
         };
-        let emitter = WebhookEmitter::spawn(config);
+        let emitter = WebhookEmitter::spawn_with_policy(config, SsrfPolicy::allow_test_loopback());
         emitter.emit(published_event());
 
         let raw = capture.await.expect("join");

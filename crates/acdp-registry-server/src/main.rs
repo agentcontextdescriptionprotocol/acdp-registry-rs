@@ -123,6 +123,36 @@ fn validate_config(cfg: &RegistryConfig) -> anyhow::Result<()> {
             );
         }
     }
+    // SEC (#17): a multi-tenant deployment must enforce tenant scoping. With
+    // `tenant_agents` configured (the operator's intent is multi-tenancy) but
+    // `require_tenant=false`, a request that resolves to no tenant (no header,
+    // unbound caller) would run with the tenant filter disabled and read across
+    // tenants. Force strict enforcement at startup rather than fail open.
+    if !cfg.auth.tenant_agents.is_empty() && !cfg.auth.require_tenant {
+        anyhow::bail!(
+            "auth.tenant_agents is configured (multi-tenant) but auth.require_tenant=false; \
+             a request resolving to no tenant would bypass the tenant filter. Set \
+             auth.require_tenant=true."
+        );
+    }
+
+    // SEC: refuse an insecure default deployment — a non-loopback bind with
+    // BOTH TLS and auth disabled exposes an unauthenticated, plaintext registry
+    // on every interface. Require an explicit opt-in (the operator asserting a
+    // TLS-terminating, authenticating proxy fronts it on a trusted network).
+    if !is_loopback_bind(&cfg.registry.bind)
+        && !cfg.registry.tls.enabled
+        && !cfg.auth.enabled
+        && !cfg.registry.allow_public_bind
+    {
+        anyhow::bail!(
+            "refusing to bind '{}' with TLS and auth both disabled: this exposes an \
+             unauthenticated, plaintext registry on a public interface. Bind 127.0.0.1, \
+             enable tls/auth, or set registry.allow_public_bind=true if a trusted proxy \
+             terminates TLS and authenticates in front of it.",
+            cfg.registry.bind
+        );
+    }
     if cfg.registry.tls.enabled {
         let cert = cfg
             .registry
@@ -144,6 +174,18 @@ fn validate_config(cfg: &RegistryConfig) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether `bind` is a loopback address (`127.0.0.0/8`, `::1`) or `localhost`.
+/// A non-loopback bind is treated as "public" for the insecure-default guard;
+/// an unparseable hostname is conservatively treated as public.
+fn is_loopback_bind(bind: &str) -> bool {
+    if bind.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    bind.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
 }
 
 #[cfg(feature = "storage-sqlite")]
@@ -539,6 +581,61 @@ mod tests {
         let mut cfg = RegistryConfig::defaults();
         cfg.auth.enabled = false;
         cfg.auth.jwt_secret = String::new();
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    // #8 — insecure-default guard.
+
+    #[test]
+    fn loopback_default_bind_passes() {
+        let cfg = RegistryConfig::defaults(); // binds 127.0.0.1, auth+tls off
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn public_bind_without_tls_or_auth_is_rejected() {
+        let mut cfg = RegistryConfig::defaults();
+        cfg.registry.bind = "0.0.0.0".into();
+        assert!(!cfg.registry.tls.enabled && !cfg.auth.enabled);
+        assert!(
+            validate_config(&cfg).is_err(),
+            "0.0.0.0 + no tls + no auth must be refused"
+        );
+    }
+
+    #[test]
+    fn public_bind_allowed_with_explicit_opt_in() {
+        let mut cfg = RegistryConfig::defaults();
+        cfg.registry.bind = "0.0.0.0".into();
+        cfg.registry.allow_public_bind = true;
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn is_loopback_bind_classification() {
+        assert!(is_loopback_bind("127.0.0.1"));
+        assert!(is_loopback_bind("::1"));
+        assert!(is_loopback_bind("localhost"));
+        assert!(!is_loopback_bind("0.0.0.0"));
+        assert!(!is_loopback_bind("::"));
+        assert!(!is_loopback_bind("10.0.0.5"));
+    }
+
+    // #17 — multi-tenant config must enforce strict tenant scoping.
+    #[test]
+    fn multitenant_without_require_tenant_is_rejected() {
+        use acdp_registry_types::config::TenantAgentBinding;
+        let mut cfg = RegistryConfig::defaults();
+        cfg.auth.tenant_agents = vec![TenantAgentBinding {
+            agent_did: "did:web:agents.example:a".into(),
+            tenant_id: "tenant-a".into(),
+        }];
+        cfg.auth.require_tenant = false;
+        assert!(
+            validate_config(&cfg).is_err(),
+            "tenant_agents without require_tenant must be refused"
+        );
+        cfg.auth.require_tenant = true;
         assert!(validate_config(&cfg).is_ok());
     }
 }

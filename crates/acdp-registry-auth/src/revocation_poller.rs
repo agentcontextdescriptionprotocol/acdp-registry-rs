@@ -38,8 +38,11 @@ use crate::revocation_store::{RevocationRecord, RevocationStore};
 struct FeedEntry {
     jti: String,
     sub: String,
+    /// The issuer that minted this token. Used to confine a peer's feed to the
+    /// issuer it is authoritative for (#7): an entry attributed to a different
+    /// issuer is anomalous (peer bug, or an attempt to revoke another issuer's
+    /// tokens) and is dropped.
     #[serde(default)]
-    #[allow(dead_code)]
     iss: String,
     exp: i64,
     revoked_at_ms: i64,
@@ -176,10 +179,36 @@ async fn apply_entries(
 ) -> bool {
     let mut all_succeeded = true;
     for e in entries {
+        // #7: only honor revocations the polled peer is authoritative for. A
+        // feed entry attributed to a different issuer is anomalous — drop it so
+        // one peer cannot inject revocations labelled as another issuer. Empty
+        // `iss` is tolerated for backward compatibility with feeds that omit it
+        // (the configured peer is the implicit authority). NOTE: this does not
+        // by itself prevent a fully-compromised configured peer from revoking
+        // an arbitrary `jti`; per-issuer scoping of the revocation store
+        // (keying is_revoked on the token's signed `iss`) is the deeper fix and
+        // requires a schema migration — tracked as a follow-up.
+        if !e.iss.is_empty() && e.iss != cfg.issuer {
+            tracing::warn!(
+                issuer = %cfg.issuer,
+                entry_iss = %e.iss,
+                jti = %e.jti,
+                "revocation feed entry from a foreign issuer; dropping (cross-issuer injection guard)"
+            );
+            continue;
+        }
         let expires_at = match Utc.timestamp_opt(e.exp, 0).single() {
             Some(t) => t,
             None => {
-                tracing::warn!(jti = %e.jti, exp = e.exp, "feed entry has malformed exp; skipping");
+                // #26: dead-letter explicitly. A malformed `exp` is permanent,
+                // so we log loudly and skip rather than holding the cursor —
+                // holding it would stall the entire feed on one bad entry.
+                tracing::error!(
+                    issuer = %cfg.issuer,
+                    jti = %e.jti,
+                    exp = e.exp,
+                    "revocation feed entry has malformed exp; dropping (cannot apply)"
+                );
                 continue;
             }
         };

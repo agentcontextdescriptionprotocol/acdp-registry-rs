@@ -21,19 +21,63 @@ struct Bucket {
     count: u32,
 }
 
-/// Fixed-window limiter: at most `limit` publishes per 60s per agent.
+/// Fixed-window limiter: at most `limit` publishes per 60s per agent, plus an
+/// optional process-global ceiling across ALL keys per 60s.
 pub struct AgentRateLimiter {
     limit: u32,
     buckets: Mutex<HashMap<String, Bucket>>,
+    /// Process-wide ceiling per window. `u32::MAX` ⇒ effectively disabled.
+    /// Defends the unauthenticated `/auth/challenge` endpoint (#24): the
+    /// per-agent key is attacker-controlled, so varying `agent_id` bypasses
+    /// the per-key bound — the global counter caps total flooding regardless.
+    global_limit: u32,
+    global: Mutex<Bucket>,
 }
 
 impl AgentRateLimiter {
-    /// Construct a limiter allowing `limit_per_minute` publishes per agent.
+    /// Construct a limiter allowing `limit_per_minute` per agent, with no
+    /// global ceiling (used by the publish limiter, keyed by the verified
+    /// producer `agent_id`).
     pub fn new(limit_per_minute: u32) -> Self {
+        Self::with_global_ceiling(limit_per_minute, u32::MAX)
+    }
+
+    /// Like [`new`](Self::new) but also enforces a process-global ceiling of
+    /// `global_limit_per_minute` across all keys.
+    pub fn with_global_ceiling(limit_per_minute: u32, global_limit_per_minute: u32) -> Self {
         Self {
             limit: limit_per_minute,
             buckets: Mutex::new(HashMap::new()),
+            global_limit: global_limit_per_minute,
+            global: Mutex::new(Bucket {
+                window_start: Instant::now(),
+                count: 0,
+            }),
         }
+    }
+
+    /// Check the process-global ceiling (#24). Call this in addition to
+    /// [`check`](Self::check) on unauthenticated endpoints where the per-key
+    /// identity is attacker-controlled.
+    pub fn check_global(&self) -> Result<(), u64> {
+        self.check_global_at(Instant::now())
+    }
+
+    fn check_global_at(&self, now: Instant) -> Result<(), u64> {
+        if self.global_limit == u32::MAX {
+            return Ok(());
+        }
+        let mut b = self.global.lock().unwrap_or_else(|e| e.into_inner());
+        if now.duration_since(b.window_start) >= WINDOW {
+            b.window_start = now;
+            b.count = 0;
+        }
+        if b.count >= self.global_limit {
+            let elapsed = now.duration_since(b.window_start);
+            return Err(WINDOW.saturating_sub(elapsed).as_secs().max(1));
+        }
+        b.count += 1;
+        Ok(())
     }
 
     /// Record one publish attempt by `agent_id`. Returns `Err(retry_after_secs)`
@@ -94,6 +138,35 @@ mod tests {
         assert!(rl.check_at("agent-a", t0).is_err());
         // A different agent is unaffected by agent-a's exhausted budget.
         assert!(rl.check_at("agent-b", t0).is_ok());
+    }
+
+    #[test]
+    fn global_ceiling_caps_total_across_distinct_keys() {
+        // #24: per-agent budget is generous, but the global ceiling caps total
+        // flooding even when the attacker rotates agent_id every request.
+        let rl = AgentRateLimiter::with_global_ceiling(1_000, 2);
+        let t0 = Instant::now();
+        assert!(rl.check_global_at(t0).is_ok());
+        assert!(rl.check_global_at(t0).is_ok());
+        assert!(
+            rl.check_global_at(t0).is_err(),
+            "global ceiling must reject once exhausted regardless of key"
+        );
+        // Refreshes next window.
+        let later = t0 + Duration::from_secs(61);
+        assert!(rl.check_global_at(later).is_ok());
+    }
+
+    #[test]
+    fn no_global_ceiling_by_default() {
+        let rl = AgentRateLimiter::new(1);
+        let t0 = Instant::now();
+        for _ in 0..10_000 {
+            assert!(
+                rl.check_global_at(t0).is_ok(),
+                "new() must not impose a global ceiling"
+            );
+        }
     }
 
     #[test]

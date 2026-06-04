@@ -167,20 +167,28 @@ impl ExtendedRegistryStore for PgStore {
         // the final DB page.
         let has_more_in_db = rows.len() > limit as usize;
         let mut items = Vec::new();
+        // BUG (#13): anchor `next_cursor` on the last row *scanned* from the DB,
+        // not on `items.last()` (post-`visible_to` filter). If the tail of a
+        // page is filtered out, `items.last()` anchors too early and the next
+        // page re-scans (or, if the whole page is filtered, yields `None` and
+        // pagination stops while visible rows remain beyond). Mirrors `search`.
+        let mut last_scanned: Option<(i64, String)> = None;
         for r in rows.iter().take(limit as usize) {
             let body_json: serde_json::Value = r.try_get("body_json").map_err(map_sqlx_err)?;
             let status: String = r.try_get("status").map_err(map_sqlx_err)?;
             let body: Body = serde_json::from_value(body_json)
                 .map_err(|e| AcdpError::RegistryInternal(format!("decode body: {e}")))?;
+            last_scanned = Some((
+                body.created_at.timestamp_millis(),
+                body.ctx_id.as_str().to_string(),
+            ));
             let ctx = full_context(body, parse_status(&status));
             if visible_to(&ctx, requester) {
                 items.push(ctx);
             }
         }
         let next_cursor = if has_more_in_db {
-            items.last().map(|c| {
-                encode_cursor(c.body.created_at.timestamp_millis(), c.body.ctx_id.as_str())
-            })
+            last_scanned.map(|(ts, id)| encode_cursor(ts, &id))
         } else {
             None
         };
@@ -211,7 +219,7 @@ impl RegistryStore for PgStore {
     fn put(&self, body: Body) -> Result<(), AcdpError> {
         self.block_on(async {
             let mut tx = self.pool.begin().await.map_err(map_sqlx_err)?;
-            insert_body(&mut tx, &body, Status::Active).await?;
+            insert_body(&mut tx, &body, Status::Active, None).await?;
             tx.commit().await.map_err(map_sqlx_err)?;
             Ok(())
         })
@@ -359,9 +367,11 @@ impl RegistryStore for PgStore {
             req,
             authority,
             idempotency,
+            tenant,
         } = commit;
         let req = req.clone();
         let authority = authority.to_string();
+        let tenant = tenant.map(|t| t.to_string());
         let idem = idempotency.map(|i| (i.key.to_string(), i.ttl));
         let now = Utc::now();
 
@@ -374,6 +384,19 @@ impl RegistryStore for PgStore {
 
             // 1. Idempotency replay.
             if let Some((key, _ttl)) = &idem {
+                // Evict an expired record for this key first so the claim in
+                // step 7 (ON CONFLICT DO NOTHING) does not collide with a stale
+                // row after its TTL has lapsed.
+                sqlx::query(
+                    "DELETE FROM idempotency_records \
+                     WHERE agent_id = $1 AND key = $2 AND expires_at <= $3",
+                )
+                .bind(req.agent_id.as_str())
+                .bind(key.as_str())
+                .bind(now)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx_err)?;
                 let row = sqlx::query(
                     "SELECT content_hash, response_json, expires_at \
                      FROM idempotency_records WHERE agent_id = $1 AND key = $2 FOR UPDATE",
@@ -411,8 +434,8 @@ impl RegistryStore for PgStore {
             // 2. Supersession coherence.
             let first_v1 = if let Some(prev) = &req.supersedes {
                 let row = sqlx::query(
-                    "SELECT lineage_id, version, status FROM contexts \
-                     WHERE ctx_id = $1 FOR UPDATE",
+                    "SELECT lineage_id, version, status, agent_id, contributors, tenant_id \
+                     FROM contexts WHERE ctx_id = $1 FOR UPDATE",
                 )
                 .bind(prev.as_str())
                 .fetch_optional(&mut *tx)
@@ -427,6 +450,48 @@ impl RegistryStore for PgStore {
                 let prev_lineage: String = row.try_get("lineage_id").map_err(map_sqlx_err)?;
                 let prev_version: i32 = row.try_get("version").map_err(map_sqlx_err)?;
                 let prev_status: String = row.try_get("status").map_err(map_sqlx_err)?;
+                let prev_agent: String = row.try_get("agent_id").map_err(map_sqlx_err)?;
+                let prev_contributors: Vec<String> =
+                    row.try_get("contributors").map_err(map_sqlx_err)?;
+                let prev_tenant: String = row.try_get("tenant_id").map_err(map_sqlx_err)?;
+                // P0 (tenant continuity): a successor must live in the same
+                // tenant as its predecessor. Even with the owner check below
+                // (agent→tenant is normally 1:1), an agent whose binding changed
+                // could otherwise stitch a v2 into a lineage owned by a different
+                // tenant. Same NotFound shape — no cross-tenant existence oracle.
+                // Only enforced when the publish carries an authoritative tenant
+                // (production tenant-scoped path); when `None` the tenant is not
+                // threaded here (untenanted, or the playground post-hoc stamp),
+                // so there is nothing to compare against.
+                if let Some(req_tenant) = tenant.as_deref() {
+                    if prev_tenant != req_tenant {
+                        return Err(AcdpError::SupersededTarget {
+                            reason: acdp::error::SupersessionReason::NotFound,
+                            message: format!(
+                                "supersedes target '{prev}' not found in this registry"
+                            ),
+                        });
+                    }
+                }
+                // P0 (producer-continuity): only the predecessor's producer or a
+                // declared contributor may publish a successor in its lineage.
+                // Signature verification only proves the *requester* signed their
+                // own request — it does not bind `supersedes` to the predecessor's
+                // owner. Without this, any signer could flip another producer's
+                // context to `superseded` and re-point `current(lineage)` — a
+                // lineage takeover (RFC-ACDP-0001 §5.9). This mirrors
+                // `InMemoryStore::commit_publish`; the registry backends had
+                // dropped the check. A non-owner gets the same NotFound shape as
+                // a genuinely-absent target so it learns neither that the
+                // predecessor exists nor its version/superseded status.
+                let is_owner = prev_agent == req.agent_id.as_str()
+                    || prev_contributors.iter().any(|c| c == req.agent_id.as_str());
+                if !is_owner {
+                    return Err(AcdpError::SupersededTarget {
+                        reason: acdp::error::SupersessionReason::NotFound,
+                        message: format!("supersedes target '{prev}' not found in this registry"),
+                    });
+                }
                 if let Some(declared) = &req.lineage_id {
                     if declared.as_str() != prev_lineage.as_str() {
                         return Err(AcdpError::SupersededTarget {
@@ -511,7 +576,7 @@ impl RegistryStore for PgStore {
             };
 
             // 5. Insert.
-            insert_body(&mut tx, &body, Status::Active).await?;
+            insert_body(&mut tx, &body, Status::Active, tenant.as_deref()).await?;
 
             // 6. Mark predecessor superseded.
             if let Some(prev) = &req.supersedes {
@@ -530,18 +595,21 @@ impl RegistryStore for PgStore {
                 status: Status::Active,
             };
 
-            // 7. Record idempotency.
-            if let Some((key, ttl)) = idem {
-                let expires_at = now + ttl;
+            // 7. Record idempotency — this INSERT is the concurrency gate
+            // (P0 #5). `ctx_id` is random per request, so two concurrent
+            // first-publishes of the same (agent_id, key) would otherwise each
+            // INSERT a distinct context. The `ON CONFLICT DO NOTHING` makes the
+            // racers serialize on the PK: the loser inserts 0 rows, so we roll
+            // back its context insert and replay the winner instead of
+            // persisting a second context.
+            if let Some((key, ttl)) = &idem {
+                let expires_at = now + *ttl;
                 let response_json = serde_json::to_value(&response)
                     .map_err(|e| AcdpError::RegistryInternal(format!("encode response: {e}")))?;
-                sqlx::query(
+                let inserted = sqlx::query(
                     "INSERT INTO idempotency_records (agent_id, key, content_hash, response_json, expires_at) \
                      VALUES ($1, $2, $3, $4, $5) \
-                     ON CONFLICT (agent_id, key) DO UPDATE SET \
-                       content_hash = EXCLUDED.content_hash, \
-                       response_json = EXCLUDED.response_json, \
-                       expires_at = EXCLUDED.expires_at",
+                     ON CONFLICT (agent_id, key) DO NOTHING",
                 )
                 .bind(req.agent_id.as_str())
                 .bind(key.as_str())
@@ -550,7 +618,44 @@ impl RegistryStore for PgStore {
                 .bind(expires_at)
                 .execute(&mut *tx)
                 .await
-                .map_err(map_sqlx_err)?;
+                .map_err(map_sqlx_err)?
+                .rows_affected();
+
+                if inserted == 0 {
+                    // A concurrent publish won the key. Discard our context
+                    // insert and replay the winner's record (or reject as a
+                    // duplicate when the content_hash differs).
+                    tx.rollback().await.ok();
+                    let row = sqlx::query(
+                        "SELECT content_hash, response_json \
+                         FROM idempotency_records WHERE agent_id = $1 AND key = $2",
+                    )
+                    .bind(req.agent_id.as_str())
+                    .bind(key.as_str())
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(map_sqlx_err)?;
+                    let Some(row) = row else {
+                        return Err(AcdpError::RegistryInternal(
+                            "idempotency key claimed by a concurrent publish but its record \
+                             could not be read back"
+                                .into(),
+                        ));
+                    };
+                    let prior_hash: String = row.try_get("content_hash").map_err(map_sqlx_err)?;
+                    if prior_hash != req.content_hash.0 {
+                        return Err(AcdpError::DuplicatePublish(format!(
+                            "Idempotency-Key '{}' was previously used by '{}' \
+                             with a different content_hash",
+                            key, req.agent_id
+                        )));
+                    }
+                    let response_json: serde_json::Value =
+                        row.try_get("response_json").map_err(map_sqlx_err)?;
+                    let winner: PublishResponse = serde_json::from_value(response_json)
+                        .map_err(|e| AcdpError::RegistryInternal(format!("decode response: {e}")))?;
+                    return Ok(PublishCommitOutcome::IdempotentReplay(winner));
+                }
             }
 
             tx.commit().await.map_err(map_sqlx_err)?;
@@ -794,6 +899,7 @@ async fn insert_body<'c>(
     tx: &mut sqlx::Transaction<'c, sqlx::Postgres>,
     body: &Body,
     status: Status,
+    tenant: Option<&str>,
 ) -> Result<(), AcdpError> {
     let body_json = serde_json::to_value(body)
         .map_err(|e| AcdpError::RegistryInternal(format!("encode body: {e}")))?;
@@ -814,12 +920,19 @@ async fn insert_body<'c>(
     };
     let context_type = context_type_str(&body.context_type);
 
+    // P0 (#3): write tenant_id in the SAME INSERT as the context row so the
+    // tenancy is atomic with the row. The previous design committed the row
+    // with the column default ('default') and stamped the real tenant in a
+    // separate, non-transactional UPDATE — a crash/error in between stranded
+    // the context in the 'default' (untenanted) bucket permanently.
+    let tenant_id = tenant.unwrap_or("default");
     sqlx::query(
         "INSERT INTO contexts (\
             ctx_id, lineage_id, agent_id, contributors, origin_registry, \
             created_at, status, visibility, context_type, version, supersedes, \
-            title, description, summary, domain, tags, expires_at, content_hash, body_json\
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)",
+            title, description, summary, domain, tags, expires_at, content_hash, body_json, \
+            tenant_id\
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)",
     )
     .bind(body.ctx_id.as_str())
     .bind(body.lineage_id.as_str())
@@ -840,6 +953,7 @@ async fn insert_body<'c>(
     .bind(body.expires_at)
     .bind(body.content_hash.0.as_str())
     .bind(body_json)
+    .bind(tenant_id)
     .execute(&mut **tx)
     .await
     .map_err(map_sqlx_err)?;

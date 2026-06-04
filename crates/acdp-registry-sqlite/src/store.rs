@@ -208,20 +208,29 @@ impl ExtendedRegistryStore for SqliteStore {
         // page that returns empty.
         let has_more_in_db = rows.len() > limit as usize;
         let mut items = Vec::new();
+        // BUG (#13): anchor `next_cursor` on the last row *scanned* from the DB,
+        // not on `items.last()` (which is post-`visible_to` filter). If the tail
+        // of a page is filtered out, `items.last()` anchors too early and the
+        // next page re-scans (or, if the whole page is filtered, yields `None`
+        // and pagination stops while visible rows remain beyond). Mirrors the
+        // fix already in `search`.
+        let mut last_scanned: Option<(i64, String)> = None;
         for r in rows.iter().take(limit as usize) {
             let body_json: String = r.try_get("body_json").map_err(map_sqlx_err)?;
             let status: String = r.try_get("status").map_err(map_sqlx_err)?;
             let body: Body = serde_json::from_str(&body_json)
                 .map_err(|e| AcdpError::RegistryInternal(format!("decode body: {e}")))?;
+            last_scanned = Some((
+                body.created_at.timestamp_millis(),
+                body.ctx_id.as_str().to_string(),
+            ));
             let ctx = full_context(body, parse_status(&status));
             if visible_to(&ctx, requester) {
                 items.push(ctx);
             }
         }
         let next_cursor = if has_more_in_db {
-            items.last().map(|c| {
-                encode_cursor(c.body.created_at.timestamp_millis(), c.body.ctx_id.as_str())
-            })
+            last_scanned.map(|(ts, id)| encode_cursor(ts, &id))
         } else {
             None
         };
@@ -256,7 +265,7 @@ impl RegistryStore for SqliteStore {
                 .begin()
                 .await
                 .map_err(|e| AcdpError::RegistryInternal(format!("tx begin: {e}")))?;
-            insert_body(&mut tx, &body, Status::Active).await?;
+            insert_body(&mut tx, &body, Status::Active, None).await?;
             tx.commit()
                 .await
                 .map_err(|e| AcdpError::RegistryInternal(format!("tx commit: {e}")))?;
@@ -431,10 +440,12 @@ impl RegistryStore for SqliteStore {
             req,
             authority,
             idempotency,
+            tenant,
         } = commit;
         let now = Utc::now();
         let req = req.clone();
         let authority = authority.to_string();
+        let tenant = tenant.map(|t| t.to_string());
         let idem = idempotency.map(|i| (i.key.to_string(), i.ttl));
 
         self.block_on(async move {
@@ -446,6 +457,19 @@ impl RegistryStore for SqliteStore {
 
             // 1. Idempotency replay / collision.
             if let Some((key, _ttl)) = &idem {
+                // Evict an expired record for this key first so the claim in
+                // step 7 (ON CONFLICT DO NOTHING) does not collide with a stale
+                // row after its TTL has lapsed.
+                sqlx::query(
+                    "DELETE FROM idempotency_records \
+                     WHERE agent_id = ? AND key = ? AND expires_at_ms <= ?",
+                )
+                .bind(req.agent_id.as_str())
+                .bind(key.as_str())
+                .bind(now.timestamp_millis())
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx_err)?;
                 let row = sqlx::query(
                     "SELECT content_hash, response_json, expires_at_ms \
                      FROM idempotency_records WHERE agent_id = ? AND key = ?",
@@ -489,7 +513,8 @@ impl RegistryStore for SqliteStore {
             // 2. Supersession coherence checks (mirrors InMemoryStore).
             let first_v1 = if let Some(prev) = &req.supersedes {
                 let row = sqlx::query(
-                    "SELECT lineage_id, version, status FROM contexts WHERE ctx_id = ?",
+                    "SELECT lineage_id, version, status, agent_id, contributors, tenant_id \
+                     FROM contexts WHERE ctx_id = ?",
                 )
                 .bind(prev.as_str())
                 .fetch_optional(&mut *tx)
@@ -504,6 +529,52 @@ impl RegistryStore for SqliteStore {
                 let prev_lineage: String = row.try_get("lineage_id").map_err(map_sqlx_err)?;
                 let prev_version: i64 = row.try_get("version").map_err(map_sqlx_err)?;
                 let prev_status: String = row.try_get("status").map_err(map_sqlx_err)?;
+                let prev_agent: String = row.try_get("agent_id").map_err(map_sqlx_err)?;
+                // contributors is stored as a JSON-encoded array of DIDs.
+                let prev_contributors: Vec<String> = row
+                    .try_get::<String, _>("contributors")
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default();
+                let prev_tenant: String = row.try_get("tenant_id").map_err(map_sqlx_err)?;
+                // P0 (tenant continuity): a successor must live in the same
+                // tenant as its predecessor. Even with the owner check below
+                // (agent→tenant is normally 1:1), an agent whose binding changed
+                // could otherwise stitch a v2 into a lineage owned by a different
+                // tenant. Same NotFound shape — no cross-tenant existence oracle.
+                // Only enforced when the publish carries an authoritative tenant
+                // (production tenant-scoped path); when `None` the tenant is not
+                // threaded here (untenanted, or the playground post-hoc stamp),
+                // so there is nothing to compare against.
+                if let Some(req_tenant) = tenant.as_deref() {
+                    if prev_tenant != req_tenant {
+                        return Err(AcdpError::SupersededTarget {
+                            reason: acdp::error::SupersessionReason::NotFound,
+                            message: format!(
+                                "supersedes target '{prev}' not found in this registry"
+                            ),
+                        });
+                    }
+                }
+                // P0 (producer-continuity): only the predecessor's producer or a
+                // declared contributor may publish a successor in its lineage.
+                // Signature verification only proves the *requester* signed their
+                // own request — it does not bind `supersedes` to the predecessor's
+                // owner. Without this, any signer could flip another producer's
+                // context to `superseded` and re-point `current(lineage)` — a
+                // lineage takeover (RFC-ACDP-0001 §5.9). This mirrors
+                // `InMemoryStore::commit_publish`; the registry backends had
+                // dropped the check. A non-owner gets the same NotFound shape as
+                // a genuinely-absent target so it learns neither that the
+                // predecessor exists nor its version/superseded status.
+                let is_owner = prev_agent == req.agent_id.as_str()
+                    || prev_contributors.iter().any(|c| c == req.agent_id.as_str());
+                if !is_owner {
+                    return Err(AcdpError::SupersededTarget {
+                        reason: acdp::error::SupersessionReason::NotFound,
+                        message: format!("supersedes target '{prev}' not found in this registry"),
+                    });
+                }
 
                 if let Some(declared) = &req.lineage_id {
                     if declared.as_str() != prev_lineage.as_str() {
@@ -590,7 +661,7 @@ impl RegistryStore for SqliteStore {
             };
 
             // 5. Insert the new body.
-            insert_body(&mut tx, &body, Status::Active).await?;
+            insert_body(&mut tx, &body, Status::Active, tenant.as_deref()).await?;
 
             // 6. Mark predecessor superseded.
             if let Some(prev) = &req.supersedes {
@@ -609,19 +680,21 @@ impl RegistryStore for SqliteStore {
                 status: Status::Active,
             };
 
-            // 7. Record idempotency.
-            if let Some((key, ttl)) = idem {
-                let expires_at = now + ttl;
+            // 7. Record idempotency — this INSERT is the concurrency gate
+            // (P0 #5). `ctx_id` is random per request, so two concurrent
+            // first-publishes of the same (agent_id, key) would otherwise each
+            // INSERT a distinct context. The `ON CONFLICT DO NOTHING` makes the
+            // racers serialize on the PK: the loser inserts 0 rows, so we roll
+            // back its context insert and replay the winner instead of
+            // persisting a second context.
+            if let Some((key, ttl)) = &idem {
+                let expires_at = now + *ttl;
                 let response_json = serde_json::to_string(&response)
                     .map_err(|e| AcdpError::RegistryInternal(format!("encode response: {e}")))?;
-                sqlx::query(
+                let inserted = sqlx::query(
                     "INSERT INTO idempotency_records (agent_id, key, content_hash, response_json, expires_at, expires_at_ms) \
                      VALUES (?, ?, ?, ?, ?, ?) \
-                     ON CONFLICT(agent_id, key) DO UPDATE SET \
-                       content_hash = excluded.content_hash, \
-                       response_json = excluded.response_json, \
-                       expires_at = excluded.expires_at, \
-                       expires_at_ms = excluded.expires_at_ms",
+                     ON CONFLICT(agent_id, key) DO NOTHING",
                 )
                 .bind(req.agent_id.as_str())
                 .bind(key.as_str())
@@ -631,7 +704,44 @@ impl RegistryStore for SqliteStore {
                 .bind(expires_at.timestamp_millis())
                 .execute(&mut *tx)
                 .await
-                .map_err(map_sqlx_err)?;
+                .map_err(map_sqlx_err)?
+                .rows_affected();
+
+                if inserted == 0 {
+                    // A concurrent publish won the key. Discard our context
+                    // insert and replay the winner's record (or reject as a
+                    // duplicate when the content_hash differs).
+                    tx.rollback().await.ok();
+                    let row = sqlx::query(
+                        "SELECT content_hash, response_json \
+                         FROM idempotency_records WHERE agent_id = ? AND key = ?",
+                    )
+                    .bind(req.agent_id.as_str())
+                    .bind(key.as_str())
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(map_sqlx_err)?;
+                    let Some(row) = row else {
+                        return Err(AcdpError::RegistryInternal(
+                            "idempotency key claimed by a concurrent publish but its record \
+                             could not be read back"
+                                .into(),
+                        ));
+                    };
+                    let prior_hash: String = row.try_get("content_hash").map_err(map_sqlx_err)?;
+                    if prior_hash != req.content_hash.0 {
+                        return Err(AcdpError::DuplicatePublish(format!(
+                            "Idempotency-Key '{}' was previously used by '{}' \
+                             with a different content_hash",
+                            key, req.agent_id
+                        )));
+                    }
+                    let response_json: String =
+                        row.try_get("response_json").map_err(map_sqlx_err)?;
+                    let winner: PublishResponse = serde_json::from_str(&response_json)
+                        .map_err(|e| AcdpError::RegistryInternal(format!("decode response: {e}")))?;
+                    return Ok(PublishCommitOutcome::IdempotentReplay(winner));
+                }
             }
 
             tx.commit()
@@ -847,6 +957,7 @@ async fn insert_body<'c>(
     tx: &mut sqlx::Transaction<'c, sqlx::Sqlite>,
     body: &Body,
     status: Status,
+    tenant: Option<&str>,
 ) -> Result<(), AcdpError> {
     let body_json = serde_json::to_string(body)
         .map_err(|e| AcdpError::RegistryInternal(format!("encode body: {e}")))?;
@@ -861,12 +972,19 @@ async fn insert_body<'c>(
     };
     let context_type = context_type_str(&body.context_type);
 
+    // P0 (#3): write tenant_id in the SAME INSERT as the context row so the
+    // tenancy is atomic with the row. The previous design committed the row
+    // with the column default ('default') and stamped the real tenant in a
+    // separate, non-transactional UPDATE — a crash/error in between stranded
+    // the context in the 'default' (untenanted) bucket permanently.
+    let tenant_id = tenant.unwrap_or("default");
     sqlx::query(
         "INSERT INTO contexts (\
             ctx_id, lineage_id, agent_id, contributors, origin_registry, \
             created_at, status, visibility, context_type, version, supersedes, \
-            title, description, summary, domain, tags, expires_at, content_hash, body_json\
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            title, description, summary, domain, tags, expires_at, content_hash, body_json, \
+            tenant_id\
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(body.ctx_id.as_str())
     .bind(body.lineage_id.as_str())
@@ -887,6 +1005,7 @@ async fn insert_body<'c>(
     .bind(body.expires_at.map(|t| t.to_rfc3339()))
     .bind(body.content_hash.0.as_str())
     .bind(body_json)
+    .bind(tenant_id)
     .execute(&mut **tx)
     .await
     .map_err(map_sqlx_err)?;
@@ -1096,5 +1215,248 @@ mod tests {
     fn fts5_escape_empty_yields_sentinel() {
         assert_eq!(fts5_escape("   "), "\"__acdp_empty_query__\"");
         assert_eq!(fts5_escape(""), "\"__acdp_empty_query__\"");
+    }
+
+    /// P0 #5: two concurrent publishes sharing one Idempotency-Key must yield
+    /// exactly ONE persisted context. `ctx_id` is random per request, so before
+    /// the claim-gate (ON CONFLICT DO NOTHING + rollback-and-replay) both racers
+    /// would INSERT distinct contexts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_publish_same_idempotency_key_creates_one_context() {
+        use crate::SqliteStore;
+        use acdp::crypto::SigningKey;
+        use acdp::producer::Producer;
+        use acdp::registry::store::{
+            PendingIdempotencyCommit, PublishCommit, PublishCommitOutcome, RegistryStore,
+        };
+        use acdp::types::primitives::{AgentDid, ContextType, Visibility};
+        use acdp_registry_store::ExtendedRegistryStore;
+        use std::sync::Arc;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = SqliteStore::connect(tmp.path(), 4).await.unwrap();
+        store.migrate().await.unwrap();
+        let store = Arc::new(store);
+
+        let p = Producer::new(
+            SigningKey::from_bytes(&[9u8; 32]),
+            AgentDid::new("did:web:agents.test:race".to_string()),
+            "did:web:agents.test:race#key-1".to_string(),
+        );
+        let req = p
+            .publish_request()
+            .title("race")
+            .context_type(ContextType::DataSnapshot)
+            .visibility(Visibility::Public)
+            .build()
+            .unwrap();
+
+        let spawn = |store: Arc<SqliteStore>, req: acdp::types::publish::PublishRequest| {
+            tokio::task::spawn_blocking(move || {
+                store.commit_publish(PublishCommit {
+                    req: &req,
+                    authority: "reg.test",
+                    idempotency: Some(PendingIdempotencyCommit {
+                        key: "race-key",
+                        ttl: chrono::Duration::hours(1),
+                    }),
+                    tenant: None,
+                })
+            })
+        };
+
+        let h1 = spawn(store.clone(), req.clone());
+        let h2 = spawn(store.clone(), req.clone());
+        let (r1, r2) = tokio::join!(h1, h2);
+        let r1 = r1.unwrap().expect("publish 1 ok");
+        let r2 = r2.unwrap().expect("publish 2 ok");
+
+        let ctx_id = |o: &PublishCommitOutcome| match o {
+            PublishCommitOutcome::Inserted(r) | PublishCommitOutcome::IdempotentReplay(r) => {
+                r.ctx_id.as_str().to_string()
+            }
+        };
+        assert_eq!(
+            ctx_id(&r1),
+            ctx_id(&r2),
+            "both racers must resolve to the same ctx_id"
+        );
+        let inserted = [&r1, &r2]
+            .iter()
+            .filter(|o| matches!(o, PublishCommitOutcome::Inserted(_)))
+            .count();
+        assert_eq!(
+            inserted, 1,
+            "exactly one publish inserts; the other replays"
+        );
+
+        let page = store.list_contexts(100, None, None, None).await.unwrap();
+        assert_eq!(
+            page.items.len(),
+            1,
+            "exactly one context row must exist after a concurrent idempotent publish"
+        );
+    }
+
+    /// P0 #3: a tenant-scoped publish must write `tenant_id` in the same
+    /// transaction as the context row (no separate stamping UPDATE that a
+    /// crash could leave stranded in the 'default' bucket).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commit_publish_writes_tenant_atomically() {
+        use crate::SqliteStore;
+        use acdp::crypto::SigningKey;
+        use acdp::producer::Producer;
+        use acdp::registry::store::{PublishCommit, PublishCommitOutcome, RegistryStore};
+        use acdp::types::primitives::{AgentDid, ContextType, Visibility};
+        use acdp_registry_store::ExtendedRegistryStore;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = SqliteStore::connect(tmp.path(), 2).await.unwrap();
+        store.migrate().await.unwrap();
+
+        let p = Producer::new(
+            SigningKey::from_bytes(&[11u8; 32]),
+            AgentDid::new("did:web:agents.test:tenant".to_string()),
+            "did:web:agents.test:tenant#key-1".to_string(),
+        );
+        let req = p
+            .publish_request()
+            .title("scoped")
+            .context_type(ContextType::DataSnapshot)
+            .visibility(Visibility::Public)
+            .build()
+            .unwrap();
+
+        let req2 = req.clone();
+        let store2 = store.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            store2.commit_publish(PublishCommit {
+                req: &req2,
+                authority: "reg.test",
+                idempotency: None,
+                tenant: Some("tenant-x"),
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let ctx_id = match &outcome {
+            PublishCommitOutcome::Inserted(r) | PublishCommitOutcome::IdempotentReplay(r) => {
+                r.ctx_id.as_str().to_string()
+            }
+        };
+
+        let tenant = store.tenant_of_ctx(&ctx_id).await.unwrap();
+        assert_eq!(
+            tenant.as_deref(),
+            Some("tenant-x"),
+            "tenant_id must be persisted atomically with the context row"
+        );
+    }
+
+    /// Supersession-ownership plan (tenant dimension): a successor must live in
+    /// the same tenant as its predecessor. A v2 committed under a different
+    /// tenant than v1 is rejected (NotFound shape); same-tenant succeeds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commit_publish_rejects_cross_tenant_supersession() {
+        use crate::SqliteStore;
+        use acdp::crypto::SigningKey;
+        use acdp::error::{AcdpError, SupersessionReason};
+        use acdp::producer::Producer;
+        use acdp::registry::store::{PublishCommit, PublishCommitOutcome, RegistryStore};
+        use acdp::types::primitives::{AgentDid, ContextType, CtxId, Visibility};
+        use acdp_registry_store::ExtendedRegistryStore;
+        use std::sync::Arc;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = SqliteStore::connect(tmp.path(), 2).await.unwrap();
+        store.migrate().await.unwrap();
+        let store = Arc::new(store);
+
+        let p = Producer::new(
+            SigningKey::from_bytes(&[13u8; 32]),
+            AgentDid::new("did:web:agents.test:rebind".to_string()),
+            "did:web:agents.test:rebind#key-1".to_string(),
+        );
+
+        // v1 committed under tenant-a.
+        let v1 = p
+            .publish_request()
+            .title("v1")
+            .context_type(ContextType::DataSnapshot)
+            .visibility(Visibility::Public)
+            .build()
+            .unwrap();
+        let s = store.clone();
+        let v1r = v1.clone();
+        let v1_resp = tokio::task::spawn_blocking(move || {
+            s.commit_publish(PublishCommit {
+                req: &v1r,
+                authority: "reg.test",
+                idempotency: None,
+                tenant: Some("tenant-a"),
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let v1_ctx = match v1_resp {
+            PublishCommitOutcome::Inserted(r) | PublishCommitOutcome::IdempotentReplay(r) => {
+                r.ctx_id
+            }
+        };
+        let v1_body = store
+            .get(&CtxId(v1_ctx.as_str().to_string()))
+            .unwrap()
+            .unwrap()
+            .body;
+
+        // v2 superseding v1 but committed under tenant-b → rejected.
+        let v2 = p
+            .supersede_body(&v1_body)
+            .title("v2")
+            .context_type(ContextType::DataSnapshot)
+            .visibility(Visibility::Public)
+            .build()
+            .unwrap();
+        let s = store.clone();
+        let v2c = v2.clone();
+        let cross = tokio::task::spawn_blocking(move || {
+            s.commit_publish(PublishCommit {
+                req: &v2c,
+                authority: "reg.test",
+                idempotency: None,
+                tenant: Some("tenant-b"),
+            })
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                cross,
+                Err(AcdpError::SupersededTarget {
+                    reason: SupersessionReason::NotFound,
+                    ..
+                })
+            ),
+            "cross-tenant supersession must be rejected (NotFound), got {cross:?}"
+        );
+
+        // v2 under the same tenant (tenant-a) → succeeds.
+        let s = store.clone();
+        let ok = tokio::task::spawn_blocking(move || {
+            s.commit_publish(PublishCommit {
+                req: &v2,
+                authority: "reg.test",
+                idempotency: None,
+                tenant: Some("tenant-a"),
+            })
+        })
+        .await
+        .unwrap();
+        assert!(
+            ok.is_ok(),
+            "same-tenant supersession must succeed, got {ok:?}"
+        );
     }
 }

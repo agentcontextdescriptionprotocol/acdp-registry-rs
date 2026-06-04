@@ -37,7 +37,7 @@ use acdp_registry_sqlite::SqliteStore;
 use acdp_registry_store::ExtendedRegistryStore;
 use acdp_registry_types::{
     auth::{AcdpClaims, BearerClaims},
-    config::PinnedAgentKey,
+    config::{PinnedAgentKey, TenantAgentBinding},
     AuthConfig, LimitsConfig, PlaygroundConfig, RegistryConfig, RegistrySection, StorageBackend,
     StorageConfig, WebhookConfig,
 };
@@ -82,6 +82,7 @@ fn config(playground: bool) -> RegistryConfig {
             authority: AUTHORITY.into(),
             port: 8443,
             bind: "0.0.0.0".into(),
+            allow_public_bind: false,
             profiles: vec!["acdp-registry-core".into()],
             tls: Default::default(),
             cross_registry_resolution: true,
@@ -216,6 +217,64 @@ async fn health_returns_ok() {
     assert_eq!(resp.status(), StatusCode::OK);
     let v = body_to_json(resp).await;
     assert_eq!(v["status"], "ok");
+}
+
+#[tokio::test]
+async fn acdp_endpoints_use_acdp_json_content_type() {
+    // RFC-ACDP-0007 §4: every response from an ACDP endpoint — success body
+    // AND error envelope — MUST carry `application/acdp+json`.
+    let h = harness(true).await;
+
+    // Success: the capabilities document.
+    let ok = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/acdp.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+    assert_eq!(
+        ok.headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/acdp+json"),
+        "capabilities success body must be acdp+json",
+    );
+
+    // Error envelope: a retrieve of a non-existent context (404).
+    let err = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/contexts/no-such-context")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        err.status().is_client_error(),
+        "expected a 4xx error, got {}",
+        err.status()
+    );
+    assert_eq!(
+        err.headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/acdp+json"),
+        "error envelope must be acdp+json",
+    );
+    let v = body_to_json(err).await;
+    assert!(
+        v["error"]["code"].as_str().is_some_and(|c| !c.is_empty()),
+        "error envelope must carry a machine-readable code: {v}",
+    );
 }
 
 #[tokio::test]
@@ -441,8 +500,10 @@ async fn tenancy_stamp_and_filter_roundtrip() {
 
 #[tokio::test]
 async fn tenancy_default_when_no_publish_header() {
-    // Publish without X-Tenant-Id stamps 'default'; retrieving with
-    // X-Tenant-Id=default → 200, with X-Tenant-Id=tenant-a → 404.
+    // Publish without X-Tenant-Id stamps the untenanted bucket. The reserved
+    // 'default' sentinel is NOT assertable (#4): retrieving with
+    // X-Tenant-Id=default → 400; the row is reachable only via the ABSENCE of
+    // a tenant assertion; a real tenant does not see it.
     let h = harness(true).await;
     let req = producer(12)
         .publish_request()
@@ -455,13 +516,107 @@ async fn tenancy_default_when_no_publish_header() {
     assert_eq!(status, StatusCode::OK);
     let ctx_id = v["ctx_id"].as_str().unwrap().to_string();
 
+    // Asserting the reserved sentinel is rejected — it cannot be used to alias
+    // the untenanted bucket.
     assert_eq!(
         retrieve_with_tenant(&h.router, &ctx_id, Some("default")).await,
+        StatusCode::BAD_REQUEST,
+    );
+    // Reachable only with no tenant assertion (V0 behavior).
+    assert_eq!(
+        retrieve_with_tenant(&h.router, &ctx_id, None).await,
         StatusCode::OK,
     );
     assert_eq!(
         retrieve_with_tenant(&h.router, &ctx_id, Some("tenant-a")).await,
         StatusCode::NOT_FOUND,
+    );
+}
+
+#[tokio::test]
+async fn strict_publish_rejects_unbound_producer_tenant_spoof() {
+    // #2: in strict mode, an UNBOUND producer must not be able to inject a
+    // context into a tenant by setting X-Tenant-Id. The authoritative tenant
+    // for a producer-authenticated publish is the [[auth.tenant_agents]]
+    // binding, not the spoofable header. A BOUND producer publishes into its
+    // configured tenant; a mismatching header is rejected.
+    let mut cfg = config(true);
+    cfg.auth.enabled = true;
+    cfg.auth.require_tenant = true;
+    cfg.auth.tenant_agents = vec![TenantAgentBinding {
+        agent_did: "did:web:agents.test:smoke-50".into(),
+        tenant_id: "tenant-a".into(),
+    }];
+    let h = harness_from_config(cfg).await;
+
+    // Unbound producer (51) tries to write into tenant-a via the header.
+    let evil = producer(51)
+        .publish_request()
+        .title("spoof")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (status, v) = publish_with_tenant(&h.router, &evil, Some("tenant-a")).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "unbound producer must not assert a tenant in strict mode: {v}"
+    );
+
+    // Bound producer (50) publishes with no header → lands in its tenant.
+    let ok = producer(50)
+        .publish_request()
+        .title("legit")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (status, v) = publish_with_tenant(&h.router, &ok, None).await;
+    assert_eq!(status, StatusCode::OK, "bound producer publish body = {v}");
+    let ctx_id = v["ctx_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        retrieve_with_tenant(&h.router, &ctx_id, Some("tenant-a")).await,
+        StatusCode::OK,
+    );
+    assert_eq!(
+        retrieve_with_tenant(&h.router, &ctx_id, Some("tenant-b")).await,
+        StatusCode::NOT_FOUND,
+    );
+
+    // Bound producer with a MISMATCHING header → rejected.
+    let mismatch = producer(50)
+        .publish_request()
+        .title("mismatch")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (status, _) = publish_with_tenant(&h.router, &mismatch, Some("tenant-b")).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "bound producer must not publish into a different tenant via header"
+    );
+}
+
+#[tokio::test]
+async fn asserting_reserved_default_tenant_is_rejected_on_publish() {
+    // #4: 'default' is the untenanted column sentinel and must not be
+    // assertable as a real tenant on a write either.
+    let h = harness(true).await;
+    let req = producer(52)
+        .publish_request()
+        .title("reserved")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (status, v) = publish_with_tenant(&h.router, &req, Some("default")).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "asserting reserved 'default' tenant must be rejected: {v}"
     );
 }
 
@@ -475,6 +630,7 @@ fn tenant_bound_token(tenant: Option<&str>) -> String {
     let claims = BearerClaims {
         iss: format!("did:web:{AUTHORITY}"),
         sub: format!("did:web:{AUTHORITY}:agents:bound"),
+        aud: AUTHORITY.into(),
         jti: "tenant-bound-jti".into(),
         iat: now,
         exp: now + 3600,
@@ -608,6 +764,12 @@ async fn strict_tenant_mode_rejects_unscoped_read() {
     let mut cfg = config(true);
     cfg.auth.enabled = true;
     cfg.auth.require_tenant = true;
+    // In strict mode a publish must be tenant-bound (#2): an unbound producer
+    // can no longer assert a tenant via the spoofable X-Tenant-Id header.
+    cfg.auth.tenant_agents = vec![TenantAgentBinding {
+        agent_did: "did:web:agents.test:smoke-33".into(),
+        tenant_id: "tenant-a".into(),
+    }];
     let h = harness_from_config(cfg).await;
 
     let req = producer(33)
@@ -622,10 +784,11 @@ async fn strict_tenant_mode_rejects_unscoped_read() {
     assert_eq!(status, StatusCode::OK, "publish body = {v}");
     let ctx_id = v["ctx_id"].as_str().unwrap().to_string();
 
-    // No tenant signal at all → default-deny (401), NOT an unfiltered read.
+    // No tenant signal at all → default-deny, NOT an unfiltered read. The code
+    // is `not_authorized`, which RFC-ACDP-0007 §5 pairs with HTTP 403.
     assert_eq!(
         get_with_auth(&h.router, &ctx_id, None, None).await,
-        StatusCode::UNAUTHORIZED,
+        StatusCode::FORBIDDEN,
     );
     // Correct tenant header → 200.
     assert_eq!(
@@ -643,6 +806,12 @@ async fn strict_tenant_mode_ignores_spoofed_header_on_unbound_token() {
     let mut cfg = config(true);
     cfg.auth.enabled = true;
     cfg.auth.require_tenant = true;
+    // The publish below is setup for the read-side test; in strict mode it must
+    // come from a tenant-bound producer (#2).
+    cfg.auth.tenant_agents = vec![TenantAgentBinding {
+        agent_did: "did:web:agents.test:smoke-34".into(),
+        tenant_id: "tenant-a".into(),
+    }];
     let h = harness_from_config(cfg).await;
 
     let req = producer(34)
@@ -656,11 +825,12 @@ async fn strict_tenant_mode_ignores_spoofed_header_on_unbound_token() {
     assert_eq!(status, StatusCode::OK, "publish body = {v}");
     let ctx_id = v["ctx_id"].as_str().unwrap().to_string();
 
-    // Unbound token + spoofed X-Tenant-Id=tenant-a → header ignored → 401.
+    // Unbound token + spoofed X-Tenant-Id=tenant-a → header ignored →
+    // default-deny. Code `not_authorized` → HTTP 403 (RFC-ACDP-0007 §5).
     let unbound = tenant_bound_token(None);
     assert_eq!(
         get_with_auth(&h.router, &ctx_id, Some(&unbound), Some("tenant-a")).await,
-        StatusCode::UNAUTHORIZED,
+        StatusCode::FORBIDDEN,
     );
     // Token bound to tenant-a → authorized, no header needed.
     let bound = tenant_bound_token(Some("tenant-a"));
@@ -795,6 +965,79 @@ async fn admin_list_filters_by_tenant() {
     let items = v["items"].as_array().unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["body"]["title"], "admin-alpha");
+}
+
+#[cfg(feature = "playground")]
+#[tokio::test]
+async fn admin_list_paginates_past_fully_hidden_pages() {
+    // #13: list_contexts must anchor next_cursor on the last RAW row scanned,
+    // not on the post-visibility-filter items.last(). The only public context
+    // is the OLDEST; newer rows are restricted (hidden from an anonymous
+    // caller). A small page whose rows are all hidden must still advance the
+    // cursor so the public row stays reachable — not stranded behind a
+    // premature next_cursor:null. Mirrors search_paginates_past_fully_hidden_pages.
+    let h = harness(true).await;
+    let app = &h.router;
+
+    let pubreq = producer(70)
+        .publish_request()
+        .title("admin-visible-oldest")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (s, pub_v) = publish(app, &pubreq, None).await;
+    assert_eq!(s, StatusCode::OK);
+    let public_ctx = pub_v["ctx_id"].as_str().unwrap().to_string();
+
+    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+    for i in 0..4 {
+        let r = producer(71)
+            .publish_request()
+            .title(format!("admin-hidden-{i}"))
+            .context_type(ContextType::DataSnapshot)
+            .visibility(Visibility::Restricted)
+            .audience(vec![AgentDid::new("did:web:agents.test:nobody")])
+            .build()
+            .unwrap();
+        let (s, _) = publish(app, &r, None).await;
+        assert_eq!(s, StatusCode::OK);
+    }
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..10 {
+        let uri = match &cursor {
+            Some(c) => format!(
+                "/admin/contexts?limit=2&cursor={}",
+                pct_encode_path_segment(c)
+            ),
+            None => "/admin/contexts?limit=2".to_string(),
+        };
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_to_json(resp).await;
+        for m in v["items"].as_array().unwrap() {
+            seen.push(m["body"]["ctx_id"].as_str().unwrap().to_string());
+        }
+        match v["next_cursor"].as_str() {
+            Some(c) => cursor = Some(c.to_string()),
+            None => break,
+        }
+    }
+    assert!(
+        seen.contains(&public_ctx),
+        "public ctx must be reachable past fully-hidden pages; saw {seen:?}"
+    );
+    assert_eq!(
+        seen.len(),
+        1,
+        "exactly the one public ctx should surface to anonymous; saw {seen:?}"
+    );
 }
 
 #[tokio::test]
@@ -937,7 +1180,11 @@ async fn idempotency_key_collision_rejected() {
 }
 
 #[tokio::test]
-async fn idempotency_key_too_long_rejected() {
+async fn idempotency_key_length_bounds() {
+    // #20: RFC-ACDP-0003 §6.1/§6.2.1 — a 1–256 char key is valid; an
+    // out-of-range key is treated as ABSENT (publish proceeds without
+    // idempotency), NOT rejected. The old code rejected valid 256-char keys
+    // (off-by-one) and 400'd on over-long keys.
     let h = harness(true).await;
     let app = &h.router;
     let req = producer(6)
@@ -947,9 +1194,26 @@ async fn idempotency_key_too_long_rejected() {
         .visibility(Visibility::Public)
         .build()
         .unwrap();
-    let huge = "x".repeat(256);
-    let (status, _) = publish(app, &req, Some(&huge)).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // 256 chars → valid and honored (a retry replays the same ctx_id).
+    let k256 = "x".repeat(256);
+    let (s1, v1) = publish(app, &req, Some(&k256)).await;
+    assert_eq!(s1, StatusCode::OK, "256-char key must be accepted");
+    let (s2, v2) = publish(app, &req, Some(&k256)).await;
+    assert_eq!(s2, StatusCode::OK);
+    assert_eq!(
+        v1["ctx_id"], v2["ctx_id"],
+        "a valid 256-char key must be honored (idempotent replay)"
+    );
+
+    // 257 chars → out of range → treated as absent → publish still succeeds.
+    let k257 = "x".repeat(257);
+    let (s3, _) = publish(app, &req, Some(&k257)).await;
+    assert_eq!(
+        s3,
+        StatusCode::OK,
+        "an over-long key must be treated as absent, not rejected"
+    );
 }
 
 /// REG-P1-2: the idempotency lookup checks `expires_at > now` in Rust (the
@@ -1677,6 +1941,96 @@ async fn lineage_round_trip_lists_versions_and_returns_current() {
     let cur = body_to_json(resp).await;
     assert_eq!(cur["body"]["title"], "v2");
     assert_eq!(cur["body"]["version"], 2);
+}
+
+#[tokio::test]
+async fn supersession_by_non_owner_is_rejected() {
+    // P0 (#1): a producer must not be able to supersede a context owned by a
+    // DIFFERENT producer. Before the fix the registry backends marked any
+    // ctx_id `superseded` regardless of ownership, letting an attacker DoS /
+    // graft another producer's lineage by guessing the public ctx_id + lineage
+    // + version. Mirrors the reference InMemoryStore: a non-owner gets the same
+    // not-found shape as a genuinely-absent target (no existence oracle).
+    let h = harness(true).await;
+    let app = &h.router;
+    let owner = producer(60);
+    let attacker = producer(61);
+
+    // Owner publishes v1.
+    let v1_req = owner
+        .publish_request()
+        .title("v1")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (status, v) = publish(app, &v1_req, None).await;
+    assert_eq!(status, StatusCode::OK, "v1 publish body = {v}");
+    let v1_ctx_id = v["ctx_id"].as_str().unwrap().to_string();
+    let lineage_id = v["lineage_id"].as_str().unwrap().to_string();
+
+    // Fetch v1's body so a successor can be chained from it.
+    let v1_body_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/contexts/{}/body",
+                    pct_encode_path_segment(&v1_ctx_id)
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v1_body: acdp::types::body::Body =
+        serde_json::from_value(body_to_json(v1_body_resp).await).unwrap();
+
+    // Attacker (a different agent) attempts to supersede the owner's context.
+    let evil = attacker
+        .supersede_body(&v1_body)
+        .title("hijack")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (status, v) = publish(app, &evil, None).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "non-owner supersession must be rejected: {v}"
+    );
+    assert_eq!(v["error"]["code"], "superseded_target", "{v}");
+
+    // The owner's lineage is untouched — current is still v1.
+    let cur = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/lineages/{}/current",
+                    pct_encode_path_segment(&lineage_id)
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cur.status(), StatusCode::OK);
+    let cur = body_to_json(cur).await;
+    assert_eq!(cur["body"]["title"], "v1");
+    assert_eq!(cur["body"]["version"], 1);
+
+    // The legitimate owner CAN still supersede its own context.
+    let v2 = owner
+        .supersede_body(&v1_body)
+        .title("v2")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (status, v) = publish(app, &v2, None).await;
+    assert_eq!(status, StatusCode::OK, "owner supersession body = {v}");
 }
 
 #[tokio::test]

@@ -82,6 +82,7 @@ fn config() -> RegistryConfig {
             authority: AUTHORITY.into(),
             port: 8443,
             bind: "0.0.0.0".into(),
+            allow_public_bind: false,
             profiles: vec!["acdp-registry-core".into()],
             tls: Default::default(),
             cross_registry_resolution: false,

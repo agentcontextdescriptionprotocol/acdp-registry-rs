@@ -29,7 +29,7 @@ acdp = { path = "../acdp-rs", version = "0.1.0", features = ["server", "client"]
 axum       = { version = "0.7", features = ["macros"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 tower      = { version = "0.4", features = ["full"] }
-tower-http = { version = "0.5", features = ["cors", "trace", "request-id", "timeout", "util", "limit"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "request-id", "timeout", "util", "limit", "set-header"] }
 
 # Async
 tokio = { version = "1", features = ["full"] }
