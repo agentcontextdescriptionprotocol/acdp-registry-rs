@@ -278,6 +278,36 @@ async fn acdp_endpoints_use_acdp_json_content_type() {
 }
 
 #[tokio::test]
+async fn oversized_body_returns_413_as_acdp_json() {
+    // RFC-ACDP-0007 §4: even a framework-generated rejection — here the 413
+    // from the outer RequestBodyLimitLayer, which bypasses both the per-route
+    // content-type layer and RegistryError::into_response — must carry the
+    // ACDP media type.
+    let h = harness(true).await;
+    let big = vec![b'x'; 2 * 1024 * 1024]; // 2 MiB > 1 MiB default cap
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/contexts")
+                .body(Body::from(big))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        resp.headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/acdp+json"),
+        "framework 413 must still carry the ACDP media type",
+    );
+}
+
+#[tokio::test]
 async fn jwks_returns_empty_keys_in_hs256_mode() {
     // Default harness uses HS256 — JWKS is documented to return an empty
     // key set (symmetric secrets are never published).
