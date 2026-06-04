@@ -59,6 +59,13 @@ pub struct TokenResponse {
 pub struct BearerClaims {
     pub iss: String,
     pub sub: String,
+    /// Intended audience — the registry authority this token is for (#16).
+    /// Validated via the standard `aud` binding so a token minted for
+    /// registry A is not accepted by registry B in a federation with
+    /// overlapping trusted issuers. `#[serde(default)]` keeps deserialization
+    /// total; presence is enforced at validation via `required_spec_claims`.
+    #[serde(default)]
+    pub aud: String,
     pub jti: String,
     pub iat: i64,
     pub exp: i64,

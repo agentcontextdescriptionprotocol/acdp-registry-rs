@@ -120,6 +120,7 @@ pub(crate) fn tenant_for_request<S: ExtendedRegistryStore + 'static>(
     headers: &HeaderMap,
 ) -> Result<Option<String>, RegistryError> {
     let header_tenant = tenant_from_headers(headers);
+    reject_reserved_tenant(header_tenant.as_deref())?;
     if !state.config.auth.enabled {
         // Auth disabled — header is the only signal.
         return Ok(header_tenant);
@@ -174,6 +175,93 @@ pub(crate) fn tenant_for_request<S: ExtendedRegistryStore + 'static>(
                 .into(),
         ));
     }
+    // A `default` claim (issuer-signed) is also rejected — the reserved
+    // sentinel is never a valid asserted tenant from any source.
+    reject_reserved_tenant(resolved.as_deref())?;
+    Ok(resolved)
+}
+
+/// Reject `RESERVED_TENANT` ("default") as an explicitly-asserted tenant from
+/// any source (header or token claim). It is the column default for untenanted
+/// rows, so allowing a caller to assert it would alias the entire untenanted
+/// bucket — a cross-boundary read/write (#4). Untenanted rows remain reachable
+/// only via the *absence* of any tenant assertion (`None`).
+pub(crate) fn reject_reserved_tenant(tenant: Option<&str>) -> Result<(), RegistryError> {
+    if tenant == Some(acdp_registry_types::config::RESERVED_TENANT) {
+        return Err(RegistryError::Acdp(
+            acdp::error::AcdpError::SchemaViolation(
+                "'default' is a reserved tenant sentinel and cannot be asserted via X-Tenant-Id \
+             or a token claim"
+                    .into(),
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve the tenant a **publish** writes into.
+///
+/// Publish is producer-authenticated (the signature over `content_hash` proves
+/// `agent_id`), so — unlike a read — the authoritative tenant is the producer's
+/// `[[auth.tenant_agents]]` binding, NOT a spoofable `X-Tenant-Id` header.
+/// Letting a raw header decide the write tenant allowed any producer to inject
+/// a context into an arbitrary tenant's namespace (#2). Precedence:
+///   * auth disabled → header only (V0), reserved sentinel rejected;
+///   * bound agent → its configured tenant is authoritative; a disagreeing
+///     header is rejected;
+///   * unbound agent → strict mode rejects (no header-asserted tenant on a
+///     write); lax mode preserves V0 header behavior.
+pub(crate) fn tenant_for_publish<S: ExtendedRegistryStore + 'static>(
+    state: &AppState<S>,
+    headers: &HeaderMap,
+    agent_id: &str,
+) -> Result<Option<String>, RegistryError> {
+    let header_tenant = tenant_from_headers(headers);
+    reject_reserved_tenant(header_tenant.as_deref())?;
+    if !state.config.auth.enabled {
+        return Ok(header_tenant);
+    }
+    let strict = state.config.auth.require_tenant;
+
+    // When the producer's `agent_id` is not authoritatively bound to a tenant
+    // by a token claim, fall back to the `[[auth.tenant_agents]]` config
+    // binding for that agent — NOT a raw header. A producer-signed publish that
+    // carries no tenant-bound token must not be able to assert an arbitrary
+    // tenant via the spoofable `X-Tenant-Id` header (#2).
+    let binding_fallback = |header: Option<String>| -> Result<Option<String>, RegistryError> {
+        match state.config.auth.tenant_for_agent(agent_id) {
+            Some(t) => reconcile_tenant_sources(Some(t), header),
+            None => Ok(if strict { None } else { header }),
+        }
+    };
+
+    let bearer = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(extract_bearer);
+
+    let resolved = match bearer {
+        // A valid bearer with a `tenant` claim is issuer-signed and
+        // authoritative (same as the read path); a disagreeing header is
+        // rejected. An unbound token (or one that doesn't validate) falls back
+        // to the producer's config binding.
+        Some(token) => match state.auth.validate_bearer_claims(token) {
+            Ok(claims) => match claims.tenant {
+                Some(c) => reconcile_tenant_sources(Some(c), header_tenant)?,
+                None => binding_fallback(header_tenant)?,
+            },
+            Err(_) => binding_fallback(header_tenant)?,
+        },
+        None => binding_fallback(header_tenant)?,
+    };
+
+    if strict && resolved.is_none() {
+        return Err(RegistryError::AuthChallenge(
+            "this registry requires a tenant scope: publish with a tenant-bound agent or token"
+                .into(),
+        ));
+    }
+    reject_reserved_tenant(resolved.as_deref())?;
     Ok(resolved)
 }
 
@@ -210,9 +298,17 @@ pub async fn publish<S: ExtendedRegistryStore + 'static>(
     // uniformly to `/auth/*` and any future endpoint, not just publish.
     let req: PublishRequest = serde_json::from_slice(&body)
         .map_err(|e| RegistryError::Acdp(acdp::error::AcdpError::SchemaViolation(e.to_string())))?;
+    // RFC-ACDP-0003 §6.1/§6.2.1: the Idempotency-Key value is 1–256 ASCII
+    // printable characters. An empty, over-long, or non-printable value is
+    // treated as ABSENT (the publish proceeds without idempotency) — NOT
+    // rejected with an error. The previous code rejected valid 256-char keys
+    // (off-by-one) and 400'd on out-of-range values (#20).
     let idempotency_key = headers
         .get("idempotency-key")
         .and_then(|v| v.to_str().ok())
+        .filter(|s| {
+            (1..=256).contains(&s.len()) && s.chars().all(|c| c.is_ascii() && !c.is_ascii_control())
+        })
         .map(str::to_string);
     // FEAT-04: forward the orchestrator's correlation id to the event so
     // downstream consumers (Seam Runtime, control plane) can link the
@@ -222,15 +318,6 @@ pub async fn publish<S: ExtendedRegistryStore + 'static>(
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty() && s.len() <= 256)
         .map(str::to_string);
-    if let Some(k) = &idempotency_key {
-        if k.is_empty() || k.len() > 255 {
-            return Err(RegistryError::Acdp(
-                acdp::error::AcdpError::SchemaViolation(
-                    "Idempotency-Key length must be between 1 and 255 bytes".into(),
-                ),
-            ));
-        }
-    }
 
     // REG-P1-3: per-agent publish rate limit (RFC-ACDP-0008 §4.3). Checked
     // here — after the body parses so we know the signing agent, before the
@@ -244,15 +331,14 @@ pub async fn publish<S: ExtendedRegistryStore + 'static>(
         }
     }
 
-    // Resolve the tenant this publish writes into using the SAME authoritative
-    // precedence every read path uses (`tenant_for_request`): the JWT `tenant`
-    // claim wins, and an `X-Tenant-Id` header that disagrees with a bound claim
-    // is rejected. The earlier code stamped the row from the raw, spoofable
-    // header (`tenant_from_headers`), which let a token bound to tenant A write
-    // a context into tenant B's namespace — a cross-tenant write that
-    // contradicted the read-side isolation. Resolved here, before the expensive
-    // verify/persist pipeline, so a spoofed mismatch is rejected up front.
-    let publish_tenant = tenant_for_request(&state, &headers)?;
+    // Resolve the tenant this publish writes into. Publish is
+    // producer-authenticated (the signature over content_hash proves
+    // `agent_id`), so the authoritative tenant is the producer's
+    // `[[auth.tenant_agents]]` binding — NOT a spoofable `X-Tenant-Id` header.
+    // The earlier code stamped the row from the raw header, which let any
+    // producer inject a context into an arbitrary tenant's namespace (#2).
+    // Resolved here, before the expensive verify/persist pipeline.
+    let publish_tenant = tenant_for_publish(&state, &headers, req.agent_id.as_str())?;
 
     let server = state.server.clone();
     let resolver = state.auth.resolver.clone();
@@ -321,7 +407,10 @@ pub async fn publish<S: ExtendedRegistryStore + 'static>(
             let key2 = key.to_string();
             let hash = req.content_hash.clone();
             let resp_clone = resp.clone();
-            let expires = Utc::now() + chrono::Duration::hours(24);
+            // #25: honor the configured TTL instead of a hardcoded 24h, matching
+            // the production commit path (acdp::registry::server::commit_via_store).
+            let expires = Utc::now()
+                + chrono::Duration::seconds(state.config.limits.idempotency_key_ttl_seconds as i64);
             tokio::task::spawn_blocking(move || {
                 server2
                     .store()
@@ -332,23 +421,33 @@ pub async fn publish<S: ExtendedRegistryStore + 'static>(
         }
         resp
     } else {
-        // Production path: full RFC-ACDP-0003 §2.1 pipeline.
+        // Production path: full RFC-ACDP-0003 §2.1 pipeline. The resolved
+        // tenant is threaded into the atomic commit so `tenant_id` is written
+        // in the same INSERT as the context row (P0 #3) — no separate stamping
+        // UPDATE that a crash could leave stranded in the default bucket.
         server
-            .publish_verified(&req, idempotency_key.as_deref(), &resolver)
+            .publish_verified_in_tenant(
+                &req,
+                idempotency_key.as_deref(),
+                &resolver,
+                publish_tenant.as_deref(),
+            )
             .await?
     };
 
-    // Stamp tenant_id post-publish. The protocol-level upsert path
-    // doesn't carry tenancy (acdp::registry::RegistryStore is shared
-    // across implementations); we apply it here via the extended
-    // trait. A `None` from `tenant_for_request` means "no tenant was
-    // asserted" → the column's default ('default') is kept.
-    if let Some(tenant_id) = &publish_tenant {
-        state
-            .server
-            .store()
-            .set_tenant_of_ctx(response.ctx_id.as_str(), tenant_id)
-            .await?;
+    // Playground path only: `publish_unverified_for_tests` does not carry
+    // tenancy, so stamp it post-publish here. The production path above already
+    // wrote `tenant_id` atomically with the row. A `None` from
+    // `tenant_for_request` means "no tenant asserted" → the column default
+    // ('default') is kept.
+    if playground_snapshot.enabled {
+        if let Some(tenant_id) = &publish_tenant {
+            state
+                .server
+                .store()
+                .set_tenant_of_ctx(response.ctx_id.as_str(), tenant_id)
+                .await?;
+        }
     }
 
     if let Some(emitter) = &state.webhook {
@@ -542,6 +641,12 @@ pub async fn retrieve_body<S: ExtendedRegistryStore + 'static>(
 /// it has. Caps the cost of a tenant whose results are sparse-or-absent
 /// inside the upstream's ordered scan — without the cap, a tenant with
 /// zero matches against a busy registry would walk the whole table.
+///
+/// Short-page contract (#15): hitting this cap can return FEWER than the
+/// requested `limit` rows while still emitting a non-`None` `next_cursor`.
+/// A short page is therefore NOT an end-of-results signal — clients MUST
+/// keep paging until `next_cursor` is `None`. `search_paginates_past_fully_hidden_pages`
+/// asserts a sparse result set drains completely across pages.
 const SEARCH_REFILL_MAX_PAGES: usize = 6;
 
 /// `GET /contexts/search`.
@@ -668,6 +773,17 @@ async fn run_search_with_refill<S: ExtendedRegistryStore + 'static>(
                 });
             }
         }
+        // SECURITY follow-up (#14, overlaps DESIGN-01 in plans/defered): the
+        // tenant filter runs HERE, post-query, because the upstream
+        // `RegistryServer::search` / `RegistryStore::search` contract carries no
+        // tenant. The store's `next_cursor` is therefore anchored on the last
+        // RAW scanned row, which may belong to another tenant — so a returned
+        // cursor can disclose a foreign row's `(created_at, ctx_id)` (a
+        // low-grade ordering/existence oracle; the row itself is removed by the
+        // retain above, so no context DATA leaks). Closing this fully requires
+        // pushing the tenant predicate into the store's search SQL (a
+        // tenant-aware `ExtendedRegistryStore::search`), so the scan — and thus
+        // the cursor — only ever sees the caller's own rows.
         accumulated.extend(matches);
 
         // Refill whenever a handler-side post-filter could have dropped rows

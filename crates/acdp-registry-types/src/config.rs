@@ -48,7 +48,8 @@ impl RegistryConfig {
             registry: RegistrySection {
                 authority: "localhost".into(),
                 port: 8443,
-                bind: "0.0.0.0".into(),
+                bind: "127.0.0.1".into(),
+                allow_public_bind: false,
                 profiles: vec![
                     "acdp-registry-core".into(),
                     "acdp-registry-discovery".into(),
@@ -79,9 +80,18 @@ pub struct RegistrySection {
     pub authority: String,
     /// TCP port to listen on.
     pub port: u16,
-    /// Bind address. Defaults to `0.0.0.0`.
+    /// Bind address. Defaults to `127.0.0.1` (loopback) so a registry that
+    /// ships without overriding the config is not exposed on every interface.
     #[serde(default = "default_bind")]
     pub bind: String,
+    /// Explicit opt-in to bind a non-loopback address while running with TLS
+    /// AND auth both disabled (SEC: insecure default). Without this, such a
+    /// configuration is rejected at startup — an unauthenticated, plaintext
+    /// registry on a public interface is almost never intended. Set to `true`
+    /// only when the registry sits behind a TLS-terminating, authenticating
+    /// proxy on a trusted network.
+    #[serde(default)]
+    pub allow_public_bind: bool,
     /// Profiles advertised in the capabilities document.
     #[serde(default)]
     pub profiles: Vec<String>,
@@ -119,7 +129,7 @@ impl RegistrySection {
 }
 
 fn default_bind() -> String {
-    "0.0.0.0".into()
+    "127.0.0.1".into()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -245,6 +255,24 @@ pub struct AuthConfig {
     ///     can no longer assert one via the spoofable `X-Tenant-Id` header.
     #[serde(default)]
     pub require_tenant: bool,
+}
+
+/// Reserved tenant identifier. It is the `contexts.tenant_id` column default
+/// for untenanted (V0) contexts, so it MUST NOT be assertable as a real tenant
+/// via `X-Tenant-Id` or a token claim — otherwise a caller asserting `default`
+/// would alias the entire untenanted bucket (a cross-boundary read/write).
+pub const RESERVED_TENANT: &str = "default";
+
+impl AuthConfig {
+    /// The tenant an agent is bound to via `[[auth.tenant_agents]]`, if any.
+    /// Shared by token issuance and the publish path so both resolve an
+    /// agent's tenant identically. First match wins.
+    pub fn tenant_for_agent(&self, agent_did: &str) -> Option<String> {
+        self.tenant_agents
+            .iter()
+            .find(|b| b.agent_did == agent_did)
+            .map(|b| b.tenant_id.clone())
+    }
 }
 
 /// One agent→tenant binding for registry-issued JWTs.

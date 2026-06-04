@@ -30,7 +30,14 @@ pub async fn issue_challenge<S: ExtendedRegistryStore + 'static>(
     // publish limiter; per-process, so front a multi-replica deployment with
     // a shared limiter for a global bound.
     if let Some(limiter) = &state.challenge_rate_limiter {
-        if let Err(retry_after_seconds) = limiter.check(req.agent_id.as_str()) {
+        // #24: enforce BOTH the per-agent budget and the process-global ceiling.
+        // The per-agent key is attacker-controlled (unauthenticated endpoint),
+        // so the global ceiling is what bounds a flood that rotates `agent_id`
+        // to defeat the per-key limit.
+        if let Err(retry_after_seconds) = limiter
+            .check_global()
+            .and_then(|()| limiter.check(req.agent_id.as_str()))
+        {
             return Err(RegistryError::RateLimited {
                 retry_after_seconds,
             });

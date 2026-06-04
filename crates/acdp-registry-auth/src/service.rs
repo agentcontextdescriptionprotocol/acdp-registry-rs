@@ -224,6 +224,9 @@ impl AuthService {
         let claims = BearerClaims {
             iss: self.signer.issuer.clone(),
             sub: req.agent_id.clone(),
+            // #16: audience = this registry's authority, validated on every
+            // bearer check so the token can't be replayed at another registry.
+            aud: self.authority.clone(),
             jti: Uuid::new_v4().to_string(),
             iat: now.timestamp(),
             exp: exp.timestamp(),

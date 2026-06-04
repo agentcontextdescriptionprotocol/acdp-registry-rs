@@ -61,7 +61,14 @@ impl<S: ExtendedRegistryStore> AppStateInner<S> {
         };
         let challenge_rate_limiter = match config.limits.challenge_rate_per_minute {
             0 => None,
-            n => Some(Arc::new(AgentRateLimiter::new(n))),
+            // #24: `/auth/challenge` is unauthenticated and keyed by the
+            // attacker-controlled `agent_id`, so also enforce a process-global
+            // ceiling (64× the per-agent budget) — varying `agent_id` can no
+            // longer flood the nonce store without bound.
+            n => Some(Arc::new(AgentRateLimiter::with_global_ceiling(
+                n,
+                n.saturating_mul(64),
+            ))),
         };
         Self {
             server,

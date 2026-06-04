@@ -21,6 +21,7 @@ use axum::Router;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
+use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
@@ -37,11 +38,14 @@ pub fn build_router<S: ExtendedRegistryStore + 'static>(state: AppState<S>) -> R
     let body_limit = state.config.limits.max_payload_bytes;
     let cors = build_cors_layer(&state.config.registry.cors.allowed_origins);
 
-    let mut router = Router::new()
-        // Capabilities + health
+    // ACDP data + capabilities + auth endpoints. RFC-ACDP-0007 §4 requires
+    // `application/acdp+json` on EVERY response from these endpoints (success
+    // bodies and error envelopes alike), so they are grouped under a
+    // response-header layer that sets the media type. JWKS, health, and the
+    // operational admin routes keep their conventional media types and are
+    // mounted separately below.
+    let mut acdp = Router::new()
         .route("/.well-known/acdp.json", get(handlers::capabilities::<S>))
-        .route("/.well-known/jwks.json", get(handlers::jwks::<S>))
-        .route("/healthz", get(handlers::health::<S>))
         // Contexts
         .route("/contexts", post(handlers::publish::<S>))
         .route("/contexts/search", get(handlers::search::<S>))
@@ -49,18 +53,29 @@ pub fn build_router<S: ExtendedRegistryStore + 'static>(state: AppState<S>) -> R
         .route("/contexts/:ctx_id/body", get(handlers::retrieve_body::<S>))
         // Lineages
         .route("/lineages/:lineage_id", get(handlers::lineage::<S>))
-        .route("/lineages/:lineage_id/current", get(handlers::current::<S>))
-        // Admin status (auth-gated by auth.admin_tokens; ships in every build)
-        .route("/admin/status", get(handlers::admin_status::<S>));
+        .route("/lineages/:lineage_id/current", get(handlers::current::<S>));
 
     if auth_enabled {
-        router = router
+        acdp = acdp
             .route("/auth/challenge", post(handlers::issue_challenge::<S>))
             .route("/auth/token", post(handlers::issue_token::<S>))
             .route("/auth/token/revoke", post(handlers::revoke_token::<S>));
     }
 
-    router
+    let acdp = acdp.layer(SetResponseHeaderLayer::overriding(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/acdp+json"),
+    ));
+
+    // Non-ACDP endpoints: JWKS sets `application/jwk-set+json` itself, health
+    // and admin/status are operational JSON — none get the acdp+json override.
+    let aux = Router::new()
+        .route("/.well-known/jwks.json", get(handlers::jwks::<S>))
+        .route("/healthz", get(handlers::health::<S>))
+        // Admin status (auth-gated by auth.admin_tokens; ships in every build)
+        .route("/admin/status", get(handlers::admin_status::<S>));
+
+    acdp.merge(aux)
         .merge(admin)
         .with_state(Arc::new(state))
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))

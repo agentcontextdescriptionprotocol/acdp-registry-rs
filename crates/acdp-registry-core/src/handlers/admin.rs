@@ -223,10 +223,34 @@ fn require_admin_bearer(
     let token = header
         .strip_prefix("Bearer ")
         .ok_or(AdminAuthError::Forbidden)?;
-    if !allowed.iter().any(|t| t == token) {
+    // #23: compare in constant time and without early return. `==` /
+    // `iter().any()` short-circuit on the first differing byte / first match,
+    // leaking matching-prefix length and which entry matched via timing. These
+    // static admin tokens gate /admin/* (incl. live pinned-key reload), so fold
+    // over every allowlist entry and accumulate the result.
+    let mut matched = false;
+    for t in allowed {
+        matched |= ct_eq(t.as_bytes(), token.as_bytes());
+    }
+    if !matched {
         return Err(AdminAuthError::Forbidden);
     }
     Ok(())
+}
+
+/// Constant-time byte-slice equality. Unequal lengths return `false` (the
+/// token *length* is not the secret); equal-length inputs are compared with an
+/// XOR fold that never short-circuits, so timing does not reveal the
+/// matching-prefix length.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Admin-endpoint auth error. Kept separate from `RegistryError`

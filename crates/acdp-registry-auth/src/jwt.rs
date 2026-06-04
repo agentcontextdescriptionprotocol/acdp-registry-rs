@@ -223,6 +223,12 @@ impl JwtSigner {
     pub fn validate(&self, token: &str) -> Result<BearerClaims, AuthError> {
         let mut v = Validation::new(self.material.algorithm());
         v.set_issuer(&[&self.issuer]);
+        // #16: bind the token to this registry's audience so a token minted for
+        // a different registry (in a federation with overlapping trusted
+        // issuers) is rejected. `aud` is required-present so a token without it
+        // cannot slip past the audience check.
+        v.set_audience(&[&self.registry_authority]);
+        v.set_required_spec_claims(&["exp", "iss", "aud"]);
         v.validate_exp = true;
         v.leeway = self.leeway_seconds;
         let data = jsonwebtoken::decode::<BearerClaims>(token, self.material.decoding(), &v)
@@ -345,6 +351,7 @@ mod tests {
         BearerClaims {
             iss: "did:web:registry.test".into(),
             sub: "did:web:registry.test:agents:alice".into(),
+            aud: "registry.test".into(),
             jti: "jti-1".into(),
             iat: now,
             exp: now + 3600,
@@ -390,6 +397,28 @@ mod tests {
         assert_eq!(claims.iss, "did:web:registry.test");
         // HS256 mode: JWKS is an empty key set.
         assert_eq!(s.jwks()["keys"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn rejects_token_for_a_different_audience() {
+        // #16: a token whose `aud` is not this registry's authority is rejected
+        // (federation replay guard). A matching `aud` validates.
+        let s = JwtSigner::new(
+            JwtSecret::from_bytes(&[7u8; 32]),
+            "did:web:registry.test".into(),
+            "registry.test".into(),
+            30,
+        );
+        let mut wrong = sample_claims();
+        wrong.aud = "other.registry".into();
+        let token = s.sign(&wrong).expect("sign");
+        assert!(
+            s.validate(&token).is_err(),
+            "token for a different audience must be rejected"
+        );
+        // Control: the correct audience (set by sample_claims) validates.
+        let token_ok = s.sign(&sample_claims()).expect("sign");
+        assert!(s.validate(&token_ok).is_ok());
     }
 
     #[test]
