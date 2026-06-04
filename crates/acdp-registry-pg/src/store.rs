@@ -442,9 +442,13 @@ impl RegistryStore for PgStore {
                 .await
                 .map_err(map_sqlx_err)?;
                 let Some(row) = row else {
+                    // Identical message/shape to the not-owner and wrong-tenant
+                    // rejections below, so a caller cannot distinguish "absent"
+                    // from "exists but not yours / another tenant's" (no
+                    // existence oracle). Matches the reference InMemoryStore.
                     return Err(AcdpError::SupersededTarget {
                         reason: acdp::error::SupersessionReason::NotFound,
-                        message: format!("supersedes target '{prev}' not found"),
+                        message: format!("supersedes target '{prev}' not found in this registry"),
                     });
                 };
                 let prev_lineage: String = row.try_get("lineage_id").map_err(map_sqlx_err)?;
