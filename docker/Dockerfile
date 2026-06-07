@@ -17,12 +17,21 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
 ARG STORAGE_FEATURE=storage-pg
+# The full workspace (incl. the sibling acdp-rs path dependency) must be present
+# for `cargo chef cook` to lay out and compile the dependency graph.
 COPY --from=planner /workspace/acdp-rs           /workspace/acdp-rs
 COPY --from=planner /workspace/acdp-registry-rs  /workspace/acdp-registry-rs
 WORKDIR /workspace/acdp-registry-rs
+# Cook compiles (and caches) only the dependencies — it overwrites the crate
+# sources with dummy `fn main() {}` / empty-lib skeletons to do so.
 RUN cargo chef cook --release --recipe-path recipe.json \
         --no-default-features --features "${STORAGE_FEATURE}" \
         -p acdp-registry-server
+# Restore the REAL sources over the skeleton stubs cook left behind, THEN build
+# the actual binary. Without this re-copy, `cargo build` re-links the stub
+# `fn main() {}` and ships a ~300 KB no-op that exits 0 and never binds.
+COPY ./acdp-rs            /workspace/acdp-rs
+COPY ./acdp-registry-rs   /workspace/acdp-registry-rs
 RUN cargo build --release \
         --no-default-features --features "${STORAGE_FEATURE}" \
         -p acdp-registry-server
