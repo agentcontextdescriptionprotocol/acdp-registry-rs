@@ -1,13 +1,13 @@
 # acdp-registry-rs
 
-[![CI](https://img.shields.io/badge/CI-passing-brightgreen)](https://github.com/agentcontextdescriptionprotocol/acdp-registry-rs/actions)
+[![CI](https://img.shields.io/badge/CI-passing-brightgreen)](https://github.com/agentcontextdistributionprotocol/acdp-registry-rs/actions)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![MSRV](https://img.shields.io/badge/MSRV-1.86-blue)](Cargo.toml)
 
 Reference **registry** implementation for the
-[Agent Context Description Protocol](https://github.com/agentcontextdescriptionprotocol/agentcontextdescriptionprotocol)
+[Agent Context Distribution Protocol](https://github.com/agentcontextdistributionprotocol/agentcontextdistributionprotocol)
 v0.1.0. Implements the `acdp-registry-core` and `acdp-registry-discovery` profiles
-on top of [`acdp`](https://github.com/agentcontextdescriptionprotocol/acdp-rs).
+on top of [`acdp`](https://github.com/agentcontextdistributionprotocol/acdp-rs).
 
 ## What you get
 
@@ -50,7 +50,7 @@ the full design spec.
 
 ```bash
 # Prerequisite: clone the sibling acdp-rs repo so the path dependency resolves.
-git clone https://github.com/agentcontextdescriptionprotocol/acdp-rs ../acdp-rs
+git clone https://github.com/agentcontextdistributionprotocol/acdp-rs ../acdp-rs
 
 # Run with default config (SQLite under ./data/registry.db).
 cargo run -p acdp-registry-server
