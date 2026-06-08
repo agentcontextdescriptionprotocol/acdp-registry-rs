@@ -22,10 +22,9 @@ services:
 
   registry:
     build:
-      # Build context is the parent dir so the Dockerfile can pull in
-      # both acdp-rs and acdp-registry-rs sibling repos.
-      context: ../..
-      dockerfile: acdp-registry-rs/docker/Dockerfile
+      # `acdp` comes from crates.io, so the build context is just this repo.
+      context: ..
+      dockerfile: docker/Dockerfile
       args:
         STORAGE_FEATURE: storage-pg
     depends_on:

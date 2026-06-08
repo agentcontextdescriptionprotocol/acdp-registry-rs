@@ -1,0 +1,12 @@
+# Keep the Docker build context small and reproducible.
+target/
+.git/
+.github/
+data/
+temp/
+plans/
+docs/
+*.db
+*.db-*
+.DS_Store
+.env
