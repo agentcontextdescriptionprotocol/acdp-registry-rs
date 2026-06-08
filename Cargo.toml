@@ -16,8 +16,8 @@ version       = "0.1.0"
 edition       = "2021"
 rust-version  = "1.86"
 license       = "MIT OR Apache-2.0"
-repository    = "https://github.com/agentcontextdescriptionprotocol/acdp-registry-rs"
-homepage      = "https://github.com/agentcontextdescriptionprotocol/acdp-registry-rs"
+repository    = "https://github.com/agentcontextdistributionprotocol/acdp-registry-rs"
+homepage      = "https://github.com/agentcontextdistributionprotocol/acdp-registry-rs"
 readme        = "README.md"
 
 [workspace.dependencies]

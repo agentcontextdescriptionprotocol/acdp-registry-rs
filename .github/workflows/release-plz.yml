@@ -19,7 +19,7 @@ jobs:
           path: acdp-registry-rs
       - uses: actions/checkout@v4
         with:
-          repository: agentcontextdescriptionprotocol/acdp-rs
+          repository: agentcontextdistributionprotocol/acdp-rs
           path: acdp-rs
       - uses: dtolnay/rust-toolchain@stable
       - name: release-plz

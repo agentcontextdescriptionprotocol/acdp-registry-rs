@@ -22,7 +22,7 @@ jobs:
           path: acdp-registry-rs
       - uses: actions/checkout@v4
         with:
-          repository: agentcontextdescriptionprotocol/acdp-rs
+          repository: agentcontextdistributionprotocol/acdp-rs
           path: acdp-rs
       - uses: docker/setup-buildx-action@v3
       - if: github.event_name != 'pull_request'

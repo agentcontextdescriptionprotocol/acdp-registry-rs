@@ -20,7 +20,7 @@ jobs:
           path: acdp-registry-rs
       - uses: actions/checkout@v4
         with:
-          repository: agentcontextdescriptionprotocol/acdp-rs
+          repository: agentcontextdistributionprotocol/acdp-rs
           path: acdp-rs
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -38,7 +38,7 @@ jobs:
           path: acdp-registry-rs
       - uses: actions/checkout@v4
         with:
-          repository: agentcontextdescriptionprotocol/acdp-rs
+          repository: agentcontextdistributionprotocol/acdp-rs
           path: acdp-rs
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -85,7 +85,7 @@ jobs:
           path: acdp-registry-rs
       - uses: actions/checkout@v4
         with:
-          repository: agentcontextdescriptionprotocol/acdp-rs
+          repository: agentcontextdistributionprotocol/acdp-rs
           path: acdp-rs
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -113,7 +113,7 @@ jobs:
           path: acdp-registry-rs
       - uses: actions/checkout@v4
         with:
-          repository: agentcontextdescriptionprotocol/acdp-rs
+          repository: agentcontextdistributionprotocol/acdp-rs
           path: acdp-rs
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:

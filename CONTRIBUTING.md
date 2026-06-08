@@ -4,7 +4,7 @@ Thanks for your interest in `acdp-registry-rs`.
 
 ## Setup
 
-1. Clone the sibling [`acdp-rs`](https://github.com/agentcontextdescriptionprotocol/acdp-rs)
+1. Clone the sibling [`acdp-rs`](https://github.com/agentcontextdistributionprotocol/acdp-rs)
    into the parent directory. The workspace consumes it as a path dependency.
 2. Install Rust 1.86 or newer (`rustup install stable`).
 3. (Optional) Install `cargo-deny` if you plan to touch dependencies.
