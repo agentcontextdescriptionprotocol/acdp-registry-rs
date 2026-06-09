@@ -5,9 +5,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this workspace is
 
 `acdp-registry-rs` is the reference **registry** for the Agent Context
-Description Protocol v0.1.0. It is an 8-crate Cargo workspace built on top of
-[`acdp`](../acdp-rs) (the protocol library), which is consumed as a path
-dependency until promoted to crates.io.
+Distribution Protocol v0.1.0. It is an 8-crate Cargo workspace built on top of
+[`acdp`](https://crates.io/crates/acdp) (the protocol library), consumed as a
+crates.io dependency.
 
 The HTTP layer is `axum 0.7`, storage is `sqlx 0.8` (Postgres + SQLite), and
 authentication is a DID challenge-response → JWT design (HS256 by default,

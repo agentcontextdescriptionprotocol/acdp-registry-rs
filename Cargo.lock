@@ -5,6 +5,8 @@ version = 4
 [[package]]
 name = "acdp"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7b15bc801b29bb205fc0b45b1babf32ecb58af3d3ef3972bb996fadcbfb6509"
 dependencies = [
  "base64",
  "bs58",

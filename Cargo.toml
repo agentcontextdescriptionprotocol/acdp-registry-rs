@@ -22,8 +22,7 @@ readme        = "README.md"
 
 [workspace.dependencies]
 # Protocol library — reuse types, crypto, validation, DID resolution.
-# Sibling repo until acdp is on crates.io.
-acdp = { path = "../acdp-rs", version = "0.1.0", features = ["server", "client"] }
+acdp = { version = "0.1.0", features = ["server", "client"] }
 
 # HTTP
 axum       = { version = "0.7", features = ["macros"] }
