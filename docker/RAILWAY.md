@@ -40,6 +40,7 @@ Railway needs to pull from GHCR. Either:
 
 | Variable | Value |
 |----------|-------|
+| `ACDP_REGISTRY_STORAGE__BACKEND` | `postgres` — the GHCR image is compiled Postgres-only and mounts no config file on Railway, so the backend must be selected here (the default is `sqlite`, which the image refuses to run) |
 | `ACDP_REGISTRY_STORAGE__POSTGRES_URL` | `${{ Postgres.DATABASE_URL }}` (Railway reference) |
 | `ACDP_REGISTRY_AUTH__JWT_SECRET` | a real secret — `openssl rand -base64 32` (the binary refuses to start on the literal `changeme`) |
 | `ACDP_REGISTRY_REGISTRY__BIND` | `0.0.0.0` |

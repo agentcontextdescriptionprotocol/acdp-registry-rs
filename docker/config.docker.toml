@@ -2,6 +2,10 @@
 authority = "localhost"
 port      = 8443
 bind      = "0.0.0.0"
+# Binding a non-loopback interface with in-process TLS disabled is a deliberate
+# choice here: the container runs behind a proxy/edge that terminates TLS (see
+# RAILWAY.md). Without this opt-in the server refuses to start on 0.0.0.0.
+allow_public_bind = true
 profiles  = ["acdp-registry-core", "acdp-registry-discovery"]
 cross_registry_resolution = true
 

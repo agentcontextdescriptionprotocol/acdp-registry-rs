@@ -34,10 +34,30 @@ impl RegistryConfig {
         } else if let Ok(p) = std::env::var("ACDP_REGISTRY_CONFIG") {
             builder = builder.add_source(config::File::with_name(&p).required(true));
         }
+        // The prefix is joined with a single `_` (so `ACDP_REGISTRY_AUTH...`),
+        // while nested keys use `__` (so `..._AUTH__JWT_SECRET`). Without
+        // pinning the prefix separator, `config` reuses `separator` for both
+        // and silently demands `ACDP_REGISTRY__AUTH__...`, which no
+        // doc/compose/Railway env var uses — so every override was a no-op.
+        //
+        // Pinning the prefix separator to `_` has one edge: a prefixed var with
+        // no nested `__` (e.g. `ACDP_REGISTRY_CONFIG`, the file-path selector
+        // read above) maps to an unknown top-level key and trips
+        // `deny_unknown_fields`. Every real override carries a `<SECTION>__<KEY>`
+        // shape, so feed the source a snapshot that drops prefixed vars lacking
+        // a nested `__`.
+        let env_snapshot: std::collections::HashMap<String, String> = std::env::vars()
+            .filter(|(k, _)| match k.strip_prefix("ACDP_REGISTRY_") {
+                Some(rest) => rest.contains("__"),
+                None => true,
+            })
+            .collect();
         builder = builder.add_source(
             config::Environment::with_prefix("ACDP_REGISTRY")
+                .prefix_separator("_")
                 .separator("__")
-                .try_parsing(true),
+                .try_parsing(true)
+                .source(Some(env_snapshot)),
         );
         builder.build()?.try_deserialize()
     }
@@ -854,5 +874,41 @@ public_key_b64 = "AAAA"
         let cfg: PlaygroundConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.pinned_keys[0].valid_from, None);
         assert_eq!(cfg.pinned_keys[0].valid_until, None);
+    }
+
+    #[test]
+    fn env_overrides_use_single_underscore_prefix_and_double_underscore_nesting() {
+        // Regression: the `config` crate reuses `separator` for the prefix
+        // unless `prefix_separator` is pinned, which silently demanded
+        // `ACDP_REGISTRY__AUTH__...`. Every doc/compose/Railway env var uses
+        // the single-underscore prefix form below, so without the pin all of
+        // them were no-ops (e.g. the storage backend could never be selected
+        // for the Postgres-only container image). Keep this convention stable.
+        //
+        // SAFETY: no other test in this crate reads or writes process env, so
+        // the set/remove pair here cannot race a concurrent reader.
+        let vars = [
+            ("ACDP_REGISTRY_REGISTRY__AUTHORITY", "env-host"),
+            ("ACDP_REGISTRY_REGISTRY__PORT", "9191"),
+            ("ACDP_REGISTRY_STORAGE__BACKEND", "postgres"),
+            // A prefixed but un-nested var must NOT trip `deny_unknown_fields`
+            // via the env source. `..._TEST_PG_URL` is the CI test harness var;
+            // `ACDP_REGISTRY_CONFIG` is the same shape but is excluded here
+            // because `load(None)` separately consults it as a file path.
+            ("ACDP_REGISTRY_TEST_PG_URL", "postgres://ignored"),
+        ];
+        for (k, v) in vars {
+            std::env::set_var(k, v);
+        }
+
+        let cfg = RegistryConfig::load(None).expect("config loads with env overrides");
+
+        for (k, _) in vars {
+            std::env::remove_var(k);
+        }
+
+        assert_eq!(cfg.registry.authority, "env-host");
+        assert_eq!(cfg.registry.port, 9191);
+        assert_eq!(cfg.storage.backend, StorageBackend::Postgres);
     }
 }
