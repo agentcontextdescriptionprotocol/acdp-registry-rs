@@ -517,6 +517,156 @@ mod tests {
         assert_eq!(s1.jwks()["keys"][0]["kid"], s2.jwks()["keys"][0]["kid"]);
     }
 
+    // ── HS256 secret validation ─────────────────────────────────────
+
+    #[test]
+    fn hs256_secret_rejects_undersized_material() {
+        // SEC: an HS256 secret under 32 bytes is brute-forceable; the
+        // base64 constructor MUST reject it rather than silently weaken auth.
+        let short = base64::engine::general_purpose::STANDARD.encode([1u8; 16]);
+        // `JwtSecret` is intentionally not Debug (it wraps key material), so we
+        // can't use unwrap_err — match the result instead.
+        let err = match JwtSecret::from_base64(&short) {
+            Ok(_) => panic!("expected undersized secret to be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, AuthError::Config(_)),
+            "undersized secret must be a config error, got {err:?}"
+        );
+        assert!(err.to_string().contains("32 bytes"));
+    }
+
+    #[test]
+    fn hs256_secret_rejects_malformed_base64() {
+        let err = match JwtSecret::from_base64("!!! not base64 !!!") {
+            Ok(_) => panic!("expected malformed base64 to be rejected"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, AuthError::Config(_)));
+    }
+
+    #[test]
+    fn hs256_secret_accepts_exactly_32_bytes() {
+        let ok = base64::engine::general_purpose::STANDARD.encode([9u8; 32]);
+        assert!(JwtSecret::from_base64(&ok).is_ok());
+    }
+
+    // ── revocation enforcement at validate() ─────────────────────────
+
+    #[tokio::test]
+    async fn validate_rejects_revoked_token() {
+        use crate::revocation_store::{InMemoryRevocationStore, RevocationRecord};
+        use std::sync::Arc;
+
+        let store = Arc::new(InMemoryRevocationStore::new());
+        let signer = JwtSigner::new(
+            JwtSecret::from_bytes(&[7u8; 32]),
+            "did:web:registry.test".into(),
+            "registry.test".into(),
+            30,
+        )
+        .with_revocations(store.clone());
+
+        let claims = sample_claims();
+        let token = signer.sign(&claims).expect("sign");
+        // Before revocation the token validates.
+        assert!(signer.validate(&token).is_ok());
+
+        // Tombstone its jti — validate must now reject it even though the
+        // signature and expiry are still perfectly valid.
+        store
+            .revoke(RevocationRecord {
+                jti: claims.jti.clone(),
+                agent_did: claims.sub.clone(),
+                expires_at: chrono::Utc::now() + chrono::Duration::seconds(3600),
+            })
+            .await
+            .unwrap();
+        let err = signer.validate(&token).unwrap_err();
+        assert!(matches!(err, AuthError::TokenInvalid(_)));
+        assert!(err.to_string().contains("revoked"));
+    }
+
+    #[tokio::test]
+    async fn validate_accepts_unrelated_jti_with_store_attached() {
+        use crate::revocation_store::{InMemoryRevocationStore, RevocationRecord};
+        use std::sync::Arc;
+
+        let store = Arc::new(InMemoryRevocationStore::new());
+        // A revocation for a *different* jti must not affect this token.
+        store
+            .revoke(RevocationRecord {
+                jti: "some-other-jti".into(),
+                agent_did: "did:web:registry.test:agents:mallory".into(),
+                expires_at: chrono::Utc::now() + chrono::Duration::seconds(3600),
+            })
+            .await
+            .unwrap();
+        let signer = JwtSigner::new(
+            JwtSecret::from_bytes(&[7u8; 32]),
+            "did:web:registry.test".into(),
+            "registry.test".into(),
+            30,
+        )
+        .with_revocations(store);
+        let token = signer.sign(&sample_claims()).unwrap();
+        assert!(signer.validate(&token).is_ok());
+    }
+
+    // ── cross-algorithm confusion ────────────────────────────────────
+
+    #[test]
+    fn hs256_token_is_rejected_by_eddsa_signer() {
+        // alg confusion guard: an HS256-signed token MUST NOT validate against
+        // an EdDSA signer (and vice-versa) — the header `alg` is pinned to the
+        // verifier's algorithm.
+        let hs = JwtSigner::new(
+            JwtSecret::from_bytes(&[7u8; 32]),
+            "did:web:registry.test".into(),
+            "registry.test".into(),
+            30,
+        );
+        let ed = JwtSigner::new_eddsa(
+            &fresh_ed25519_pkcs8_pem(),
+            "did:web:registry.test".into(),
+            "registry.test".into(),
+            30,
+            None,
+        )
+        .unwrap();
+        let hs_token = hs.sign(&sample_claims()).unwrap();
+        assert!(matches!(
+            ed.validate(&hs_token),
+            Err(AuthError::TokenInvalid(_))
+        ));
+
+        let ed_token = ed.sign(&sample_claims()).unwrap();
+        assert!(matches!(
+            hs.validate(&ed_token),
+            Err(AuthError::TokenInvalid(_))
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_mismatched_registry_claim() {
+        // The `aud` audience check and the `acdp.registry` claim are separate
+        // defenses; a token whose aud matches but whose acdp.registry points at
+        // a different registry MUST be rejected (line ~236 branch).
+        let signer = JwtSigner::new(
+            JwtSecret::from_bytes(&[7u8; 32]),
+            "did:web:registry.test".into(),
+            "registry.test".into(),
+            30,
+        );
+        let mut claims = sample_claims();
+        claims.acdp.registry = "evil.registry".into(); // aud still "registry.test"
+        let token = signer.sign(&claims).unwrap();
+        let err = signer.validate(&token).unwrap_err();
+        assert!(matches!(err, AuthError::TokenInvalid(_)));
+        assert!(err.to_string().contains("wrong registry"));
+    }
+
     #[test]
     fn eddsa_rejects_token_signed_by_different_key() {
         let s1 = JwtSigner::new_eddsa(

@@ -522,4 +522,29 @@ mod tests {
         let msg = format!("{err:?}");
         assert!(msg.contains("32"), "got {msg}");
     }
+
+    #[test]
+    fn signature_algorithm_label_is_case_sensitive() {
+        // Downgrade defense compares the request's signature.algorithm against
+        // the pinned algorithm's exact wire name. An uppercased "ED25519" must
+        // NOT be silently accepted as "ed25519" — a refactor toward a
+        // case-insensitive match would weaken the downgrade guard.
+        let key = SigningKey::generate();
+        let did = "did:web:x:agents:alice";
+        let (mut req, pub_b64) = build_signed_request(key, did);
+        req.signature.algorithm = "ED25519".into();
+        let pinned = PinnedAgentKey {
+            agent_did: did.into(),
+            public_key_b64: pub_b64,
+            algorithm: "ed25519".into(),
+            valid_from: None,
+            valid_until: None,
+        };
+        let err = enforce_pinned_signature(&req, &cfg(vec![pinned], false)).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("does not match pinned algorithm"),
+            "expected downgrade-defense rejection, got {msg}"
+        );
+    }
 }

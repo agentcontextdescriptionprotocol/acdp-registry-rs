@@ -341,6 +341,137 @@ mod tests {
         );
     }
 
+    /// RFC-ACDP-0007 §5: size-cap rejections are 413 (not 400) so a client
+    /// can distinguish "too big" from "malformed".
+    #[test]
+    fn payload_and_embedded_too_large_are_413() {
+        let payload = acdp(AcdpError::PayloadTooLarge("2 MiB".into()));
+        assert_eq!(payload.wire_code(), "payload_too_large");
+        assert_eq!(payload.http_status(), 413);
+
+        let embedded = acdp(AcdpError::EmbeddedTooLarge("128 KiB".into()));
+        assert_eq!(embedded.wire_code(), "embedded_too_large");
+        assert_eq!(embedded.http_status(), 413);
+    }
+
+    /// A failed gateway hop (federation / unreachable key resolution) is 502 —
+    /// the registry itself is healthy, the upstream hop failed. Keeping these
+    /// distinct from 400/404 lets clients key retry behavior off the status.
+    #[test]
+    fn gateway_hop_failures_are_502() {
+        let xreg = acdp(AcdpError::CrossRegistryResolutionFailed("peer down".into()));
+        assert_eq!(xreg.wire_code(), "cross_registry_resolution_failed");
+        assert_eq!(xreg.http_status(), 502);
+
+        let key = acdp(AcdpError::KeyResolutionUnreachable(
+            "did:web timeout".into(),
+        ));
+        assert_eq!(key.wire_code(), "key_resolution_unreachable");
+        assert_eq!(key.http_status(), 502);
+    }
+
+    /// Cursor faults are permanent client errors (400), and the two reasons
+    /// stay distinct so a client can tell "you sent garbage" from "your page
+    /// token aged out, restart pagination".
+    #[test]
+    fn cursor_faults_are_400_and_distinct() {
+        let invalid = acdp(AcdpError::InvalidCursor("not base64".into()));
+        assert_eq!(invalid.wire_code(), "invalid_cursor");
+        assert_eq!(invalid.http_status(), 400);
+
+        let expired = acdp(AcdpError::CursorExpired);
+        assert_eq!(expired.wire_code(), "cursor_expired");
+        assert_eq!(expired.http_status(), 400);
+    }
+
+    /// The common retrieval/publish outcomes land on their RFC-ACDP-0007 §5
+    /// status codes. Guards against a refactor silently collapsing them.
+    #[test]
+    fn common_outcomes_map_to_expected_status() {
+        assert_eq!(acdp(AcdpError::NotFound("ctx".into())).http_status(), 404);
+        assert_eq!(
+            acdp(AcdpError::NotFound("ctx".into())).wire_code(),
+            "not_found"
+        );
+        assert_eq!(
+            acdp(AcdpError::DuplicatePublish("k".into())).http_status(),
+            409
+        );
+        assert_eq!(
+            acdp(AcdpError::KeyNotAuthorized("vm".into())).http_status(),
+            403
+        );
+        assert_eq!(
+            acdp(AcdpError::KeyNotAuthorized("vm".into())).wire_code(),
+            "key_not_authorized"
+        );
+        assert_eq!(
+            acdp(AcdpError::NotAuthorized("x".into())).http_status(),
+            403
+        );
+        assert_eq!(acdp(AcdpError::RateLimited("x".into())).http_status(), 429);
+    }
+
+    /// The registry-layer rate-limit variant projects to 429 + `rate_limited`,
+    /// independent of the protocol-layer `AcdpError::RateLimited`.
+    #[test]
+    fn registry_rate_limited_is_429() {
+        let e = RegistryError::RateLimited {
+            retry_after_seconds: 30,
+        };
+        assert_eq!(e.http_status(), 429);
+        assert_eq!(e.wire_code(), "rate_limited");
+    }
+
+    /// RFC-ACDP-0007 §5: `details` is absent (the key is omitted, not `null`)
+    /// when there is nothing structured to add — so a generic client doesn't
+    /// have to distinguish `null` from missing.
+    #[test]
+    fn wire_envelope_omits_details_when_absent() {
+        let e = acdp(AcdpError::NotFound("ctx".into()));
+        let json = serde_json::to_value(WireError::from(&e)).unwrap();
+        assert!(
+            json["error"].get("details").is_none(),
+            "details should be omitted, got: {json}"
+        );
+        assert_eq!(json["error"]["code"], "not_found");
+        assert!(json["error"]["message"].is_string());
+    }
+
+    /// RFC-ACDP-0007 §4 + RFC-ACDP-0008 §4.3: an error response carries the
+    /// `application/acdp+json` media type, and a 429 additionally carries a
+    /// `Retry-After` header echoing the bounded window.
+    #[cfg(feature = "axum")]
+    #[test]
+    fn rate_limited_response_sets_retry_after_and_acdp_media_type() {
+        use axum::response::IntoResponse;
+        let resp = RegistryError::RateLimited {
+            retry_after_seconds: 42,
+        }
+        .into_response();
+        assert_eq!(resp.status().as_u16(), 429);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/acdp+json"
+        );
+        assert_eq!(resp.headers().get("retry-after").unwrap(), "42");
+    }
+
+    /// A non-429 error still carries the ACDP media type but MUST NOT carry a
+    /// stray `Retry-After`.
+    #[cfg(feature = "axum")]
+    #[test]
+    fn non_rate_limited_response_has_no_retry_after() {
+        use axum::response::IntoResponse;
+        let resp = acdp(AcdpError::NotFound("ctx".into())).into_response();
+        assert_eq!(resp.status().as_u16(), 404);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/acdp+json"
+        );
+        assert!(resp.headers().get("retry-after").is_none());
+    }
+
     /// #18 — `internal_error` envelopes MUST NOT leak driver/SQL detail.
     #[test]
     fn internal_errors_do_not_leak_detail() {

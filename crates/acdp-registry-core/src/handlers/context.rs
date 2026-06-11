@@ -936,3 +936,50 @@ mod tenant_precedence_tests {
         assert!(matches!(err, RegistryError::AuthChallenge(_)));
     }
 }
+
+#[cfg(test)]
+mod tenant_helper_tests {
+    use super::{reject_reserved_tenant, tenant_from_headers};
+    use acdp::error::AcdpError;
+    use acdp_registry_types::RegistryError;
+    use axum::http::HeaderMap;
+
+    #[test]
+    fn reject_reserved_tenant_blocks_the_default_sentinel() {
+        // #4: "default" is the column default for untenanted rows; asserting it
+        // from any source would alias the whole untenanted bucket.
+        let err = reject_reserved_tenant(Some("default")).unwrap_err();
+        assert!(matches!(
+            err,
+            RegistryError::Acdp(AcdpError::SchemaViolation(_))
+        ));
+    }
+
+    #[test]
+    fn reject_reserved_tenant_allows_none_and_real_tenants() {
+        assert!(reject_reserved_tenant(None).is_ok());
+        assert!(reject_reserved_tenant(Some("tenant-a")).is_ok());
+        // Only the exact sentinel is reserved — a lookalike is fine.
+        assert!(reject_reserved_tenant(Some("default-2")).is_ok());
+    }
+
+    #[test]
+    fn tenant_from_headers_extracts_trims_and_drops_empty() {
+        let mut h = HeaderMap::new();
+        assert_eq!(tenant_from_headers(&h), None, "absent header → None");
+
+        h.insert("x-tenant-id", "  tenant-a  ".parse().unwrap());
+        assert_eq!(
+            tenant_from_headers(&h),
+            Some("tenant-a".to_string()),
+            "surrounding whitespace is trimmed"
+        );
+
+        h.insert("x-tenant-id", "   ".parse().unwrap());
+        assert_eq!(
+            tenant_from_headers(&h),
+            None,
+            "a whitespace-only header is treated as absent"
+        );
+    }
+}

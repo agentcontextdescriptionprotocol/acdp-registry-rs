@@ -405,6 +405,117 @@ mod tests {
         assert_ne!(a, b, "each emit must mint a fresh event_id");
     }
 
+    // ── signature correctness ────────────────────────────────────────
+
+    #[test]
+    fn sign_produces_github_shaped_hmac() {
+        let sig = sign("topsecret", b"hello world");
+        // Shape: "sha256=" + 64 lowercase hex chars.
+        let hex = sig.strip_prefix("sha256=").expect("sha256= prefix");
+        assert_eq!(hex.len(), 64);
+        assert!(hex
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+
+        // Recompute independently — the digest must match an HMAC-SHA256 over
+        // the same (key, body), proving sign() isn't doing anything bespoke.
+        let mut mac = HmacSha256::new_from_slice(b"topsecret").unwrap();
+        mac.update(b"hello world");
+        let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+        assert_eq!(sig, expected);
+    }
+
+    #[test]
+    fn sign_is_sensitive_to_body_and_secret() {
+        let base = sign("k", b"body");
+        assert_ne!(
+            base,
+            sign("k", b"body!"),
+            "a changed body must change the sig"
+        );
+        assert_ne!(
+            base,
+            sign("k2", b"body"),
+            "a changed secret must change the sig"
+        );
+    }
+
+    #[tokio::test]
+    async fn delivered_signature_authenticates_the_raw_body() {
+        // The whole point of X-ACDP-Signature: a receiver recomputing
+        // sign(secret, raw_body) gets exactly the header value. This is the
+        // contract GitHub-compatible consumers rely on.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let capture = tokio::spawn(capture_one_request(listener));
+
+        let config = WebhookConfig {
+            enabled: true,
+            url: format!("http://{addr}/hook"),
+            secret: "shhh".into(),
+            timeout_seconds: 5,
+            max_retries: 1,
+            queue_capacity: 8,
+        };
+        let emitter = WebhookEmitter::spawn_with_policy(config, SsrfPolicy::allow_test_loopback());
+        emitter.emit(published_event());
+
+        let raw = capture.await.expect("join");
+        let (head, body) = raw.split_once("\r\n\r\n").expect("header/body split");
+        let sig_header = head
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("x-acdp-signature:"))
+            .and_then(|l| l.split_once(':').map(|(_, v)| v))
+            .map(str::trim)
+            .expect("X-ACDP-Signature header present");
+        let recomputed = sign("shhh", body.as_bytes());
+        assert_eq!(
+            sig_header, recomputed,
+            "receiver-side recomputation must match the transmitted signature"
+        );
+        // A receiver using the wrong secret must NOT validate.
+        assert_ne!(sig_header, sign("wrong", body.as_bytes()));
+    }
+
+    // ── config validation (SEC-03 / SEC-04) ──────────────────────────
+
+    fn cfg(url: &str, secret: &str, enabled: bool) -> WebhookConfig {
+        WebhookConfig {
+            enabled,
+            url: url.into(),
+            secret: secret.into(),
+            timeout_seconds: 5,
+            max_retries: 1,
+            queue_capacity: 8,
+        }
+    }
+
+    #[tokio::test]
+    async fn try_spawn_rejects_empty_secret_when_enabled() {
+        // SEC-04: HMAC over an empty key accepts every signature.
+        let err = WebhookEmitter::try_spawn(cfg("https://hooks.example.com/acdp", "  ", true))
+            .err()
+            .expect("empty secret must be rejected");
+        assert!(matches!(err, WebhookError::Config(_)), "got {err:?}");
+        assert!(err.to_string().contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn try_spawn_rejects_ssrf_url() {
+        // SEC-03: a URL resolving to an internal/IMDS address (or non-HTTPS)
+        // is refused before the worker ever starts.
+        let err = WebhookEmitter::try_spawn(cfg("http://169.254.169.254/latest", "secret", true))
+            .err()
+            .expect("SSRF-violating URL must be rejected");
+        assert!(matches!(err, WebhookError::Config(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn try_spawn_skips_validation_when_disabled() {
+        // A disabled webhook need not carry a secret or a vetted URL.
+        assert!(WebhookEmitter::try_spawn(cfg("", "", false)).is_ok());
+    }
+
     #[tokio::test]
     async fn omits_tenant_header_when_absent() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

@@ -468,6 +468,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn in_memory_owner_of_is_none_for_unknown_jti() {
+        // The revocation endpoint relies on owner_of(None) to mean "no such
+        // token" so an attacker can't probe for existence via the error shape.
+        let s = InMemoryRevocationStore::new();
+        assert!(s.owner_of("never-issued").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn in_memory_is_revoked_false_for_expired_tombstone() {
+        // An expired token is harmless: even with a tombstone present,
+        // is_revoked is false (validate already rejects it on exp), so the
+        // store doesn't have to keep dead rows alive to stay correct.
+        let s = InMemoryRevocationStore::new();
+        s.revoke(RevocationRecord {
+            jti: "expired".into(),
+            agent_did: "did:web:agent.example".into(),
+            expires_at: Utc::now() - chrono::Duration::seconds(1),
+        })
+        .await
+        .unwrap();
+        assert!(
+            !s.is_revoked("expired").unwrap(),
+            "expired tombstone must not count as an active revocation"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sqlite_revoke_unknown_jti_creates_tombstone() {
+        // Parity with the in-memory store: a direct revoke (no prior
+        // record_issued) must still produce an active tombstone via the
+        // INSERT … ON CONFLICT DO UPDATE path.
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE issued_tokens (\
+                jti TEXT PRIMARY KEY, \
+                agent_did TEXT NOT NULL, \
+                expires_at TEXT NOT NULL, \
+                revoked INTEGER NOT NULL DEFAULT 0\
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let s = SqliteRevocationStore::new(pool);
+        assert!(!s.is_revoked("t9").unwrap(), "unknown jti is not revoked");
+        s.revoke(rec("t9")).await.unwrap();
+        assert!(s.is_revoked("t9").unwrap());
+        assert_eq!(
+            s.owner_of("t9").await.unwrap().as_deref(),
+            Some("did:web:agent.example")
+        );
+    }
+
+    #[tokio::test]
     async fn in_memory_revoke_unknown_jti_creates_tombstone() {
         // Direct `revoke` (without prior record_issued) still tombstones.
         // The AuthService policy enforces caller==owner before calling this.
