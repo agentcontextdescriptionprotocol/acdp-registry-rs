@@ -297,6 +297,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn in_memory_take_treats_expired_nonce_as_absent() {
+        // An already-expired challenge MUST NOT be redeemable, even though the
+        // row still exists at the moment of take — and the consume must still
+        // remove it (no resurrection on a later, earlier-clock take).
+        let store = InMemoryChallengeStore::new();
+        store
+            .put(ChallengeRecord {
+                nonce: "stale".into(),
+                agent_id: "did:web:agent.example".into(),
+                expires_at: Utc::now() - chrono::Duration::seconds(1),
+            })
+            .await
+            .unwrap();
+        assert!(
+            store.take("stale").await.unwrap().is_none(),
+            "an expired nonce must not be redeemable"
+        );
+        // It was consumed by the take above, so a second take is also None.
+        assert!(store.take("stale").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn in_memory_evict_drops_expired_keeps_fresh() {
+        let store = InMemoryChallengeStore::new();
+        store
+            .put(ChallengeRecord {
+                nonce: "old".into(),
+                agent_id: "did:web:a".into(),
+                expires_at: Utc::now() - chrono::Duration::seconds(1),
+            })
+            .await
+            .unwrap();
+        store
+            .put(ChallengeRecord {
+                nonce: "fresh".into(),
+                agent_id: "did:web:a".into(),
+                expires_at: Utc::now() + chrono::Duration::seconds(60),
+            })
+            .await
+            .unwrap();
+        store.evict_expired(Utc::now()).await.unwrap();
+        // The fresh nonce survives eviction and is still redeemable.
+        assert!(store.take("fresh").await.unwrap().is_some());
+        // The old one is gone (take returns None because it was evicted).
+        assert!(store.take("old").await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sqlite_take_treats_expired_nonce_as_absent() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE auth_challenges (\
+                nonce TEXT PRIMARY KEY, \
+                agent_id TEXT NOT NULL DEFAULT '', \
+                created_at TEXT NOT NULL, \
+                expires_at TEXT NOT NULL\
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let store = SqliteChallengeStore::new(pool);
+        store
+            .put(ChallengeRecord {
+                nonce: "stale".into(),
+                agent_id: "did:web:agent.example".into(),
+                expires_at: Utc::now() - chrono::Duration::seconds(1),
+            })
+            .await
+            .unwrap();
+        assert!(
+            store.take("stale").await.unwrap().is_none(),
+            "expired nonce must not redeem even across the DELETE … RETURNING path"
+        );
+    }
+
+    #[tokio::test]
     async fn sqlite_put_duplicate_nonce_returns_challenge_replay() {
         // BUG-04: the SQLite store used to surface the unique-constraint
         // violation as the generic `AuthError::Storage`, diverging from

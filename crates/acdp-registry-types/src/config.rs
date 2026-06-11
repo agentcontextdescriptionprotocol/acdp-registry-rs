@@ -876,6 +876,113 @@ public_key_b64 = "AAAA"
         assert_eq!(cfg.pinned_keys[0].valid_until, None);
     }
 
+    // ── effective_base_url ──────────────────────────────────────────
+
+    #[test]
+    fn effective_base_url_derives_from_authority_when_unset() {
+        let mut cfg = RegistryConfig::defaults();
+        cfg.registry.authority = "registry.example".into();
+        cfg.registry.base_url = String::new();
+        assert_eq!(
+            cfg.registry.effective_base_url(),
+            "https://registry.example"
+        );
+    }
+
+    #[test]
+    fn effective_base_url_prefers_explicit_and_trims_trailing_slash() {
+        let mut cfg = RegistryConfig::defaults();
+        cfg.registry.authority = "ignored.example".into();
+        cfg.registry.base_url = "https://public.example:8443/".into();
+        assert_eq!(
+            cfg.registry.effective_base_url(),
+            "https://public.example:8443"
+        );
+    }
+
+    #[test]
+    fn effective_base_url_treats_whitespace_only_as_unset() {
+        let mut cfg = RegistryConfig::defaults();
+        cfg.registry.authority = "host.example".into();
+        cfg.registry.base_url = "   ".into();
+        assert_eq!(cfg.registry.effective_base_url(), "https://host.example");
+    }
+
+    // ── tenant_for_agent ────────────────────────────────────────────
+
+    fn auth_with_bindings(bindings: &[(&str, &str)]) -> AuthConfig {
+        AuthConfig {
+            tenant_agents: bindings
+                .iter()
+                .map(|(did, tenant)| TenantAgentBinding {
+                    agent_did: (*did).into(),
+                    tenant_id: (*tenant).into(),
+                })
+                .collect(),
+            ..AuthConfig::default()
+        }
+    }
+
+    #[test]
+    fn tenant_for_agent_returns_bound_tenant() {
+        let auth = auth_with_bindings(&[("did:web:a", "tenant-a"), ("did:web:b", "tenant-b")]);
+        assert_eq!(
+            auth.tenant_for_agent("did:web:b"),
+            Some("tenant-b".to_string())
+        );
+    }
+
+    #[test]
+    fn tenant_for_agent_returns_none_for_unlisted_and_empty() {
+        assert_eq!(AuthConfig::default().tenant_for_agent("did:web:x"), None);
+        let auth = auth_with_bindings(&[("did:web:a", "tenant-a")]);
+        assert_eq!(auth.tenant_for_agent("did:web:unknown"), None);
+    }
+
+    #[test]
+    fn tenant_for_agent_first_binding_wins_on_duplicate_did() {
+        // First match wins — the issuance and publish paths MUST agree, so the
+        // resolution order is deterministic even with a misconfigured duplicate.
+        let auth = auth_with_bindings(&[("did:web:dup", "first"), ("did:web:dup", "second")]);
+        assert_eq!(
+            auth.tenant_for_agent("did:web:dup"),
+            Some("first".to_string())
+        );
+    }
+
+    // ── deserialization guards ──────────────────────────────────────
+
+    #[test]
+    fn storage_backend_parses_known_variants() {
+        let toml = r#"
+backend = "postgres"
+postgres_url = "postgres://localhost/acdp"
+max_connections = 5
+"#;
+        let cfg: StorageConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.backend, StorageBackend::Postgres);
+        assert_eq!(cfg.max_connections, 5);
+    }
+
+    #[test]
+    fn top_level_unknown_section_is_rejected() {
+        // `deny_unknown_fields` at the top level catches a mistyped section
+        // name (e.g. `[storag]`) instead of silently ignoring it.
+        let toml = r#"
+[registry]
+authority = "localhost"
+port = 8443
+
+[storag]
+backend = "sqlite"
+"#;
+        let err = toml::from_str::<RegistryConfig>(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("storag"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn env_overrides_use_single_underscore_prefix_and_double_underscore_nesting() {
         // Regression: the `config` crate reuses `separator` for the prefix

@@ -363,6 +363,7 @@ mod tests {
     use super::*;
     use crate::challenge_store::InMemoryChallengeStore;
     use crate::jwt::JwtSecret;
+    use crate::revocation_store::InMemoryRevocationStore;
     use chrono::Duration;
 
     /// Build an AuthService just sufficient to drive `issue_token` up to
@@ -497,6 +498,178 @@ mod tests {
             tenant_for_agent(&bindings, "did:web:dup"),
             Some("first".into())
         );
+    }
+
+    fn bare_service() -> AuthService {
+        let challenges: Arc<dyn ChallengeStore> = Arc::new(InMemoryChallengeStore::default());
+        let signer = JwtSigner::new(
+            JwtSecret::from_bytes(&[7u8; 32]),
+            "did:web:registry.test".into(),
+            "registry.test".into(),
+            30,
+        );
+        AuthService::new(
+            AuthConfig::default(),
+            challenges,
+            signer,
+            Arc::new(WebResolver::new()),
+            "registry.test".into(),
+        )
+    }
+
+    #[tokio::test]
+    async fn issue_challenge_rejects_malformed_did() {
+        // SEC-05: cheap prefix/length screen before any storage work.
+        let svc = bare_service();
+        for bad in ["", "did:key:zabc", "did:web:", "https://not-a-did"] {
+            let err = svc.issue_challenge(bad).await.unwrap_err();
+            assert!(
+                matches!(err, AuthError::UnsupportedDidMethod(_)),
+                "expected UnsupportedDidMethod for {bad:?}, got {err:?}"
+            );
+        }
+        // Over the 2048-byte ceiling is also rejected.
+        let huge = format!("did:web:{}", "a".repeat(2050));
+        assert!(matches!(
+            svc.issue_challenge(&huge).await.unwrap_err(),
+            AuthError::UnsupportedDidMethod(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn issue_challenge_accepts_valid_did_and_binds_authority() {
+        let svc = bare_service();
+        let ch = svc
+            .issue_challenge("did:web:agents.test:alice")
+            .await
+            .expect("valid did:web challenge issues");
+        assert_eq!(ch.registry_authority, "registry.test");
+        assert!(!ch.nonce.is_empty());
+        // The signing input is registry-authority-namespaced (replay guard).
+        assert!(ch.signing_input.contains("registry.test"));
+        assert!(ch.signing_input.contains(&ch.nonce));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn issue_token_rejects_agent_id_mismatch() {
+        // Step 2: the nonce was bound to alice; bob cannot redeem it even with
+        // a structurally valid request.
+        let expires_at = Utc::now() + Duration::seconds(60);
+        let svc = service_with_challenge("nonce-mm", "did:web:agents.test:alice", expires_at);
+        let req = TokenRequest {
+            nonce: "nonce-mm".into(),
+            agent_id: "did:web:agents.test:bob".into(),
+            expires_at: expires_at.timestamp(),
+            algorithm: "ed25519".into(),
+            key_id: "did:web:agents.test:bob#key-1".into(),
+            signature: "ignored".into(),
+        };
+        assert!(matches!(
+            svc.issue_token(req).await.unwrap_err(),
+            AuthError::ChallengeUnknown(_)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn issue_token_rejects_expires_at_mismatch() {
+        // Step 2: a request that tampers with expires_at no longer matches the
+        // value the registry committed at issuance.
+        let expires_at = Utc::now() + Duration::seconds(60);
+        let svc = service_with_challenge("nonce-exp", "did:web:agents.test:alice", expires_at);
+        let req = TokenRequest {
+            nonce: "nonce-exp".into(),
+            agent_id: "did:web:agents.test:alice".into(),
+            expires_at: expires_at.timestamp() + 999, // tampered
+            algorithm: "ed25519".into(),
+            key_id: "did:web:agents.test:alice#key-1".into(),
+            signature: "ignored".into(),
+        };
+        assert!(matches!(
+            svc.issue_token(req).await.unwrap_err(),
+            AuthError::ChallengeUnknown(_)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn issue_token_consumes_nonce_so_replay_fails() {
+        // Step 1 atomicity at the service level: a second issue_token for the
+        // same nonce sees it already consumed (ChallengeUnknown), even though
+        // the first attempt failed downstream (no live DID to resolve).
+        let expires_at = Utc::now() + Duration::seconds(60);
+        let svc = service_with_challenge("nonce-once", "did:web:agents.test:alice", expires_at);
+        let mk = || TokenRequest {
+            nonce: "nonce-once".into(),
+            agent_id: "did:web:agents.test:alice".into(),
+            expires_at: expires_at.timestamp(),
+            algorithm: "ed25519".into(),
+            key_id: "did:web:agents.test:alice#key-1".into(),
+            signature: "AAAA".into(),
+        };
+        let _ = svc.issue_token(mk()).await; // consumes the nonce
+        assert!(matches!(
+            svc.issue_token(mk()).await.unwrap_err(),
+            AuthError::ChallengeUnknown(_)
+        ));
+    }
+
+    // ── revoke_token ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn revoke_token_errors_when_revocation_not_configured() {
+        let svc = bare_service(); // no .with_revocations
+        let err = svc.revoke_token("any", "did:web:caller").await.unwrap_err();
+        assert!(matches!(err, AuthError::Internal(_)));
+    }
+
+    #[tokio::test]
+    async fn revoke_token_rejects_unknown_jti() {
+        let store = Arc::new(InMemoryRevocationStore::new());
+        let svc = bare_service().with_revocations(store);
+        let err = svc
+            .revoke_token("never-issued", "did:web:caller")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AuthError::TokenInvalid(_)));
+    }
+
+    #[tokio::test]
+    async fn revoke_token_rejects_non_owner() {
+        // Ownership enforcement: only the DID a token was issued to may revoke it.
+        let store = Arc::new(InMemoryRevocationStore::new());
+        store
+            .record_issued(RevocationRecord {
+                jti: "jti-owned".into(),
+                agent_did: "did:web:agents.test:alice".into(),
+                expires_at: Utc::now() + Duration::seconds(3600),
+            })
+            .await
+            .unwrap();
+        let svc = bare_service().with_revocations(store.clone());
+        let err = svc
+            .revoke_token("jti-owned", "did:web:agents.test:mallory")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AuthError::TokenInvalid(_)));
+        // The token stays live since the revoke was refused.
+        assert!(!store.is_revoked("jti-owned").unwrap());
+    }
+
+    #[tokio::test]
+    async fn revoke_token_succeeds_for_owner() {
+        let store = Arc::new(InMemoryRevocationStore::new());
+        store
+            .record_issued(RevocationRecord {
+                jti: "jti-owned".into(),
+                agent_did: "did:web:agents.test:alice".into(),
+                expires_at: Utc::now() + Duration::seconds(3600),
+            })
+            .await
+            .unwrap();
+        let svc = bare_service().with_revocations(store.clone());
+        svc.revoke_token("jti-owned", "did:web:agents.test:alice")
+            .await
+            .expect("owner may revoke");
+        assert!(store.is_revoked("jti-owned").unwrap());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

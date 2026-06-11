@@ -337,4 +337,46 @@ mod admin_auth_tests {
         let res = require_admin_bearer(&cfg, &headers_with(Some("Bearer t2")));
         assert!(res.is_ok());
     }
+
+    #[test]
+    fn bearer_scheme_is_case_sensitive() {
+        // RFC 6750 schemes are case-insensitive, but this code matches the
+        // exact "Bearer " prefix; lock the current behavior so a refactor that
+        // loosens it is a deliberate, reviewed change.
+        let cfg = cfg_with_admin_tokens(&["t1"]);
+        assert!(matches!(
+            require_admin_bearer(&cfg, &headers_with(Some("bearer t1"))),
+            Err(AdminAuthError::Forbidden)
+        ));
+    }
+
+    #[test]
+    fn rejects_token_with_extra_whitespace() {
+        // "Bearer  t1" (two spaces) yields a token of " t1", which is not in
+        // the allowlist — no accidental trimming.
+        let cfg = cfg_with_admin_tokens(&["t1"]);
+        assert!(matches!(
+            require_admin_bearer(&cfg, &headers_with(Some("Bearer  t1"))),
+            Err(AdminAuthError::Forbidden)
+        ));
+    }
+
+    #[test]
+    fn empty_presented_token_does_not_match_nonempty_allowlist() {
+        let cfg = cfg_with_admin_tokens(&["t1"]);
+        assert!(matches!(
+            require_admin_bearer(&cfg, &headers_with(Some("Bearer "))),
+            Err(AdminAuthError::Forbidden)
+        ));
+    }
+
+    #[test]
+    fn ct_eq_matches_only_identical_byte_slices() {
+        assert!(ct_eq(b"secret-token", b"secret-token"));
+        assert!(!ct_eq(b"secret-token", b"secret-toleN"));
+        // Differing lengths are unequal (and don't panic on the zip).
+        assert!(!ct_eq(b"short", b"longer-token"));
+        // Two empty slices are trivially equal (length guard passes, fold is 0).
+        assert!(ct_eq(b"", b""));
+    }
 }

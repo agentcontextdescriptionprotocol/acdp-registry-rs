@@ -2303,3 +2303,206 @@ async fn harness_with_playground(playground: PlaygroundConfig) -> Harness {
         db,
     }
 }
+
+#[tokio::test]
+async fn challenge_endpoint_returns_well_formed_challenge() {
+    // The success shape of POST /auth/challenge was previously unasserted
+    // (only the rate-limit and absent-when-disabled paths were covered). A
+    // challenge needs no DID resolution, so it round-trips in-process.
+    let mut cfg = config(false);
+    cfg.auth.enabled = true;
+    let h = harness_from_config(cfg).await;
+
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/challenge")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"agent_id": "did:web:agents.test:alice"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_to_json(resp).await;
+    assert_eq!(v["registry_authority"], AUTHORITY, "body = {v}");
+    let nonce = v["nonce"].as_str().expect("nonce string");
+    assert!(!nonce.is_empty());
+    assert!(v["expires_at"].is_number(), "expires_at must be numeric");
+    // The signing input is namespaced and binds the nonce + registry authority
+    // (replay guard) — assert both travel to the caller.
+    let signing_input = v["signing_input"].as_str().expect("signing_input string");
+    assert!(
+        signing_input.contains(nonce),
+        "signing_input = {signing_input}"
+    );
+    assert!(signing_input.contains(AUTHORITY));
+}
+
+#[tokio::test]
+async fn token_endpoint_rejects_unknown_nonce() {
+    // POST /auth/token referencing a nonce the registry never issued is
+    // rejected at step 1 (before any DID work) as not_authorized — and it
+    // carries the ACDP media type, not a bare 500.
+    let mut cfg = config(false);
+    cfg.auth.enabled = true;
+    let h = harness_from_config(cfg).await;
+
+    let body = json!({
+        "nonce": "never-issued-nonce",
+        "agent_id": "did:web:agents.test:alice",
+        "expires_at": chrono::Utc::now().timestamp() + 60,
+        "algorithm": "ed25519",
+        "key_id": "did:web:agents.test:alice#key-1",
+        "signature": "AAAA",
+    });
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/token")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "unknown nonce → 403");
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/acdp+json"),
+    );
+    let v = body_to_json(resp).await;
+    assert_eq!(v["error"]["code"], "not_authorized", "body = {v}");
+}
+
+#[tokio::test]
+async fn unsupported_method_on_context_route_is_405() {
+    // A known path with an unsupported method returns 405 (axum's MethodRouter
+    // fallback), not 404 — distinguishing "no such route" from "wrong verb".
+    let h = harness(true).await;
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/contexts/whatever")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+/// Mint a real, canonically-formed `ctx_id` by publishing into a throwaway
+/// harness. Returned to the caller to query against a *different* (empty)
+/// registry, so the id is well-formed (parses) yet was never stored there.
+async fn well_formed_but_absent_ctx_id() -> String {
+    let donor = harness(true).await;
+    let req = producer(91)
+        .publish_request()
+        .title("seed-for-unknown-id")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (status, v) = publish(&donor.router, &req, None).await;
+    assert_eq!(status, StatusCode::OK, "seed publish failed: {v}");
+    v["ctx_id"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn retrieve_unknown_context_returns_404_not_found() {
+    // A syntactically valid but never-published local ctx_id retrieves as a
+    // not_found envelope (the plain GET /contexts/{id} 404 path).
+    let h = harness(true).await;
+    let ctx_id = well_formed_but_absent_ctx_id().await;
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/contexts/{}", pct_encode_path_segment(&ctx_id)))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let v = body_to_json(resp).await;
+    assert_eq!(v["error"]["code"], "not_found", "body = {v}");
+}
+
+#[tokio::test]
+async fn retrieve_body_for_unknown_context_returns_404() {
+    let h = harness(true).await;
+    let ctx_id = well_formed_but_absent_ctx_id().await;
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/contexts/{}/body",
+                    pct_encode_path_segment(&ctx_id)
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// `POST /admin/pinned-keys/reload` is mounted only under the `playground`
+/// feature and gated by `auth.admin_tokens`. Lives behind the same cfg gate
+/// as the other admin-route tests so it compiles in both build variants.
+#[cfg(feature = "playground")]
+#[tokio::test]
+async fn admin_reload_pinned_keys_requires_admin_token() {
+    let mut cfg = config(true);
+    cfg.auth.admin_tokens = vec!["secret-admin".into()];
+    let h = harness_from_config(cfg).await;
+
+    // No token → 403.
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/pinned-keys/reload")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Valid admin bearer → 200 (reloads the [playground] config section).
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/pinned-keys/reload")
+                .header("authorization", "Bearer secret-admin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}

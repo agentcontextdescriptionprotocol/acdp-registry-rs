@@ -181,4 +181,66 @@ mod tests {
             "budget should refresh in the next window"
         );
     }
+
+    #[test]
+    fn window_boundary_is_inclusive_at_exactly_60s() {
+        // The reset is `>= WINDOW`, so the budget refreshes at exactly 60.0s
+        // but NOT a tick earlier (59.999s is still the same window).
+        let rl = AgentRateLimiter::new(1);
+        let t0 = Instant::now();
+        assert!(rl.check_at("a", t0).is_ok());
+        assert!(rl.check_at("a", t0).is_err());
+        // 59.999s in — still throttled.
+        assert!(rl
+            .check_at("a", t0 + Duration::from_millis(59_999))
+            .is_err());
+        // Exactly 60s — new window.
+        assert!(rl.check_at("a", t0 + Duration::from_secs(60)).is_ok());
+    }
+
+    #[test]
+    fn retry_after_never_reports_zero() {
+        // Near the very end of a window the remaining seconds floor to 0;
+        // the limiter clamps to 1 so a client never sees `Retry-After: 0`.
+        let rl = AgentRateLimiter::new(1);
+        let t0 = Instant::now();
+        assert!(rl.check_at("a", t0).is_ok());
+        let retry = rl
+            .check_at("a", t0 + Duration::from_millis(59_500))
+            .expect_err("still throttled");
+        assert_eq!(retry, 1, "sub-second remainder must clamp to 1s");
+    }
+
+    #[test]
+    fn prune_evicts_only_stale_buckets() {
+        let rl = AgentRateLimiter::new(10);
+        let t0 = Instant::now();
+        // Fill the map to the prune threshold with buckets in the current window.
+        for i in 0..PRUNE_AT {
+            assert!(rl.check_at(&format!("agent-{i}"), t0).is_ok());
+        }
+        // A new key one full window later trips the opportunistic prune; every
+        // existing bucket is now stale and must be evicted, leaving just the
+        // freshly-inserted key.
+        let later = t0 + Duration::from_secs(61);
+        assert!(rl.check_at("newcomer", later).is_ok());
+        let len = rl.buckets.lock().unwrap().len();
+        assert_eq!(len, 1, "stale buckets must be pruned, got {len} entries");
+    }
+
+    #[test]
+    fn global_and_per_agent_counters_are_independent() {
+        // Exhausting the per-agent budget must not consume the global counter,
+        // and vice-versa — the publish path checks them separately.
+        let rl = AgentRateLimiter::with_global_ceiling(1, 1);
+        let t0 = Instant::now();
+        // Use up the per-agent budget for "a".
+        assert!(rl.check_at("a", t0).is_ok());
+        assert!(rl.check_at("a", t0).is_err());
+        // The global counter is untouched — its first call still succeeds.
+        assert!(rl.check_global_at(t0).is_ok());
+        assert!(rl.check_global_at(t0).is_err());
+        // And a different agent's per-agent budget is likewise untouched.
+        assert!(rl.check_at("b", t0).is_ok());
+    }
 }

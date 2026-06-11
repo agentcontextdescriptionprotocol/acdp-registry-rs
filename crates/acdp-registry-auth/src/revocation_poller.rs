@@ -269,4 +269,82 @@ mod tests {
         let dt = revoked_at_from_ms(1_700_000_001_500).unwrap();
         assert_eq!(dt.timestamp_millis(), 1_700_000_001_500);
     }
+
+    #[test]
+    fn revoked_at_from_ms_rejects_out_of_range() {
+        // A wildly out-of-range millisecond value must not panic or wrap — it
+        // returns None, which the apply path tolerates (it doesn't persist it).
+        assert!(revoked_at_from_ms(i64::MAX).is_none());
+    }
+
+    use crate::revocation_store::InMemoryRevocationStore;
+
+    fn feed_cfg(issuer: &str) -> RevocationFeedConfig {
+        RevocationFeedConfig {
+            issuer: issuer.into(),
+            feed_url: "https://peer.example/auth/revocations".into(),
+            admin_token: "admin-key".into(),
+            poll_seconds: 300,
+        }
+    }
+
+    fn entry(jti: &str, iss: &str, exp: i64) -> FeedEntry {
+        FeedEntry {
+            jti: jti.into(),
+            sub: "did:web:peer:agents:alice".into(),
+            iss: iss.into(),
+            exp,
+            revoked_at_ms: 1_700_000_000_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_entries_applies_matching_and_empty_issuer() {
+        // An entry whose `iss` matches the configured peer (or is empty, the
+        // backward-compatible "implicit authority" case) is applied locally.
+        let store: Arc<dyn RevocationStore> = Arc::new(InMemoryRevocationStore::new());
+        let cfg = feed_cfg("cp.local");
+        let entries = vec![
+            entry("matches", "cp.local", 9_999_999_999),
+            entry("empty-iss", "", 9_999_999_999),
+        ];
+        assert!(apply_entries(&entries, &store, &cfg).await);
+        assert!(store.is_revoked("matches").unwrap());
+        assert!(store.is_revoked("empty-iss").unwrap());
+    }
+
+    #[tokio::test]
+    async fn apply_entries_drops_foreign_issuer_entry() {
+        // #7 cross-issuer injection guard: an entry attributed to a different
+        // issuer is dropped (never revoked locally) but the batch still counts
+        // as "succeeded" so the cursor advances past the poisoned entry.
+        let store: Arc<dyn RevocationStore> = Arc::new(InMemoryRevocationStore::new());
+        let cfg = feed_cfg("cp.local");
+        let entries = vec![entry("foreign", "evil.issuer", 9_999_999_999)];
+        assert!(apply_entries(&entries, &store, &cfg).await);
+        assert!(
+            !store.is_revoked("foreign").unwrap(),
+            "a foreign-issuer entry must not revoke a local token"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_entries_skips_malformed_exp_but_does_not_stall() {
+        // A permanently-broken `exp` (out of range) is dead-lettered: skipped,
+        // not applied, but the batch still returns true so one bad entry can't
+        // stall the whole feed forever (#26).
+        let store: Arc<dyn RevocationStore> = Arc::new(InMemoryRevocationStore::new());
+        let cfg = feed_cfg("cp.local");
+        let entries = vec![
+            entry("bad-exp", "cp.local", i64::MAX),
+            entry("good", "cp.local", 9_999_999_999),
+        ];
+        assert!(apply_entries(&entries, &store, &cfg).await);
+        assert!(
+            !store.is_revoked("bad-exp").unwrap(),
+            "an entry with a malformed exp must be skipped"
+        );
+        // The well-formed sibling in the same batch is still applied.
+        assert!(store.is_revoked("good").unwrap());
+    }
 }

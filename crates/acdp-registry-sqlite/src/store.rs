@@ -1190,10 +1190,66 @@ fn map_sqlx_err(e: sqlx::Error) -> AcdpError {
 #[cfg(test)]
 mod tests {
     use super::fts5_escape;
+    use base64::Engine as _;
 
     #[test]
     fn fts5_escape_single_token() {
         assert_eq!(fts5_escape("hello"), "\"hello\"");
+    }
+
+    #[test]
+    fn fts5_escape_handles_numeric_and_unicode_tokens() {
+        // Numeric-only and multi-byte tokens must still be quoted (not dropped,
+        // not treated as operators) so they participate in the AND query.
+        assert_eq!(super::fts5_escape("2024 report"), "\"2024\" \"report\"");
+        assert_eq!(super::fts5_escape("café"), "\"café\"");
+        // A column-filter injection attempt (`title:`) is neutralized by quoting.
+        assert_eq!(super::fts5_escape("title:secret"), "\"title:secret\"");
+    }
+
+    // ── pagination cursor (encode/decode) ────────────────────────────
+
+    #[test]
+    fn cursor_round_trips_anchor_and_ctx_id() {
+        use super::{decode_cursor, encode_cursor};
+        let anchor_ms = 1_700_000_123_456_i64;
+        let cur = encode_cursor(anchor_ms, "acdp://reg/ctx-1");
+        let (ts, ctx_id) = decode_cursor(&cur)
+            .expect("decode ok")
+            .expect("cursor present");
+        assert_eq!(ts.timestamp_millis(), anchor_ms);
+        assert_eq!(ctx_id, "acdp://reg/ctx-1");
+    }
+
+    #[test]
+    fn cursor_rejects_malformed_input() {
+        use super::decode_cursor;
+        use acdp::error::AcdpError;
+        // Not base64.
+        assert!(matches!(
+            decode_cursor("!!!not-base64!!!"),
+            Err(AcdpError::InvalidCursor(_))
+        ));
+        // Valid base64 but missing the ctx_id field.
+        let truncated = super::B64.encode("123:456");
+        assert!(matches!(
+            decode_cursor(&truncated),
+            Err(AcdpError::InvalidCursor(_))
+        ));
+    }
+
+    #[test]
+    fn expired_cursor_is_rejected() {
+        use super::{decode_cursor, B64, CURSOR_TTL_SECS};
+        use acdp::error::AcdpError;
+        // Craft a cursor minted just past the TTL window.
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let stale_mint = now_ms - (CURSOR_TTL_SECS * 1000 + 5_000);
+        let raw = B64.encode(format!("{stale_mint}:{now_ms}:acdp://reg/ctx-1"));
+        assert!(
+            matches!(decode_cursor(&raw), Err(AcdpError::CursorExpired)),
+            "a cursor older than the TTL must be rejected so stale pages can't be replayed"
+        );
     }
 
     #[test]
