@@ -16,7 +16,12 @@ on top of [`acdp`](https://github.com/agentcontextdistributionprotocol/acdp-rs).
 - **Pluggable storage** — Postgres (production) and SQLite (dev / CI), behind a
   unified `ExtendedRegistryStore` trait.
 - **DID-bound authentication** — challenge / response over Ed25519, short-lived
-  HS256 JWTs, anonymous public reads opt-in.
+  JWTs (HS256 or EdDSA with a published JWKS), token revocation, anonymous
+  public reads opt-in.
+- **Multi-tenancy** — tenant-scoped publish / retrieve / search via a signed JWT
+  `tenant` claim, with an optional strict mode.
+- **Cross-registry resolution** — foreign `ctx_id`s are resolved against their
+  home registry (public-only, SSRF-guarded).
 - **HMAC-signed webhooks** — `context.published`, `context.retrieved`,
   `search.executed`.
 - **Playground mode** — compile-time + runtime feature that skips DID
@@ -38,20 +43,18 @@ acdp-registry-rs/
 │   └── acdp-registry-server/       # binary: `acdp-registry`
 ├── docker/                         # Dockerfile + docker-compose
 ├── config/                         # example TOML configs
-└── docs/                           # architecture notes, ops guide
+└── docs/                           # reference docs (API, auth, config, ops)
 ```
 
-See [`plans/acdp-registry-rs-design.md`](plans/acdp-registry-rs-design.md) for
-the full design spec.
+See [`docs/`](docs/README.md) for architecture, the HTTP API, authentication,
+configuration, multi-tenancy, webhooks, and operations.
 
 ## Quick start
 
 ### Local dev (SQLite)
 
 ```bash
-# Prerequisite: clone the sibling acdp-rs repo so the path dependency resolves.
-git clone https://github.com/agentcontextdistributionprotocol/acdp-rs ../acdp-rs
-
+# `acdp` is pulled from crates.io — no sibling checkout needed.
 # Run with default config (SQLite under ./data/registry.db).
 cargo run -p acdp-registry-server
 
@@ -98,6 +101,7 @@ Selected fields:
 | Method | Path                              | Notes |
 |--------|-----------------------------------|-------|
 | GET    | `/.well-known/acdp.json`          | Capabilities document. |
+| GET    | `/.well-known/jwks.json`          | JWKS (EdDSA public key; empty for HS256). |
 | GET    | `/healthz`                        | Storage liveness. |
 | POST   | `/contexts`                       | Publish (full RFC-ACDP-0003 §2.1 pipeline). |
 | GET    | `/contexts/{ctx_id}`              | Retrieve full context. |
@@ -105,13 +109,17 @@ Selected fields:
 | GET    | `/contexts/search`                | Keyword + filter search. |
 | GET    | `/lineages/{lineage_id}`          | Full lineage (visibility-filtered). |
 | GET    | `/lineages/{lineage_id}/current`  | Newest non-superseded version. |
-| POST   | `/auth/challenge`                 | Issue a nonce for DID challenge-response. |
-| POST   | `/auth/token`                     | Verify signed challenge → JWT. |
-| GET    | `/admin/contexts`                 | Compile-gated by `playground`. |
+| POST   | `/auth/challenge`                 | Issue a nonce for DID challenge-response (when `auth.enabled`). |
+| POST   | `/auth/token`                     | Verify signed challenge → JWT (when `auth.enabled`). |
+| POST   | `/auth/token/revoke`              | Revoke your own token by `jti` (when `auth.enabled`). |
+| GET    | `/admin/status`                   | Operational snapshot (admin bearer). |
+| GET    | `/admin/contexts`                 | Compile-gated by `playground` (admin bearer). |
+| POST   | `/admin/pinned-keys/reload`       | Compile-gated by `playground` (admin bearer). |
 
 Visibility (`public` / `restricted` / `private`) is enforced server-side per
 RFC-ACDP-0008 §4.5; authenticated callers identify themselves via
-`Authorization: Bearer <jwt>`.
+`Authorization: Bearer <jwt>`. Full request/response shapes, error envelope,
+auth flow, config, and ops are documented under [`docs/`](docs/README.md).
 
 When `auth.enabled = false`, the `/auth/challenge` and `/auth/token` routes
 are not mounted, and any `Authorization` header is ignored — every caller
