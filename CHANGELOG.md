@@ -117,3 +117,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   no longer silently produce valid HMACs (`SEC-04`), and the
   `RequestBodyLimitLayer` (`SEC-06`) protects every route from
   arbitrarily-large request bodies.
+
+### Documentation
+
+- Reference guides under `docs/`: an index (`README.md`) plus
+  `HTTP-API.md` (every endpoint, media types, and the RFC-ACDP-0007
+  error envelope), `AUTHENTICATION.md` (DID challenge-response, JWT
+  claims, HS256 vs EdDSA/JWKS, token revocation, cross-issuer
+  revocation federation), `CONFIGURATION.md` (the full config tree and
+  startup validation), `MULTI-TENANCY.md` (tenant resolution and strict
+  mode), and `WEBHOOKS.md` (event payloads and the signature scheme).
+- `ARCHITECTURE.md` and `OPERATIONS.md` refreshed to match the current
+  code (crates.io `acdp` dependency, EdDSA/JWKS, revocation federation,
+  multi-tenancy, admin endpoints, rate limiting). Protocol-level material
+  links to the `acdp` library docs rather than being restated.
+- `README.md`, `CONTRIBUTING.md`, and `SECURITY.md` corrected to reflect
+  that `acdp` is consumed from crates.io (no sibling path dependency) and
+  the current auth/hardening surface.

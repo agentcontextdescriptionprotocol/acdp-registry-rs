@@ -16,7 +16,12 @@ on top of [`acdp`](https://github.com/agentcontextdistributionprotocol/acdp-rs).
 - **Pluggable storage** — Postgres (production) and SQLite (dev / CI), behind a
   unified `ExtendedRegistryStore` trait.
 - **DID-bound authentication** — challenge / response over Ed25519, short-lived
-  HS256 JWTs, anonymous public reads opt-in.
+  JWTs (HS256 or EdDSA with a published JWKS), token revocation, anonymous
+  public reads opt-in.
+- **Multi-tenancy** — tenant-scoped publish / retrieve / search via a signed JWT
+  `tenant` claim, with an optional strict mode.
+- **Cross-registry resolution** — foreign `ctx_id`s are resolved against their
+  home registry (public-only, SSRF-guarded).
 - **HMAC-signed webhooks** — `context.published`, `context.retrieved`,
   `search.executed`.
 - **Playground mode** — compile-time + runtime feature that skips DID
@@ -38,7 +43,7 @@ acdp-registry-rs/
 │   └── acdp-registry-server/       # binary: `acdp-registry`
 ├── docker/                         # Dockerfile + docker-compose
 ├── config/                         # example TOML configs
-└── docs/                           # architecture notes, ops guide
+└── docs/                           # reference docs (API, auth, config, ops)
 ```
 
 See [`docs/`](docs/README.md) for architecture, the HTTP API, authentication,

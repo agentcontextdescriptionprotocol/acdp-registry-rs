@@ -4,10 +4,11 @@ Thanks for your interest in `acdp-registry-rs`.
 
 ## Setup
 
-1. Clone the sibling [`acdp-rs`](https://github.com/agentcontextdistributionprotocol/acdp-rs)
-   into the parent directory. The workspace consumes it as a path dependency.
-2. Install Rust 1.86 or newer (`rustup install stable`).
-3. (Optional) Install `cargo-deny` if you plan to touch dependencies.
+1. Install Rust 1.86 or newer (`rustup install stable`).
+2. (Optional) Install `cargo-deny` if you plan to touch dependencies.
+
+The protocol library [`acdp`](https://crates.io/crates/acdp) is consumed from
+crates.io — no sibling checkout is required.
 
 ## Pre-PR check set
 
@@ -40,6 +41,15 @@ and version bumps from these prefixes:
 ## Adding a new endpoint
 
 See `CLAUDE.md` → "Adding a new endpoint" for the four-step recipe.
+
+## Documentation
+
+Reference docs live in [`docs/`](docs/README.md) (HTTP API, authentication,
+configuration, multi-tenancy, webhooks, operations). When a change alters the
+HTTP surface, config, auth, or operational behavior, update the relevant page in
+the same PR. Document protocol-level concepts by linking to the
+[`acdp` library docs](https://github.com/agentcontextdistributionprotocol/acdp-rs/tree/main/docs)
+rather than restating them.
 
 ## Migrations
 
