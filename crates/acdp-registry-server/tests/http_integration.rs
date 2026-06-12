@@ -2842,3 +2842,64 @@ async fn lineage_audit_walks_a_clean_chain() {
         "every receipts-era context carries a receipt"
     );
 }
+
+/// Upgrade boundary: enabling receipts must not break idempotent replays
+/// of records minted BEFORE the signer existed. The store replays the
+/// original (receipt-less) response and the §7 no-degraded-mode check
+/// applies only to newly inserted contexts — a producer retry across the
+/// receipts-enablement boundary gets its 200, not a 500.
+#[tokio::test]
+async fn pre_receipts_idempotency_record_replays_after_enabling_receipts() {
+    let h = receipts_harness().await;
+    let p = did_key_producer(40);
+    let req = p
+        .publish_request()
+        .title("pre-receipts publish")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+
+    // Seed the idempotency record a pre-receipts deployment would have
+    // stored: same (agent_id, key, content_hash), response WITHOUT a
+    // registry_receipt member.
+    let seeded_ctx_id = format!("acdp://{AUTHORITY}/00000000-0000-4000-8000-000000000040");
+    let seeded_response = json!({
+        "ctx_id": seeded_ctx_id,
+        "lineage_id": format!("lin:sha256:{}", "ab".repeat(32)),
+        "version": 1,
+        "created_at": "2026-06-01T00:00:00.000Z",
+        "status": "active",
+    });
+    let future_ms = (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp_millis();
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", h.db_path().display()))
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO idempotency_records \
+         (agent_id, key, content_hash, response_json, expires_at, expires_at_ms) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(req.agent_id.as_str())
+    .bind("upgrade-boundary-key")
+    .bind(req.content_hash.0.as_str())
+    .bind(seeded_response.to_string())
+    .bind((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339())
+    .bind(future_ms)
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let (status, v) = publish(&h.router, &req, Some("upgrade-boundary-key")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "replay of a pre-receipts record must succeed on a receipts registry: {v}"
+    );
+    assert_eq!(v["ctx_id"], seeded_ctx_id, "original response replayed");
+    assert!(
+        v.get("registry_receipt").is_none_or(|r| r.is_null()),
+        "the original receipt-less response is returned verbatim: {v}"
+    );
+}

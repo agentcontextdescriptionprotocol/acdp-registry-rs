@@ -246,8 +246,8 @@ pub async fn lineage_audit<S: ExtendedRegistryStore + 'static>(
     // every other store call.
     let items = tokio::task::spawn_blocking(move || server.store().lineage(&id))
         .await
-        .map_err(|e| AdminAuthError::ConfigReload(format!("join: {e}")))?
-        .map_err(|e| AdminAuthError::ConfigReload(format!("lineage read: {e}")))?;
+        .map_err(|e| AdminAuthError::Internal(format!("join: {e}")))?
+        .map_err(|e| AdminAuthError::Internal(format!("lineage read: {e}")))?;
 
     if items.is_empty() {
         return Ok((
@@ -434,6 +434,10 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 pub enum AdminAuthError {
     Forbidden,
     ConfigReload(String),
+    /// Non-auth failure inside an admin handler (storage read, task
+    /// join). Distinct from `ConfigReload` so the response body names
+    /// the actual failure instead of claiming a config reload happened.
+    Internal(String),
 }
 
 impl IntoResponse for AdminAuthError {
@@ -447,6 +451,11 @@ impl IntoResponse for AdminAuthError {
             AdminAuthError::ConfigReload(msg) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": format!("config reload failed: {msg}")})),
+            )
+                .into_response(),
+            AdminAuthError::Internal(msg) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("internal error: {msg}")})),
             )
                 .into_response(),
         }

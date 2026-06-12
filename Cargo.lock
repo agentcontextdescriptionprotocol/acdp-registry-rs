@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "acdp"
 version = "0.1.0"
-source = "git+https://github.com/agentcontextdistributionprotocol/acdp-rs.git?rev=7d8c29de1d355e89642af5dc60f018a1153bcfb1#7d8c29de1d355e89642af5dc60f018a1153bcfb1"
+source = "git+https://github.com/agentcontextdistributionprotocol/acdp-rs.git?rev=77f5f7f915c144106f6de2b13a6cd18e470a9ceb#77f5f7f915c144106f6de2b13a6cd18e470a9ceb"
 dependencies = [
  "base64",
  "bs58",

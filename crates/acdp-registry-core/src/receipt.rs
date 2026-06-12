@@ -50,17 +50,24 @@ pub fn load_signing_key(cfg: &ReceiptConfig) -> Result<SigningKey, String> {
     Ok(SigningKey::from_bytes(&arr))
 }
 
+/// Validate a key-id fragment: non-empty after trimming, no '#'. Shared
+/// by [`build_signer`] and [`build_did_document`] so the DID document can
+/// never carry a key id the signer construction would have refused.
+fn validated_fragment<'a>(fragment: &'a str, what: &str) -> Result<&'a str, String> {
+    let f = fragment.trim();
+    if f.is_empty() || f.contains('#') {
+        return Err(format!(
+            "{what} must be a non-empty fragment without '#' (got '{fragment}')"
+        ));
+    }
+    Ok(f)
+}
+
 /// Build the [`ReceiptSigner`] for this deployment:
 /// `registry_did = did:web:<authority>`,
 /// `key_id = did:web:<authority>#<receipt.key_id_fragment>`.
 pub fn build_signer(cfg: &ReceiptConfig, authority: &str) -> Result<ReceiptSigner, String> {
-    let fragment = cfg.key_id_fragment.trim();
-    if fragment.is_empty() || fragment.contains('#') {
-        return Err(format!(
-            "receipt.key_id_fragment must be a non-empty fragment without '#' (got '{}')",
-            cfg.key_id_fragment
-        ));
-    }
+    let fragment = validated_fragment(&cfg.key_id_fragment, "receipt.key_id_fragment")?;
     let key = load_signing_key(cfg)?;
     let registry_did = authority_to_did_web(authority);
     let key_id = format!("{registry_did}#{fragment}");
@@ -84,7 +91,8 @@ pub fn build_did_document(
 ) -> Result<serde_json::Value, String> {
     let key = load_signing_key(cfg)?;
     let did = authority_to_did_web(authority);
-    let active_id = format!("{did}#{}", cfg.key_id_fragment.trim());
+    let active_fragment = validated_fragment(&cfg.key_id_fragment, "receipt.key_id_fragment")?;
+    let active_id = format!("{did}#{active_fragment}");
 
     let mut verification_method = vec![verification_method_entry(
         &did,
@@ -101,7 +109,11 @@ pub fn build_did_document(
                 bytes.len()
             )
         })?;
-        let id = format!("{did}#{}", retired.key_id_fragment.trim());
+        let fragment = validated_fragment(
+            &retired.key_id_fragment,
+            "receipt.retired_keys.key_id_fragment",
+        )?;
+        let id = format!("{did}#{fragment}");
         verification_method.push(verification_method_entry(&did, &id, &arr));
     }
 

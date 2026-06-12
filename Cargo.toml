@@ -25,7 +25,7 @@ readme        = "README.md"
 # Pinned to the acdp-rs 0.2.0 trust-hardening branch (registry receipts,
 # did:key, divergence diagnostics) until 0.2.0 is published to crates.io;
 # switch back to a plain version requirement at that point.
-acdp = { version = "0.1.0", git = "https://github.com/agentcontextdistributionprotocol/acdp-rs.git", rev = "7d8c29de1d355e89642af5dc60f018a1153bcfb1", features = ["server", "client"] }
+acdp = { version = "0.1.0", git = "https://github.com/agentcontextdistributionprotocol/acdp-rs.git", rev = "77f5f7f915c144106f6de2b13a6cd18e470a9ceb", features = ["server", "client"] }
 
 # HTTP
 axum       = { version = "0.7", features = ["macros"] }

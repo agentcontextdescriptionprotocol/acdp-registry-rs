@@ -168,6 +168,12 @@ fn validate_config(cfg: &RegistryConfig) -> anyhow::Result<()> {
         }
         acdp_registry_core::receipt::build_signer(&cfg.receipt, &cfg.registry.authority)
             .map_err(|e| anyhow::anyhow!("receipt: {e}"))?;
+        // Also build the DID document up front: it additionally validates
+        // every `[[receipt.retired_keys]]` entry. A malformed retired key
+        // must fail startup, not silently 404 `/.well-known/did.json`
+        // while capabilities keep advertising the receipts profile.
+        acdp_registry_core::receipt::build_did_document(&cfg.receipt, &cfg.registry.authority)
+            .map_err(|e| anyhow::anyhow!("receipt: {e}"))?;
     }
 
     // SEC: refuse an insecure default deployment — a non-loopback bind with
@@ -702,6 +708,31 @@ mod tests {
         let mut cfg = RegistryConfig::defaults();
         cfg.receipt.signing_key_seed_b64 = "not-base64!!".into();
         assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn malformed_retired_receipt_key_fails_startup() {
+        use base64::Engine as _;
+        let mut cfg = RegistryConfig::defaults();
+        cfg.receipt.signing_key_seed_b64 =
+            base64::engine::general_purpose::STANDARD.encode([5u8; 32]);
+        cfg.receipt.retired_keys = vec![acdp_registry_types::RetiredReceiptKey {
+            public_key_b64: "not-base64!!".into(),
+            key_id_fragment: "receipt-key-0".into(),
+        }];
+        assert!(
+            validate_config(&cfg).is_err(),
+            "a bad retired key must fail startup, not silently 404 did.json"
+        );
+        cfg.receipt.retired_keys[0].public_key_b64 =
+            base64::engine::general_purpose::STANDARD.encode([6u8; 32]);
+        cfg.receipt.retired_keys[0].key_id_fragment = "has#hash".into();
+        assert!(
+            validate_config(&cfg).is_err(),
+            "a '#' in a retired fragment must fail startup"
+        );
+        cfg.receipt.retired_keys[0].key_id_fragment = "receipt-key-0".into();
+        assert!(validate_config(&cfg).is_ok());
     }
 
     #[test]
