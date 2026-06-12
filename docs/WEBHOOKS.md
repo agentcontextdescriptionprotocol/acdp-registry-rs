@@ -29,12 +29,20 @@ plus `event_id`, `schema_version`, and a `type` discriminator.
   "version": 1,
   "created_at": "2026-06-10T12:00:00Z",
   "derived_from": ["registry.example.com/ctx_parent"],
-  "run_id": "run-123"
+  "run_id": "run-123",
+  "key_fingerprint": "sha256:139e…",
+  "registry_receipt": { "registry_did": "did:web:registry.example.com", "…": "…" }
 }
 ```
 
 `registry_base_url` lets a federation control plane bootstrap proxy routes;
 `run_id` echoes the publisher's `X-Run-Id` header (omitted if absent).
+
+`key_fingerprint` and `registry_receipt` (ACDP 0.2.0, additive — both omitted
+on a receipt-less registry) carry the RFC-ACDP-0010 §6 fingerprint of the
+producer key the registry actually resolved at publish time, and the full
+signed receipt, so the control plane can correlate and re-verify without
+re-fetching the context.
 
 ### `context.retrieved`
 

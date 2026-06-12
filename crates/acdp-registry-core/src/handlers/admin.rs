@@ -205,6 +205,179 @@ pub async fn admin_status<S: ExtendedRegistryStore + 'static>(
     }))
 }
 
+/// Result of a full lineage integrity walk, returned by
+/// `GET /admin/lineages/{lineage_id}/audit`.
+#[derive(Debug, Serialize)]
+pub struct LineageAuditResponse {
+    pub lineage_id: String,
+    /// Number of versions found in storage.
+    pub versions: usize,
+    /// True when every invariant below held.
+    pub ok: bool,
+    /// Human-readable invariant violations (empty when `ok`).
+    pub issues: Vec<String>,
+    /// Contexts in this lineage without a stored registry receipt.
+    /// Informational, not a failure: contexts published before receipts
+    /// were enabled legitimately stay receipt-less (no-backfill policy).
+    pub receiptless_contexts: usize,
+}
+
+/// `GET /admin/lineages/{lineage_id}/audit` — the full lineage walk-back
+/// as an on-demand integrity audit (ACDP 0.2.0 workstream D3).
+///
+/// The publish path validates a v(N+1) against the immediate
+/// predecessor's *persisted* row (lineage anchoring, RFC-ACDP-0001
+/// §5.6.2), trusting the registry's own storage by induction. This
+/// endpoint is the other half of that bargain: it re-walks the whole
+/// chain so storage corruption the anchored fast path would silently
+/// inherit (a gap, a fork, a mismatched derivation) is still detectable —
+/// just off the publish path. Auth-gated by `auth.admin_tokens`; ships in
+/// every build like `/admin/status`.
+pub async fn lineage_audit<S: ExtendedRegistryStore + 'static>(
+    State(state): State<Arc<AppState<S>>>,
+    headers: HeaderMap,
+    axum::extract::Path(lineage_id): axum::extract::Path<String>,
+) -> Result<axum::response::Response, AdminAuthError> {
+    require_admin_bearer(&state.config, &headers)?;
+
+    let server = state.server.clone();
+    let id = acdp::types::primitives::LineageId(lineage_id.clone());
+    // RegistryStore::lineage is sync; run it on the blocking pool like
+    // every other store call.
+    let items = tokio::task::spawn_blocking(move || server.store().lineage(&id))
+        .await
+        .map_err(|e| AdminAuthError::ConfigReload(format!("join: {e}")))?
+        .map_err(|e| AdminAuthError::ConfigReload(format!("lineage read: {e}")))?;
+
+    if items.is_empty() {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "not_found",
+                "message": format!("lineage '{lineage_id}' not found in this registry"),
+            })),
+        )
+            .into_response());
+    }
+
+    let report = audit_lineage(&lineage_id, &items);
+    Ok(Json(report).into_response())
+}
+
+/// Pure invariant walk over an already-loaded lineage, ordered by
+/// `version ASC` (the store's `lineage` contract).
+fn audit_lineage(
+    requested: &str,
+    items: &[acdp::types::body::FullContext],
+) -> LineageAuditResponse {
+    use acdp::types::primitives::Status;
+
+    let mut issues = Vec::new();
+
+    // 1. The chain starts at version 1 and is contiguous.
+    for (i, ctx) in items.iter().enumerate() {
+        let expected = (i + 1) as u32;
+        if ctx.body.version != expected {
+            issues.push(format!(
+                "version gap: position {i} holds version {} (expected {expected})",
+                ctx.body.version
+            ));
+        }
+    }
+
+    // 2. lineage_id is the RFC-ACDP-0001 §5.6 derivation from v1's ctx_id,
+    //    and every row carries it.
+    let first = &items[0];
+    let derived = acdp::crypto::derive_lineage_id(&first.body.ctx_id);
+    if derived.as_str() != requested {
+        issues.push(format!(
+            "lineage_id mismatch: derive_lineage_id(v1) = '{}' ≠ stored '{requested}'",
+            derived.as_str()
+        ));
+    }
+    for ctx in items {
+        if ctx.body.lineage_id.as_str() != requested {
+            issues.push(format!(
+                "context '{}' carries lineage_id '{}' ≠ '{requested}'",
+                ctx.body.ctx_id.as_str(),
+                ctx.body.lineage_id.as_str()
+            ));
+        }
+    }
+
+    // 3. Supersession links: v1 supersedes nothing; v(N) supersedes v(N-1).
+    if let Some(prev) = &first.body.supersedes {
+        issues.push(format!(
+            "v1 '{}' declares supersedes '{}' (a lineage root must not)",
+            first.body.ctx_id.as_str(),
+            prev.as_str()
+        ));
+    }
+    for pair in items.windows(2) {
+        let (prev, next) = (&pair[0], &pair[1]);
+        match &next.body.supersedes {
+            Some(s) if s.as_str() == prev.body.ctx_id.as_str() => {}
+            Some(s) => issues.push(format!(
+                "broken link: v{} supersedes '{}' ≠ predecessor '{}'",
+                next.body.version,
+                s.as_str(),
+                prev.body.ctx_id.as_str()
+            )),
+            None => issues.push(format!(
+                "broken link: v{} '{}' declares no supersedes",
+                next.body.version,
+                next.body.ctx_id.as_str()
+            )),
+        }
+        // Producer continuity (RFC-ACDP-0003 §3.1): the successor's agent
+        // must be the predecessor's producer or a declared contributor.
+        let continuous = next.body.agent_id == prev.body.agent_id
+            || prev.body.contributors.contains(&next.body.agent_id);
+        if !continuous {
+            issues.push(format!(
+                "producer discontinuity: v{} published by '{}' which is neither \
+                 v{}'s producer nor contributor",
+                next.body.version,
+                next.body.agent_id.as_str(),
+                prev.body.version
+            ));
+        }
+    }
+
+    // 4. Exactly one non-superseded tip (it may be active or expired).
+    let tips = items
+        .iter()
+        .filter(|c| !matches!(c.registry_state.status, Status::Superseded))
+        .count();
+    if tips != 1 {
+        issues.push(format!(
+            "expected exactly 1 non-superseded tip, found {tips}"
+        ));
+    }
+    // ...and the tip is the highest version.
+    if let Some(last) = items.last() {
+        if matches!(last.registry_state.status, Status::Superseded) {
+            issues.push(format!(
+                "highest version v{} is marked superseded — the chain points past its end",
+                last.body.version
+            ));
+        }
+    }
+
+    let receiptless_contexts = items
+        .iter()
+        .filter(|c| c.registry_receipt.is_none())
+        .count();
+
+    LineageAuditResponse {
+        lineage_id: requested.to_string(),
+        versions: items.len(),
+        ok: issues.is_empty(),
+        issues,
+        receiptless_contexts,
+    }
+}
+
 /// Reject the request unless `Authorization: Bearer <token>` matches
 /// one of `auth.admin_tokens`. When `admin_tokens` is empty the
 /// endpoint is effectively disabled — operators must opt in.

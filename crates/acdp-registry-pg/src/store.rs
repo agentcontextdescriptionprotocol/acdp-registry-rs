@@ -127,7 +127,8 @@ impl ExtendedRegistryStore for PgStore {
         // is range-clamped above so there is no injection risk today, but
         // the inline pattern was contrary to every other query in this
         // file and is fragile if the clamp is ever loosened.
-        let mut q = String::from("SELECT body_json, status FROM contexts WHERE 1=1");
+        let mut q =
+            String::from("SELECT body_json, status, registry_receipt FROM contexts WHERE 1=1");
         let mut next_pos = 1usize;
         // Plan §7: SQL-level tenant filter — see sqlite/list_contexts
         // and store/lib.rs for rationale. The composite
@@ -174,15 +175,11 @@ impl ExtendedRegistryStore for PgStore {
         // pagination stops while visible rows remain beyond). Mirrors `search`.
         let mut last_scanned: Option<(i64, String)> = None;
         for r in rows.iter().take(limit as usize) {
-            let body_json: serde_json::Value = r.try_get("body_json").map_err(map_sqlx_err)?;
-            let status: String = r.try_get("status").map_err(map_sqlx_err)?;
-            let body: Body = serde_json::from_value(body_json)
-                .map_err(|e| AcdpError::RegistryInternal(format!("decode body: {e}")))?;
+            let ctx = row_to_context(r)?;
             last_scanned = Some((
-                body.created_at.timestamp_millis(),
-                body.ctx_id.as_str().to_string(),
+                ctx.body.created_at.timestamp_millis(),
+                ctx.body.ctx_id.as_str().to_string(),
             ));
-            let ctx = full_context(body, parse_status(&status));
             if visible_to(&ctx, requester) {
                 items.push(ctx);
             }
@@ -219,7 +216,7 @@ impl RegistryStore for PgStore {
     fn put(&self, body: Body) -> Result<(), AcdpError> {
         self.block_on(async {
             let mut tx = self.pool.begin().await.map_err(map_sqlx_err)?;
-            insert_body(&mut tx, &body, Status::Active, None).await?;
+            insert_body(&mut tx, &body, Status::Active, None, None).await?;
             tx.commit().await.map_err(map_sqlx_err)?;
             Ok(())
         })
@@ -227,11 +224,13 @@ impl RegistryStore for PgStore {
 
     fn get(&self, ctx_id: &CtxId) -> Result<Option<FullContext>, AcdpError> {
         self.block_on(async {
-            let row = sqlx::query("SELECT body_json, status FROM contexts WHERE ctx_id = $1")
-                .bind(ctx_id.as_str())
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(map_sqlx_err)?;
+            let row = sqlx::query(
+                "SELECT body_json, status, registry_receipt FROM contexts WHERE ctx_id = $1",
+            )
+            .bind(ctx_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx_err)?;
             let Some(row) = row else {
                 return Ok(None);
             };
@@ -242,7 +241,7 @@ impl RegistryStore for PgStore {
     fn lineage(&self, lineage_id: &LineageId) -> Result<Vec<FullContext>, AcdpError> {
         self.block_on(async {
             let rows = sqlx::query(
-                "SELECT body_json, status FROM contexts WHERE lineage_id = $1 \
+                "SELECT body_json, status, registry_receipt FROM contexts WHERE lineage_id = $1 \
                  ORDER BY version ASC, created_at ASC",
             )
             .bind(lineage_id.as_str())
@@ -368,6 +367,7 @@ impl RegistryStore for PgStore {
             authority,
             idempotency,
             tenant,
+            receipt_minter,
         } = commit;
         let req = req.clone();
         let authority = authority.to_string();
@@ -579,8 +579,25 @@ impl RegistryStore for PgStore {
                 extensions: Default::default(),
             };
 
+            // 4.5. Mint the registry receipt (RFC-ACDP-0010 §7) inside the
+            // transaction, against the fully-assigned body. The receipt is
+            // written by the SAME INSERT as the context row below, so a
+            // context can never be observed without its receipt — minting
+            // failure aborts the whole publish (tx drop = rollback).
+            let receipt: Option<serde_json::Value> = match receipt_minter {
+                Some(mint) => Some(mint(&body)?),
+                None => None,
+            };
+
             // 5. Insert.
-            insert_body(&mut tx, &body, Status::Active, tenant.as_deref()).await?;
+            insert_body(
+                &mut tx,
+                &body,
+                Status::Active,
+                tenant.as_deref(),
+                receipt.as_ref(),
+            )
+            .await?;
 
             // 6. Mark predecessor superseded.
             if let Some(prev) = &req.supersedes {
@@ -597,6 +614,7 @@ impl RegistryStore for PgStore {
                 version: req.version,
                 created_at,
                 status: Status::Active,
+                registry_receipt: receipt,
             };
 
             // 7. Record idempotency — this INSERT is the concurrency gate
@@ -826,7 +844,9 @@ impl RegistryStore for PgStore {
                 let status: String = r.try_get("status").map_err(map_sqlx_err)?;
                 let body: Body = serde_json::from_value(body_json)
                     .map_err(|e| AcdpError::RegistryInternal(format!("decode body: {e}")))?;
-                let mut ctx = full_context(body, parse_status(&status));
+                // Receipts aren't projected into SearchResult rows, so the
+                // search SELECT deliberately skips the column.
+                let mut ctx = full_context(body, parse_status(&status), None);
                 ctx.registry_state.status =
                     project_status_inline(&ctx.registry_state.status, ctx.body.expires_at, now);
                 last_scanned = Some((
@@ -904,6 +924,7 @@ async fn insert_body<'c>(
     body: &Body,
     status: Status,
     tenant: Option<&str>,
+    receipt: Option<&serde_json::Value>,
 ) -> Result<(), AcdpError> {
     let body_json = serde_json::to_value(body)
         .map_err(|e| AcdpError::RegistryInternal(format!("encode body: {e}")))?;
@@ -930,13 +951,16 @@ async fn insert_body<'c>(
     // separate, non-transactional UPDATE — a crash/error in between stranded
     // the context in the 'default' (untenanted) bucket permanently.
     let tenant_id = tenant.unwrap_or("default");
+    // RFC-ACDP-0010 §7: the receipt rides the SAME INSERT as the context row,
+    // so receipt-and-context atomicity is structural, not transactional
+    // bookkeeping a refactor could break.
     sqlx::query(
         "INSERT INTO contexts (\
             ctx_id, lineage_id, agent_id, contributors, origin_registry, \
             created_at, status, visibility, context_type, version, supersedes, \
             title, description, summary, domain, tags, expires_at, content_hash, body_json, \
-            tenant_id\
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)",
+            tenant_id, registry_receipt\
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)",
     )
     .bind(body.ctx_id.as_str())
     .bind(body.lineage_id.as_str())
@@ -958,6 +982,7 @@ async fn insert_body<'c>(
     .bind(body.content_hash.0.as_str())
     .bind(body_json)
     .bind(tenant_id)
+    .bind(receipt)
     .execute(&mut **tx)
     .await
     .map_err(map_sqlx_err)?;
@@ -980,19 +1005,20 @@ async fn insert_body<'c>(
 fn row_to_context(r: &PgRow) -> Result<FullContext, AcdpError> {
     let body_json: serde_json::Value = r.try_get("body_json").map_err(map_sqlx_err)?;
     let status: String = r.try_get("status").map_err(map_sqlx_err)?;
+    let receipt: Option<serde_json::Value> = r.try_get("registry_receipt").map_err(map_sqlx_err)?;
     let body: Body = serde_json::from_value(body_json)
         .map_err(|e| AcdpError::RegistryInternal(format!("decode body: {e}")))?;
-    Ok(full_context(body, parse_status(&status)))
+    Ok(full_context(body, parse_status(&status), receipt))
 }
 
-fn full_context(body: Body, status: Status) -> FullContext {
+fn full_context(body: Body, status: Status, receipt: Option<serde_json::Value>) -> FullContext {
     FullContext {
         body,
         registry_state: RegistryState {
             status,
             extensions: Default::default(),
         },
-        registry_receipt: None,
+        registry_receipt: receipt,
         extensions: Default::default(),
     }
 }

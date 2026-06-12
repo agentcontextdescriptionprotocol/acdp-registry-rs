@@ -10,8 +10,9 @@ pub mod event;
 
 pub use auth::{AuthChallenge, BearerClaims, TokenRequest, TokenResponse};
 pub use config::{
-    AuthConfig, CorsConfig, LimitsConfig, PlaygroundConfig, RegistryConfig, RegistrySection,
-    StorageBackend, StorageConfig, TenantAgentBinding, WebhookConfig,
+    AuthConfig, CorsConfig, LimitsConfig, PlaygroundConfig, ReceiptConfig, RegistryConfig,
+    RegistrySection, RetiredReceiptKey, StorageBackend, StorageConfig, TenantAgentBinding,
+    WebhookConfig,
 };
 pub use error::RegistryError;
 pub use event::WebhookEvent;

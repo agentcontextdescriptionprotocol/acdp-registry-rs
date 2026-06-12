@@ -27,6 +27,38 @@ pub async fn capabilities<S: ExtendedRegistryStore + 'static>(
     )
 }
 
+/// `GET /.well-known/did.json` — the registry's own `did:web` DID document
+/// (RFC-ACDP-0010 workstream A1).
+///
+/// `did:web:<authority>` resolves to exactly this URL, so serving it here
+/// makes the registry's receipt verification key discoverable without any
+/// out-of-band hosting. The document is precomputed at startup from
+/// `[receipt]`: the active signing key sits in both `verificationMethod`
+/// and `assertionMethod`; rotated-out keys (`[[receipt.retired_keys]]`)
+/// stay in `verificationMethod` forever — removing one bricks every
+/// receipt it signed. 404 when no receipt key is configured.
+pub async fn registry_did_document<S: ExtendedRegistryStore + 'static>(
+    State(state): State<Arc<AppState<S>>>,
+) -> impl IntoResponse {
+    match &state.registry_did_document {
+        Some(doc) => (
+            StatusCode::OK,
+            [(axum::http::header::CACHE_CONTROL, "public, max-age=300")],
+            Json(doc.clone()),
+        )
+            .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "not_found",
+                "message":
+                    "this registry serves no DID document (no receipt signing key configured)",
+            })),
+        )
+            .into_response(),
+    }
+}
+
 /// `GET /.well-known/jwks.json` — publish the public key(s) federated
 /// peers should use to verify tokens issued by this registry.
 ///

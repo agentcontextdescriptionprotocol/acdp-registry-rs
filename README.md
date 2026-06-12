@@ -6,8 +6,14 @@
 
 Reference **registry** implementation for the
 [Agent Context Distribution Protocol](https://github.com/agentcontextdistributionprotocol/agentcontextdistributionprotocol)
-v0.1.0. Implements the `acdp-registry-core` and `acdp-registry-discovery` profiles
-on top of [`acdp`](https://github.com/agentcontextdistributionprotocol/acdp-rs).
+v0.1.0 / v0.2.0. Implements the `acdp-registry-core` and
+`acdp-registry-discovery` profiles on top of
+[`acdp`](https://github.com/agentcontextdistributionprotocol/acdp-rs) —
+plus, with a `[receipt]` signing key configured, the ACDP 0.2.0
+trust-hardening surface: the `acdp-registry-receipts` profile (signed,
+atomically-persisted publish receipts, RFC-ACDP-0010), self-certifying
+`did:key` producers, and a self-hosted `/.well-known/did.json`
+(see [docs/RECEIPTS.md](docs/RECEIPTS.md)).
 
 ## What you get
 

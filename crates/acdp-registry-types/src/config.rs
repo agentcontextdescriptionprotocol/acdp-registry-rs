@@ -21,6 +21,8 @@ pub struct RegistryConfig {
     pub limits: LimitsConfig,
     #[serde(default)]
     pub playground: PlaygroundConfig,
+    #[serde(default)]
+    pub receipt: ReceiptConfig,
 }
 
 impl RegistryConfig {
@@ -89,6 +91,7 @@ impl RegistryConfig {
             webhook: WebhookConfig::default(),
             limits: LimitsConfig::default(),
             playground: PlaygroundConfig::default(),
+            receipt: ReceiptConfig::default(),
         }
     }
 }
@@ -623,6 +626,88 @@ impl PlaygroundConfig {
     pub fn has_entry_for(&self, agent_did: &str) -> bool {
         self.pinned_keys.iter().any(|p| p.agent_did == agent_did)
     }
+}
+
+/// Registry-receipt signing identity (RFC-ACDP-0010, workstream A).
+///
+/// When a signing key is configured the registry mints a signed receipt
+/// for every publish, persists it atomically with the context row, and
+/// advertises `acdp_version: 0.2.0` plus the `acdp-registry-receipts`
+/// profile. When NO key is configured neither is advertised — a registry
+/// without a signing key must not claim the profile (RFC-ACDP-0010 §7:
+/// no degraded mode).
+///
+/// The key is an Ed25519 seed supplied through exactly one of two
+/// sources, mirroring the "file / env seed" split used for JWT secrets:
+///
+///   * `signing_key_seed_b64` — standard base64 of the raw 32-byte seed.
+///     Env-friendly: `ACDP_REGISTRY_RECEIPT__SIGNING_KEY_SEED_B64`.
+///   * `signing_key_path` — path to a file (e.g. a mounted secret)
+///     whose contents are that same base64 string; surrounding
+///     whitespace is tolerated.
+///
+/// This struct is pure data — decoding and `acdp::types::receipt::
+/// ReceiptSigner` construction live in `acdp-registry-core::receipt`,
+/// which is also the single seam to swap in a KMS/HSM-backed key source
+/// later without touching the publish path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptConfig {
+    /// Standard base64 of the raw 32-byte Ed25519 seed. Empty = unset.
+    #[serde(default)]
+    pub signing_key_seed_b64: String,
+    /// File containing the base64 seed. `None` = unset.
+    #[serde(default)]
+    pub signing_key_path: Option<PathBuf>,
+    /// Fragment of the receipt key id under the registry DID; the full
+    /// `signature.key_id` becomes `did:web:<authority>#<fragment>`.
+    /// Rotations MUST pick a fresh fragment (e.g. `receipt-key-2`) so
+    /// receipts minted under the old key keep resolving to the old key.
+    #[serde(default = "default_receipt_key_fragment")]
+    pub key_id_fragment: String,
+    /// Rotated-out receipt verification keys. RFC-ACDP-0010 §9: retired
+    /// keys stay in the DID document's `verificationMethod` indefinitely
+    /// (they are removed from `assertionMethod` only) — dropping an entry
+    /// from this list bricks every receipt that key ever signed. Remove
+    /// an entry ONLY on confirmed key compromise.
+    #[serde(default)]
+    pub retired_keys: Vec<RetiredReceiptKey>,
+}
+
+impl Default for ReceiptConfig {
+    fn default() -> Self {
+        Self {
+            signing_key_seed_b64: String::new(),
+            signing_key_path: None,
+            key_id_fragment: default_receipt_key_fragment(),
+            retired_keys: Vec::new(),
+        }
+    }
+}
+
+fn default_receipt_key_fragment() -> String {
+    "receipt-key-1".into()
+}
+
+impl ReceiptConfig {
+    /// Whether a receipt signing key source is configured. Gates the
+    /// `acdp-registry-receipts` profile and the 0.2.0 capability bump.
+    pub fn is_configured(&self) -> bool {
+        !self.signing_key_seed_b64.trim().is_empty() || self.signing_key_path.is_some()
+    }
+}
+
+/// A retired receipt verification key, published in the registry DID
+/// document's `verificationMethod` (never `assertionMethod`) so receipts
+/// signed before a rotation keep verifying.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetiredReceiptKey {
+    /// Standard base64 of the raw 32-byte Ed25519 PUBLIC key.
+    pub public_key_b64: String,
+    /// The fragment this key was published under while active (the
+    /// `signature.key_id` of receipts it signed points here).
+    pub key_id_fragment: String,
 }
 
 /// Wall-clock unix seconds. Wrapped so we have one switchable point

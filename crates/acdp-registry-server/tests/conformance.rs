@@ -44,9 +44,7 @@ use acdp_registry_types::{
     StorageConfig, WebhookConfig,
 };
 use axum::body::Body;
-use axum::http::Request;
-#[cfg(feature = "playground")]
-use axum::http::StatusCode;
+use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::Value;
 use tower::ServiceExt;
@@ -105,6 +103,7 @@ fn config() -> RegistryConfig {
             enabled: true,
             ..Default::default()
         },
+        receipt: Default::default(),
     }
 }
 
@@ -569,4 +568,100 @@ async fn playground_compiled_in_but_runtime_disabled_keeps_admin_route() {
     // The admin route is wired in at compile time; the playground flag
     // only affects whether `publish` skips DID verification.
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+// ─── ACDP 0.2.0: did:key golden vector + capability gate (sig-003 / dk-003) ───
+
+/// Caps for a did:key-accepting 0.2.0 registry. The standard `caps()` stays
+/// did:web-only, which doubles as the dk-003 counter-registry below.
+fn did_key_caps() -> CapabilitiesDocument {
+    let mut c = caps();
+    c.acdp_version = "0.2.0".into();
+    c.supported_did_methods = vec!["did:web".into(), "did:key".into()];
+    c
+}
+
+/// Non-playground harness: did:key verification is pure/offline, so the
+/// full RFC-ACDP-0003 §2.1 pipeline (steps 7–8 included) runs without a
+/// network DID resolver — exactly what the golden vector is meant to pin.
+async fn did_key_harness(caps: CapabilitiesDocument) -> axum::Router {
+    let store = SqliteStore::connect_in_memory().await.unwrap();
+    store.migrate().await.unwrap();
+    let server = Arc::new(RegistryServer::try_new(store, caps, AUTHORITY).unwrap());
+    let challenges: Arc<dyn ChallengeStore> = Arc::new(InMemoryChallengeStore::new());
+    let secret = JwtSecret::from_bytes(&[42u8; 32]);
+    let signer = JwtSigner::new(secret, format!("did:web:{AUTHORITY}"), AUTHORITY.into(), 30);
+    let resolver = Arc::new(acdp::did::WebResolver::new());
+    let auth = Arc::new(AuthService::new(
+        AuthConfig::default(),
+        challenges,
+        signer,
+        resolver,
+        AUTHORITY.into(),
+    ));
+    let mut cfg = config();
+    cfg.playground.enabled = false;
+    let state = AppStateInner::new(server, auth, None, cfg, None);
+    build_router(state)
+}
+
+/// Replays the spec's did:key golden publish request (sig-003,
+/// `vectors[0].expected.publish_request_body` — a byte-pinned, fully
+/// signed request) against both registry postures:
+///
+///   * did:key advertised  → accepted through the verified pipeline;
+///   * did:web-only (dk-003) → rejected `key_resolution_failed` / 400.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn did_key_golden_vector_accepted_and_gated() {
+    let Ok(dir) = std::env::var("ACDP_SPEC_DIR") else {
+        eprintln!("conformance: ACDP_SPEC_DIR unset; skipping sig-003/dk-003");
+        return;
+    };
+    let Some(fixtures) = resolve_fixture_dir(&dir) else {
+        eprintln!("conformance: no fixtures under ACDP_SPEC_DIR={dir}; skipping");
+        return;
+    };
+    let path = fixtures.join("sig-003-did-key-golden.json");
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("conformance: cannot read {}: {e}; skipping", path.display());
+            return;
+        }
+    };
+    let fx: Value = serde_json::from_str(&raw).unwrap();
+    let req_body = fx["vectors"][0]["expected"]["publish_request_body"].clone();
+    assert!(
+        req_body.is_object(),
+        "sig-003 must carry vectors[0].expected.publish_request_body"
+    );
+
+    let post = |app: axum::Router, body: Value| async move {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/contexts")
+                    .header("content-type", "application/acdp+json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let v = body_to_json(resp).await;
+        (status, v)
+    };
+
+    // Advertised → the golden request verifies offline and persists.
+    let accepting = did_key_harness(did_key_caps()).await;
+    let (status, v) = post(accepting, req_body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "sig-003 accept body = {v}");
+    assert!(v["ctx_id"].as_str().is_some_and(|s| !s.is_empty()));
+
+    // dk-003: not advertised → key_resolution_failed, HTTP 400, permanent.
+    let rejecting = did_key_harness(caps()).await;
+    let (status, v) = post(rejecting, req_body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "dk-003 body = {v}");
+    assert_eq!(v["error"]["code"], "key_resolution_failed");
 }

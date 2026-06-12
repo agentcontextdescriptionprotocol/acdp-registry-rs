@@ -41,6 +41,13 @@ pub struct AppStateInner<S: ExtendedRegistryStore> {
     /// writes and grow the nonce store. `None` when
     /// `limits.challenge_rate_per_minute == 0` (disabled).
     pub challenge_rate_limiter: Option<Arc<AgentRateLimiter>>,
+    /// The registry's own `did:web` DID document, served at
+    /// `GET /.well-known/did.json` so consumers can resolve the receipt
+    /// verification key (RFC-ACDP-0010). Precomputed at startup from
+    /// `config.receipt` — `None` when no receipt key is configured (the
+    /// endpoint then 404s). Static for the process lifetime: key rotation
+    /// is a config change + restart.
+    pub registry_did_document: Option<serde_json::Value>,
 }
 
 impl<S: ExtendedRegistryStore> AppStateInner<S> {
@@ -70,6 +77,17 @@ impl<S: ExtendedRegistryStore> AppStateInner<S> {
                 n.saturating_mul(64),
             ))),
         };
+        // Receipt key problems are caught at startup by the binary's
+        // validate_config; if the key still fails to load here, serve no
+        // DID document rather than panic mid-construction (test harnesses
+        // build state without running validate_config first).
+        let registry_did_document = if config.receipt.is_configured() {
+            crate::receipt::build_did_document(&config.receipt, &config.registry.authority)
+                .map_err(|e| tracing::error!(error = %e, "receipt DID document unavailable"))
+                .ok()
+        } else {
+            None
+        };
         Self {
             server,
             auth,
@@ -79,6 +97,7 @@ impl<S: ExtendedRegistryStore> AppStateInner<S> {
             playground,
             rate_limiter,
             challenge_rate_limiter,
+            registry_did_document,
         }
     }
 }

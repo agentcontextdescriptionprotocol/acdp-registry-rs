@@ -1,7 +1,8 @@
 # acdp-registry-rs documentation
 
 Reference documentation for the Agent Context Distribution Protocol (ACDP)
-v0.1.0 registry. Start with the [project README](../README.md) for a quick
+registry (protocol v0.1.0, with v0.2.0 trust-hardening — registry receipts
+and did:key — available when a receipt signing key is configured). Start with the [project README](../README.md) for a quick
 start; these docs go deeper.
 
 ## Map
@@ -14,6 +15,7 @@ start; these docs go deeper.
 | [CONFIGURATION.md](CONFIGURATION.md) | The full config tree — every TOML key, its env-var name, type, and default. |
 | [MULTI-TENANCY.md](MULTI-TENANCY.md) | Tenant resolution precedence, strict mode, agent→tenant bindings, the SQL filter. |
 | [WEBHOOKS.md](WEBHOOKS.md) | Event payloads, the GitHub-compatible signature scheme, delivery and retry semantics. |
+| [RECEIPTS.md](RECEIPTS.md) | ACDP 0.2.0 registry receipts: enabling, serving `/.well-known/did.json`, the key-retention rule, rotation, did:key, the lineage audit. |
 | [OPERATIONS.md](OPERATIONS.md) | Deploying, observability, backup/restore, key rotation, federation ops. |
 
 ## Where the protocol ends and this registry begins

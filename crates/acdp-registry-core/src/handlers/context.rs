@@ -420,6 +420,27 @@ pub async fn publish<S: ExtendedRegistryStore + 'static>(
             .map_err(|e| RegistryError::Internal(format!("join: {e}")))??;
         }
         resp
+    } else if req.agent_id.as_str().starts_with("did:key:") {
+        // did:key producers (ACDP 0.2.0 workstream C): steps 7–8 run
+        // through acdp's pure offline verifier — the DID *is* the key, so
+        // no DID document fetch and no SSRF surface. The capabilities gate
+        // inside the validator rejects with `key_resolution_failed` when
+        // `did:key` is not advertised in `supported_did_methods` (the
+        // anchor-plan / dk-003 pinned behavior). The pipeline is sync, so
+        // it runs on the blocking pool like the store calls.
+        let server2 = server.clone();
+        let req_clone = req.clone();
+        let idem = idempotency_key.clone();
+        let tenant = publish_tenant.clone();
+        tokio::task::spawn_blocking(move || {
+            server2.publish_verified_did_key_in_tenant(
+                &req_clone,
+                idem.as_deref(),
+                tenant.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| RegistryError::Internal(format!("join: {e}")))??
     } else {
         // Production path: full RFC-ACDP-0003 §2.1 pipeline. The resolved
         // tenant is threaded into the atomic commit so `tenant_id` is written
@@ -477,6 +498,18 @@ pub async fn publish<S: ExtendedRegistryStore + 'static>(
                     .map(|c| c.as_str().to_string())
                     .collect(),
                 run_id,
+                // ACDP 0.2.0 workstream B touchpoint: surface the producer
+                // key fingerprint and the minted receipt so the control
+                // plane can correlate without re-fetching the context.
+                // Both come straight off the publish response — absent on
+                // a receipt-less (0.1.0-mode) registry.
+                key_fingerprint: response
+                    .registry_receipt
+                    .as_ref()
+                    .and_then(|r| r.get("key_fingerprint"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                registry_receipt: response.registry_receipt.clone().map(Box::new),
             },
             publish_tenant.clone(),
         );
@@ -542,7 +575,13 @@ pub async fn retrieve<S: ExtendedRegistryStore + 'static>(
                 status: acdp::types::primitives::Status::Active,
                 extensions: Default::default(),
             },
-            registry_receipt: None,
+            // Pass the upstream registry's receipt through verbatim (the
+            // resolver has already verified it — and *required* it when the
+            // upstream advertises `acdp-registry-receipts`, fed-009). The
+            // receipt's `registry_did` binds to the ORIGIN authority, which
+            // matches the ctx_id authority the caller asked for, so
+            // consumers re-verify it against the origin, not this proxy.
+            registry_receipt: verified.inner.registry_receipt.clone(),
             extensions: Default::default(),
         };
         if let Some(emitter) = &state.webhook {

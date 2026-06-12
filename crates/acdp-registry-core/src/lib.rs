@@ -7,6 +7,7 @@
 pub mod handlers;
 pub mod playground;
 pub mod rate_limit;
+pub mod receipt;
 pub mod state;
 
 pub use state::{AppState, AppStateInner};
@@ -71,9 +72,23 @@ pub fn build_router<S: ExtendedRegistryStore + 'static>(state: AppState<S>) -> R
     // and admin/status are operational JSON — none get the acdp+json override.
     let aux = Router::new()
         .route("/.well-known/jwks.json", get(handlers::jwks::<S>))
+        // The registry's own did:web document (receipt verification keys,
+        // RFC-ACDP-0010). Conventional application/json — DID resolvers
+        // don't expect the acdp+json media type here.
+        .route(
+            "/.well-known/did.json",
+            get(handlers::registry_did_document::<S>),
+        )
         .route("/healthz", get(handlers::health::<S>))
         // Admin status (auth-gated by auth.admin_tokens; ships in every build)
-        .route("/admin/status", get(handlers::admin_status::<S>));
+        .route("/admin/status", get(handlers::admin_status::<S>))
+        // Full lineage walk as an on-demand integrity audit (D3) — the
+        // publish path anchors on the immediate predecessor; this is where
+        // the complete chain is still re-checked.
+        .route(
+            "/admin/lineages/:lineage_id/audit",
+            get(handlers::lineage_audit::<S>),
+        );
 
     acdp.merge(aux)
         .merge(admin)

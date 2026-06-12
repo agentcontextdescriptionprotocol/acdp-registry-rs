@@ -10,6 +10,7 @@ The complete inbound surface of `acdp-registry`. Routes are assembled in
 |--------|------|------|------------|
 | GET  | `/.well-known/acdp.json`         | none        | always |
 | GET  | `/.well-known/jwks.json`         | none        | always |
+| GET  | `/.well-known/did.json`          | none        | always (404 unless `[receipt]` configured) |
 | GET  | `/healthz`                       | none        | always |
 | POST | `/contexts`                      | producer signature | always |
 | GET  | `/contexts/{ctx_id}`             | optional bearer | always |
@@ -21,6 +22,7 @@ The complete inbound surface of `acdp-registry`. Routes are assembled in
 | POST | `/auth/token`                    | challenge signature | `auth.enabled` |
 | POST | `/auth/token/revoke`             | bearer      | `auth.enabled` |
 | GET  | `/admin/status`                  | admin bearer | always |
+| GET  | `/admin/lineages/{lineage_id}/audit` | admin bearer | always |
 | GET  | `/admin/contexts`                | admin bearer | `playground` feature |
 | POST | `/admin/pinned-keys/reload`      | admin bearer | `playground` feature |
 
@@ -68,6 +70,11 @@ Capabilities document. `Cache-Control: max-age=300`.
 `supported_did_methods` mirrors `auth.did_methods`; `profiles` mirrors
 `registry.profiles`; `limits` mirrors the `[limits]` config section.
 
+With a `[receipt]` signing key configured (ACDP 0.2.0), `acdp_version`
+becomes `"0.2.0"` and `profiles` additionally carries
+`"acdp-registry-receipts"`. `supported_did_methods` may include `"did:key"`
+when enabled via `auth.did_methods`.
+
 ### `GET /.well-known/jwks.json`
 
 JSON Web Key Set for verifying this registry's JWTs. `Cache-Control:
@@ -81,6 +88,16 @@ max-age=300`, `Content-Type: application/jwk-set+json`.
 - **HS256 mode** — `{ "keys": [] }`. Symmetric secrets are never published.
 
 See [AUTHENTICATION.md](AUTHENTICATION.md#signing-algorithms).
+
+### `GET /.well-known/did.json` *(ACDP 0.2.0)*
+
+The registry's own `did:web` DID document, generated from `[receipt]` —
+this is where consumers resolve the receipt verification key
+(`did:web:<authority>` resolves to exactly this URL). The active signing
+key appears in `verificationMethod` **and** `assertionMethod`; retired keys
+(`[[receipt.retired_keys]]`) appear in `verificationMethod` only, per the
+RFC-ACDP-0010 §9 retention rule. `Cache-Control: max-age=300`. `404` when no
+receipt key is configured. See [RECEIPTS.md](RECEIPTS.md).
 
 ### `GET /healthz`
 
@@ -106,9 +123,15 @@ Request headers:
 | `X-Tenant-Id`     | optional | Tenant fallback; see [MULTI-TENANCY.md](MULTI-TENANCY.md). For writes the producer's `[[auth.tenant_agents]]` binding is authoritative. |
 
 Body: an RFC-ACDP-0003 `PublishRequest` (JSON). Response: `200` with a
-`PublishResponse` (assigned `ctx_id`, `lineage_id`, `version`, `status`). A
+`PublishResponse` (assigned `ctx_id`, `lineage_id`, `version`, `status`, and —
+on a receipts-advertising registry — the top-level `registry_receipt`, the
+signed RFC-ACDP-0010 attestation minted atomically with the row). A
 per-agent rate limit (`limits.publish_rate_per_minute`, default 60) is checked
 before the expensive verify — `429` + `Retry-After` when drained.
+
+did:key producers (ACDP 0.2.0) are verified **offline** — no DID-document
+fetch — when `"did:key"` is in `supported_did_methods`; otherwise the publish
+is rejected with `key_resolution_failed` (400, permanent).
 
 ### `GET /contexts/{ctx_id}`
 
@@ -120,9 +143,16 @@ request is resolved against the foreign registry anonymously — only remote
 `public` contexts are surfaced (see
 [OPERATIONS.md](OPERATIONS.md#cross-registry-federation)).
 
+On a receipts-advertising registry the response carries the top-level
+`registry_receipt` member (outside `body` and `registry_state`); contexts
+published before receipts were enabled omit it (no backfill — see
+[RECEIPTS.md](RECEIPTS.md)). Foreign retrievals pass the upstream's verified
+receipt through verbatim.
+
 ### `GET /contexts/{ctx_id}/body`
 
-As above, but returns only the context `Body` (no envelope metadata).
+As above, but returns only the context `Body` (no envelope metadata, and
+never `registry_receipt` — the immutable-cache story is unchanged).
 
 ### `GET /contexts/search`
 
@@ -234,6 +264,29 @@ Operational snapshot. Always shipped.
 
 `idempotency.records` and the webhook queue fields are `null` when the backend
 doesn't track them.
+
+### `GET /admin/lineages/{lineage_id}/audit` *(ACDP 0.2.0)*
+
+Full lineage walk as an on-demand integrity check (workstream D3): the
+publish path validates only against the immediate predecessor's persisted
+row (lineage anchoring); this endpoint re-walks the entire chain. Always
+shipped.
+
+```json
+{
+  "lineage_id": "lin:sha256:…",
+  "versions": 4,
+  "ok": true,
+  "issues": [],
+  "receiptless_contexts": 1
+}
+```
+
+Checks: version contiguity from 1, `supersedes` links, the `lineage_id`
+derivation from v1's `ctx_id`, producer continuity, and the
+single-non-superseded-tip invariant. `receiptless_contexts` counts rows
+without a stored receipt (informational — pre-receipts history is
+legitimate; see [RECEIPTS.md](RECEIPTS.md)). `404` for an unknown lineage.
 
 ### `GET /admin/contexts` *(playground feature)*
 
