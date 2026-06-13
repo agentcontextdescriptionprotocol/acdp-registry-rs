@@ -767,10 +767,7 @@ mod tests {
         // RFC-ACDP-0010 §7/§11: advertising the profile without a signing key
         // is a false capability claim — must fail startup.
         let mut cfg = RegistryConfig::defaults();
-        cfg.registry.profiles = vec![
-            "acdp-registry-core".into(),
-            "acdp-registry-receipts".into(),
-        ];
+        cfg.registry.profiles = vec!["acdp-registry-core".into(), "acdp-registry-receipts".into()];
         let err = validate_config(&cfg)
             .expect_err("receipts profile without a receipt key must be refused");
         assert!(
