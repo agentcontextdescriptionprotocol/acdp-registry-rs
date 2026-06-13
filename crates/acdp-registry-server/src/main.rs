@@ -136,6 +136,46 @@ fn validate_config(cfg: &RegistryConfig) -> anyhow::Result<()> {
         );
     }
 
+    // ACDP 0.2.0: validate the DID methods this registry will advertise.
+    // The publish validator gates on `supported_did_methods`, so an entry
+    // the pipeline can't actually verify would advertise a capability the
+    // registry silently fails to honor.
+    for method in &cfg.auth.did_methods {
+        match method.as_str() {
+            "did:web" | "did:key" => {}
+            other => anyhow::bail!(
+                "auth.did_methods contains unsupported method '{other}'; \
+                 this registry can verify 'did:web' and 'did:key'"
+            ),
+        }
+    }
+    if !cfg.auth.did_methods.iter().any(|m| m == "did:web") {
+        anyhow::bail!("auth.did_methods must include 'did:web' (mandatory per RFC-ACDP-0007 §3.1)");
+    }
+
+    // ACDP 0.2.0: receipt signing identity (RFC-ACDP-0010). Parse the key
+    // at startup — a registry must never lazily discover a bad receipt key
+    // on its first publish, because advertising the receipts profile is a
+    // hard commitment with no degraded mode.
+    if cfg.receipt.is_configured() {
+        if cfg.playground.enabled {
+            anyhow::bail!(
+                "playground.enabled is incompatible with [receipt]: a receipts-advertising \
+                 registry has no unverified publish path (RFC-ACDP-0010 §7: no degraded mode, \
+                 and the playground never resolves the producer key a receipt must attest). \
+                 Disable one of the two."
+            );
+        }
+        acdp_registry_core::receipt::build_signer(&cfg.receipt, &cfg.registry.authority)
+            .map_err(|e| anyhow::anyhow!("receipt: {e}"))?;
+        // Also build the DID document up front: it additionally validates
+        // every `[[receipt.retired_keys]]` entry. A malformed retired key
+        // must fail startup, not silently 404 `/.well-known/did.json`
+        // while capabilities keep advertising the receipts profile.
+        acdp_registry_core::receipt::build_did_document(&cfg.receipt, &cfg.registry.authority)
+            .map_err(|e| anyhow::anyhow!("receipt: {e}"))?;
+    }
+
     // SEC: refuse an insecure default deployment — a non-loopback bind with
     // BOTH TLS and auth disabled exposes an unauthenticated, plaintext registry
     // on every interface. Require an explicit opt-in (the operator asserting a
@@ -305,6 +345,25 @@ async fn serve_with_store<S: ExtendedRegistryStore + 'static>(
     let caps = build_capabilities(&cfg);
     let server = RegistryServer::try_new(store, caps, cfg.registry.authority.clone())
         .map_err(|e| anyhow::anyhow!("registry server: {e}"))?;
+    // ACDP 0.2.0 / RFC-ACDP-0010: attach the receipt signer. From here on
+    // every verified publish mints a receipt inside the store transaction,
+    // and `with_receipt_signer` adds the `acdp-registry-receipts` profile
+    // to the advertised capabilities (it requires the 0.2.0 version bump
+    // performed by `build_capabilities` above).
+    let server = if cfg.receipt.is_configured() {
+        let signer =
+            acdp_registry_core::receipt::build_signer(&cfg.receipt, &cfg.registry.authority)
+                .map_err(|e| anyhow::anyhow!("receipt: {e}"))?;
+        tracing::info!(
+            registry_did = %signer.registry_did(),
+            "receipt signing enabled — advertising acdp-registry-receipts"
+        );
+        server
+            .with_receipt_signer(signer)
+            .map_err(|e| anyhow::anyhow!("receipt signer: {e}"))?
+    } else {
+        server
+    };
     let server = Arc::new(server);
 
     // Auth.
@@ -477,7 +536,15 @@ fn spawn_shutdown_watcher(handle: axum_server::Handle) {
 
 fn build_capabilities(cfg: &RegistryConfig) -> CapabilitiesDocument {
     CapabilitiesDocument {
-        acdp_version: "0.1.0".into(),
+        // Plan A4: the 0.2.0 version claim is gated on the receipt signer
+        // being configured, exactly like the receipts profile (which
+        // `with_receipt_signer` appends and which requires >= 0.2.0).
+        // A key-less deployment keeps the 0.1.0 claim it actually honors.
+        acdp_version: if cfg.receipt.is_configured() {
+            "0.2.0".into()
+        } else {
+            "0.1.0".into()
+        },
         registry_did: authority_to_did_web(&cfg.registry.authority),
         supported_signature_algorithms: vec!["ed25519".into()],
         supported_did_methods: cfg.auth.did_methods.clone(),
@@ -619,6 +686,70 @@ mod tests {
         assert!(!is_loopback_bind("0.0.0.0"));
         assert!(!is_loopback_bind("::"));
         assert!(!is_loopback_bind("10.0.0.5"));
+    }
+
+    // ACDP 0.2.0 — receipt + did:key startup validation.
+
+    #[test]
+    fn receipt_with_playground_is_rejected() {
+        use base64::Engine as _;
+        let mut cfg = RegistryConfig::defaults();
+        cfg.receipt.signing_key_seed_b64 =
+            base64::engine::general_purpose::STANDARD.encode([5u8; 32]);
+        cfg.playground.enabled = true;
+        let err = validate_config(&cfg).expect_err("playground + receipts must be refused");
+        assert!(err.to_string().contains("no degraded mode"));
+        cfg.playground.enabled = false;
+        assert!(validate_config(&cfg).is_ok(), "receipts alone are fine");
+    }
+
+    #[test]
+    fn malformed_receipt_seed_fails_startup() {
+        let mut cfg = RegistryConfig::defaults();
+        cfg.receipt.signing_key_seed_b64 = "not-base64!!".into();
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn malformed_retired_receipt_key_fails_startup() {
+        use base64::Engine as _;
+        let mut cfg = RegistryConfig::defaults();
+        cfg.receipt.signing_key_seed_b64 =
+            base64::engine::general_purpose::STANDARD.encode([5u8; 32]);
+        cfg.receipt.retired_keys = vec![acdp_registry_types::RetiredReceiptKey {
+            public_key_b64: "not-base64!!".into(),
+            key_id_fragment: "receipt-key-0".into(),
+        }];
+        assert!(
+            validate_config(&cfg).is_err(),
+            "a bad retired key must fail startup, not silently 404 did.json"
+        );
+        cfg.receipt.retired_keys[0].public_key_b64 =
+            base64::engine::general_purpose::STANDARD.encode([6u8; 32]);
+        cfg.receipt.retired_keys[0].key_id_fragment = "has#hash".into();
+        assert!(
+            validate_config(&cfg).is_err(),
+            "a '#' in a retired fragment must fail startup"
+        );
+        cfg.receipt.retired_keys[0].key_id_fragment = "receipt-key-0".into();
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn did_methods_are_validated() {
+        let mut cfg = RegistryConfig::defaults();
+        cfg.auth.did_methods = vec!["did:web".into(), "did:key".into()];
+        assert!(validate_config(&cfg).is_ok());
+        cfg.auth.did_methods = vec!["did:key".into()];
+        assert!(
+            validate_config(&cfg).is_err(),
+            "did:web is mandatory per RFC-ACDP-0007 §3.1"
+        );
+        cfg.auth.did_methods = vec!["did:web".into(), "did:ion".into()];
+        assert!(
+            validate_config(&cfg).is_err(),
+            "methods the pipeline can't verify must be refused"
+        );
     }
 
     // #17 — multi-tenant config must enforce strict tenant scoping.

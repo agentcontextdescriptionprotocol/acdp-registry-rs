@@ -40,6 +40,11 @@ The binary validates config before serving and refuses to boot on a misconfig
 - **Bind safety** — a non-loopback `bind` with neither TLS nor auth requires an
   explicit `allow_public_bind = true`.
 - **TLS** — when `tls.enabled`, `cert_path` and `key_path` must exist on disk.
+- **DID methods** — `auth.did_methods` entries must be `did:web` or `did:key`,
+  and `did:web` must be present (RFC-ACDP-0007 §3.1).
+- **Receipts** — a configured `[receipt]` key must parse (exactly one source,
+  valid base64, 32 bytes), and is incompatible with `playground.enabled`
+  (RFC-ACDP-0010 §7: a receipts registry has no unverified publish path).
 
 ## Reference
 
@@ -174,3 +179,29 @@ Repeatable.
 
 Hot-reload the `[playground]` section with `POST /admin/pinned-keys/reload`
 (playground feature) — see [HTTP-API.md](HTTP-API.md#post-adminpinned-keysreload).
+
+### `[receipt]` *(ACDP 0.2.0)*
+
+Registry-receipt signing identity (RFC-ACDP-0010). Configuring a key enables
+receipt minting, the `acdp-registry-receipts` profile, the `acdp_version:
+0.2.0` capability claim, and `GET /.well-known/did.json`. Leave unset to stay
+a 0.1.0 receipt-less registry. See [RECEIPTS.md](RECEIPTS.md) for the
+operator runbook (rotation, retention, backfill policy).
+
+| Key | Type | Default | Notes |
+|-----|------|---------|-------|
+| `signing_key_seed_b64` | string | `""` | Standard base64 of the raw 32-byte Ed25519 seed. Exactly one of the two key sources may be set. |
+| `signing_key_path` | path | — | File (e.g. mounted secret) whose contents are that base64 string. |
+| `key_id_fragment` | string | `receipt-key-1` | Fragment under the registry DID; `signature.key_id = did:web:<authority>#<fragment>`. Pick a fresh fragment per rotation. |
+
+#### `[[receipt.retired_keys]]`
+
+Repeatable. Rotated-out receipt keys, published in the DID document's
+`verificationMethod` only (never `assertionMethod`). **Removing an entry
+bricks every receipt that key signed** — RFC-ACDP-0010 §9 retains retired
+keys indefinitely; remove only on confirmed compromise.
+
+| Key | Type | Default | Notes |
+|-----|------|---------|-------|
+| `public_key_b64` | string | — | Standard base64 of the raw 32-byte Ed25519 **public** key. |
+| `key_id_fragment` | string | — | The fragment the key was published under while active. |

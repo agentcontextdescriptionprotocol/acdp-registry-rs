@@ -5,9 +5,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this workspace is
 
 `acdp-registry-rs` is the reference **registry** for the Agent Context
-Distribution Protocol v0.1.0. It is an 8-crate Cargo workspace built on top of
-[`acdp`](https://crates.io/crates/acdp) (the protocol library), consumed as a
-crates.io dependency.
+Distribution Protocol (v0.1.0, plus the v0.2.0 trust-hardening surface —
+registry receipts and did:key — activated when a `[receipt]` signing key is
+configured). It is an 8-crate Cargo workspace built on top of
+[`acdp`](https://crates.io/crates/acdp) (the protocol library), currently
+consumed as a **git dependency pinned to the acdp-rs 0.2.0 branch**
+(`feat/acdp-0.2-trust-hardening`); switch back to crates.io once `acdp 0.2.0`
+is published.
 
 The HTTP layer is `axum 0.7`, storage is `sqlx 0.8` (Postgres + SQLite), and
 authentication is a DID challenge-response → JWT design (HS256 by default,
@@ -51,7 +55,7 @@ ACDP_REGISTRY_CONFIG=config/registry.example.toml cargo run -p acdp-registry-ser
 | `acdp-registry-sqlite`      | SQLite backend (FTS5 virtual table; arrays as JSON-encoded TEXT). |
 | `acdp-registry-auth`        | DID challenge → JWT (HS256 or EdDSA); tenant-bound claims, revocation store + cursors, cross-issuer revocation pollers. Reuses `acdp::did::WebResolver` and `verify_ed25519`. |
 | `acdp-registry-webhook`     | HMAC-SHA256-signed POSTs over a bounded mpsc channel. |
-| `acdp-registry-core`        | axum router + handlers, generic over `S: ExtendedRegistryStore`. |
+| `acdp-registry-core`        | axum router + handlers, generic over `S: ExtendedRegistryStore`; `receipt` module loads the receipt key and generates the registry DID document. |
 | `acdp-registry-server`      | Binary (`acdp-registry`): feature flags select the storage backend at compile time. |
 
 ## Feature flags (server / core)
@@ -77,11 +81,38 @@ runtime by `auth.admin_tokens`.
   wrap sync calls in `tokio::task::spawn_blocking`.
 - `acdp-registry-core` is **generic** over the store, not boxed. The server
   binary monomorphizes the type when constructing `Arc<RegistryServer<S>>`.
-- The publish pipeline reuses `RegistryServer::publish_verified` from
-  `acdp::registry::server` — we add storage adapters, NOT a parallel validator.
+- The publish pipeline reuses `RegistryServer::publish_verified_in_tenant` /
+  `publish_verified_did_key_in_tenant` from `acdp::registry::server` — we add
+  storage adapters, NOT a parallel validator. The publish handler routes
+  `did:key:` producers to the offline (resolver-free) variant.
 - DID verification reuses `acdp`'s `WebResolver` (LRU-cached, SSRF-policy-gated)
   for both publish AND auth-challenge verification. There is intentionally only
   one resolver per server instance.
+
+## Registry receipts (ACDP 0.2.0 / RFC-ACDP-0010)
+
+- A configured `[receipt]` key (Ed25519 seed; `acdp-registry-core::receipt`
+  loads it) flips the registry to 0.2.0: `with_receipt_signer` on the
+  `RegistryServer`, `acdp_version: "0.2.0"` + the `acdp-registry-receipts`
+  profile in capabilities, and `GET /.well-known/did.json` (the registry's
+  own DID document, generated from `[receipt]`).
+- Atomicity is **structural**: the store's `commit_publish` invokes
+  `PublishCommit::receipt_minter` inside the transaction and writes the
+  receipt in the SAME `INSERT INTO contexts` as the row (`registry_receipt`
+  column, pg migration 008 / sqlite 009). Never split that into a second
+  statement — a context must not be observable without its receipt.
+- The receipt surfaces top-level in the publish response and
+  `GET /contexts/{ctx_id}` — never in `/contexts/{ctx_id}/body`.
+- No backfill: pre-receipts contexts stay receipt-less (a receipt attests
+  publish-time key resolution; minting later would be a false attestation).
+- `playground.enabled` + `[receipt]` is refused at startup (no unverified
+  publish path on a receipts registry — RFC-ACDP-0010 §7).
+- Key retention (§9 MUST): rotated receipt keys stay in `verificationMethod`
+  forever via `[[receipt.retired_keys]]`; rotation removes them from
+  `assertionMethod` only. See `docs/RECEIPTS.md`.
+- Lineage anchoring (D3): the publish path validates against the immediate
+  predecessor's persisted row only; the full walk lives in
+  `GET /admin/lineages/{lineage_id}/audit`.
 
 ## Conventions
 

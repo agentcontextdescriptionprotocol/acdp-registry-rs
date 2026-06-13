@@ -167,7 +167,8 @@ impl ExtendedRegistryStore for SqliteStore {
     ) -> Result<Page<FullContext>, AcdpError> {
         let limit = limit.clamp(1, 200) as i64;
         let anchor = cursor.map(decode_cursor).transpose()?.flatten();
-        let mut sql = String::from("SELECT body_json, status FROM contexts WHERE 1=1");
+        let mut sql =
+            String::from("SELECT body_json, status, registry_receipt FROM contexts WHERE 1=1");
         // Plan §7: push the tenant filter into SQL so a busy
         // mixed-tenant registry doesn't return short pages caused by a
         // post-query retain. The `idx_ctx_tenant_created` index lets
@@ -216,15 +217,11 @@ impl ExtendedRegistryStore for SqliteStore {
         // fix already in `search`.
         let mut last_scanned: Option<(i64, String)> = None;
         for r in rows.iter().take(limit as usize) {
-            let body_json: String = r.try_get("body_json").map_err(map_sqlx_err)?;
-            let status: String = r.try_get("status").map_err(map_sqlx_err)?;
-            let body: Body = serde_json::from_str(&body_json)
-                .map_err(|e| AcdpError::RegistryInternal(format!("decode body: {e}")))?;
+            let ctx = row_to_context(r)?;
             last_scanned = Some((
-                body.created_at.timestamp_millis(),
-                body.ctx_id.as_str().to_string(),
+                ctx.body.created_at.timestamp_millis(),
+                ctx.body.ctx_id.as_str().to_string(),
             ));
-            let ctx = full_context(body, parse_status(&status));
             if visible_to(&ctx, requester) {
                 items.push(ctx);
             }
@@ -265,7 +262,7 @@ impl RegistryStore for SqliteStore {
                 .begin()
                 .await
                 .map_err(|e| AcdpError::RegistryInternal(format!("tx begin: {e}")))?;
-            insert_body(&mut tx, &body, Status::Active, None).await?;
+            insert_body(&mut tx, &body, Status::Active, None, None).await?;
             tx.commit()
                 .await
                 .map_err(|e| AcdpError::RegistryInternal(format!("tx commit: {e}")))?;
@@ -275,19 +272,17 @@ impl RegistryStore for SqliteStore {
 
     fn get(&self, ctx_id: &CtxId) -> Result<Option<FullContext>, AcdpError> {
         self.block_on(async {
-            let row = sqlx::query("SELECT body_json, status FROM contexts WHERE ctx_id = ?")
-                .bind(ctx_id.as_str())
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(map_sqlx_err)?;
+            let row = sqlx::query(
+                "SELECT body_json, status, registry_receipt FROM contexts WHERE ctx_id = ?",
+            )
+            .bind(ctx_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx_err)?;
             let Some(row) = row else {
                 return Ok(None);
             };
-            let body_json: String = row.try_get("body_json").map_err(map_sqlx_err)?;
-            let status: String = row.try_get("status").map_err(map_sqlx_err)?;
-            let body: Body = serde_json::from_str(&body_json)
-                .map_err(|e| AcdpError::RegistryInternal(format!("decode body: {e}")))?;
-            let ctx = full_context(body, parse_status(&status));
+            let ctx = row_to_context(&row)?;
             Ok(Some(project_context(ctx, Utc::now())))
         })
     }
@@ -295,7 +290,7 @@ impl RegistryStore for SqliteStore {
     fn lineage(&self, lineage_id: &LineageId) -> Result<Vec<FullContext>, AcdpError> {
         self.block_on(async {
             let rows = sqlx::query(
-                "SELECT body_json, status FROM contexts \
+                "SELECT body_json, status, registry_receipt FROM contexts \
                  WHERE lineage_id = ? \
                  ORDER BY version ASC, created_at ASC",
             )
@@ -306,14 +301,7 @@ impl RegistryStore for SqliteStore {
             let now = Utc::now();
             let mut out = Vec::with_capacity(rows.len());
             for r in rows {
-                let body_json: String = r.try_get("body_json").map_err(map_sqlx_err)?;
-                let status: String = r.try_get("status").map_err(map_sqlx_err)?;
-                let body: Body = serde_json::from_str(&body_json)
-                    .map_err(|e| AcdpError::RegistryInternal(format!("decode body: {e}")))?;
-                out.push(project_context(
-                    full_context(body, parse_status(&status)),
-                    now,
-                ));
+                out.push(project_context(row_to_context(&r)?, now));
             }
             Ok(out)
         })
@@ -441,6 +429,7 @@ impl RegistryStore for SqliteStore {
             authority,
             idempotency,
             tenant,
+            receipt_minter,
         } = commit;
         let now = Utc::now();
         let req = req.clone();
@@ -664,8 +653,25 @@ impl RegistryStore for SqliteStore {
                 extensions: Default::default(),
             };
 
+            // 4.5. Mint the registry receipt (RFC-ACDP-0010 §7) inside the
+            // transaction, against the fully-assigned body. The receipt is
+            // written by the SAME INSERT as the context row below, so a
+            // context can never be observed without its receipt — minting
+            // failure aborts the whole publish (tx drop = rollback).
+            let receipt: Option<serde_json::Value> = match receipt_minter {
+                Some(mint) => Some(mint(&body)?),
+                None => None,
+            };
+
             // 5. Insert the new body.
-            insert_body(&mut tx, &body, Status::Active, tenant.as_deref()).await?;
+            insert_body(
+                &mut tx,
+                &body,
+                Status::Active,
+                tenant.as_deref(),
+                receipt.as_ref(),
+            )
+            .await?;
 
             // 6. Mark predecessor superseded.
             if let Some(prev) = &req.supersedes {
@@ -682,6 +688,7 @@ impl RegistryStore for SqliteStore {
                 version: req.version,
                 created_at,
                 status: Status::Active,
+                registry_receipt: receipt,
             };
 
             // 7. Record idempotency — this INSERT is the concurrency gate
@@ -866,7 +873,9 @@ impl RegistryStore for SqliteStore {
                 let status: String = row.try_get("status").map_err(map_sqlx_err)?;
                 let body: Body = serde_json::from_str(&body_json)
                     .map_err(|e| AcdpError::RegistryInternal(format!("decode body: {e}")))?;
-                let mut ctx = full_context(body, parse_status(&status));
+                // Receipts aren't projected into SearchResult rows, so the
+                // search SELECT deliberately skips the column.
+                let mut ctx = full_context(body, parse_status(&status), None);
                 ctx.registry_state.status =
                     project_status_inline(&ctx.registry_state.status, ctx.body.expires_at, now);
                 last_scanned = Some((
@@ -962,6 +971,7 @@ async fn insert_body<'c>(
     body: &Body,
     status: Status,
     tenant: Option<&str>,
+    receipt: Option<&serde_json::Value>,
 ) -> Result<(), AcdpError> {
     let body_json = serde_json::to_string(body)
         .map_err(|e| AcdpError::RegistryInternal(format!("encode body: {e}")))?;
@@ -982,13 +992,20 @@ async fn insert_body<'c>(
     // separate, non-transactional UPDATE — a crash/error in between stranded
     // the context in the 'default' (untenanted) bucket permanently.
     let tenant_id = tenant.unwrap_or("default");
+    // RFC-ACDP-0010 §7: the receipt rides the SAME INSERT as the context row,
+    // so receipt-and-context atomicity is structural, not transactional
+    // bookkeeping a refactor could break.
+    let receipt_json = receipt
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| AcdpError::RegistryInternal(format!("encode receipt: {e}")))?;
     sqlx::query(
         "INSERT INTO contexts (\
             ctx_id, lineage_id, agent_id, contributors, origin_registry, \
             created_at, status, visibility, context_type, version, supersedes, \
             title, description, summary, domain, tags, expires_at, content_hash, body_json, \
-            tenant_id\
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            tenant_id, registry_receipt\
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(body.ctx_id.as_str())
     .bind(body.lineage_id.as_str())
@@ -1010,6 +1027,7 @@ async fn insert_body<'c>(
     .bind(body.content_hash.0.as_str())
     .bind(body_json)
     .bind(tenant_id)
+    .bind(receipt_json)
     .execute(&mut **tx)
     .await
     .map_err(map_sqlx_err)?;
@@ -1030,16 +1048,32 @@ async fn insert_body<'c>(
     Ok(())
 }
 
-fn full_context(body: Body, status: Status) -> FullContext {
+fn full_context(body: Body, status: Status, receipt: Option<serde_json::Value>) -> FullContext {
     FullContext {
         body,
         registry_state: RegistryState {
             status,
             extensions: Default::default(),
         },
-        registry_receipt: None,
+        registry_receipt: receipt,
         extensions: Default::default(),
     }
+}
+
+/// Decode one `body_json, status, registry_receipt` row into a
+/// [`FullContext`]. The receipt column is TEXT (JSON) and nullable —
+/// `None` for contexts published before receipts were enabled.
+fn row_to_context(r: &sqlx::sqlite::SqliteRow) -> Result<FullContext, AcdpError> {
+    let body_json: String = r.try_get("body_json").map_err(map_sqlx_err)?;
+    let status: String = r.try_get("status").map_err(map_sqlx_err)?;
+    let receipt_raw: Option<String> = r.try_get("registry_receipt").map_err(map_sqlx_err)?;
+    let body: Body = serde_json::from_str(&body_json)
+        .map_err(|e| AcdpError::RegistryInternal(format!("decode body: {e}")))?;
+    let receipt = receipt_raw
+        .map(|s| serde_json::from_str(&s))
+        .transpose()
+        .map_err(|e| AcdpError::RegistryInternal(format!("decode receipt: {e}")))?;
+    Ok(full_context(body, parse_status(&status), receipt))
 }
 
 /// DESIGN-04: typed accessor for the wire-form of `ContextType`. The prior
@@ -1321,6 +1355,7 @@ mod tests {
                         ttl: chrono::Duration::hours(1),
                     }),
                     tenant: None,
+                    receipt_minter: None,
                 })
             })
         };
@@ -1395,6 +1430,7 @@ mod tests {
                 authority: "reg.test",
                 idempotency: None,
                 tenant: Some("tenant-x"),
+                receipt_minter: None,
             })
         })
         .await
@@ -1455,6 +1491,7 @@ mod tests {
                 authority: "reg.test",
                 idempotency: None,
                 tenant: Some("tenant-a"),
+                receipt_minter: None,
             })
         })
         .await
@@ -1487,6 +1524,7 @@ mod tests {
                 authority: "reg.test",
                 idempotency: None,
                 tenant: Some("tenant-b"),
+                receipt_minter: None,
             })
         })
         .await
@@ -1510,6 +1548,7 @@ mod tests {
                 authority: "reg.test",
                 idempotency: None,
                 tenant: Some("tenant-a"),
+                receipt_minter: None,
             })
         })
         .await
@@ -1518,5 +1557,174 @@ mod tests {
             ok.is_ok(),
             "same-tenant supersession must succeed, got {ok:?}"
         );
+    }
+
+    /// RFC-ACDP-0010 §7 crash-consistency: a failing receipt minter must
+    /// abort the WHOLE publish — no context row, no idempotency record. A
+    /// crash between "insert context" and "mint receipt" is structurally
+    /// unobservable because both ride one INSERT in one transaction; this
+    /// test pins the only seam left (the minter erroring mid-transaction).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn receipt_minter_failure_aborts_the_whole_publish() {
+        use crate::SqliteStore;
+        use acdp::crypto::SigningKey;
+        use acdp::producer::Producer;
+        use acdp::registry::store::{PendingIdempotencyCommit, PublishCommit, RegistryStore};
+        use acdp::types::primitives::{AgentDid, ContextType, Visibility};
+        use acdp_registry_store::ExtendedRegistryStore;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = SqliteStore::connect(tmp.path(), 2).await.unwrap();
+        store.migrate().await.unwrap();
+
+        let p = Producer::new(
+            SigningKey::from_bytes(&[21u8; 32]),
+            AgentDid::new("did:web:agents.test:mintfail".to_string()),
+            "did:web:agents.test:mintfail#key-1".to_string(),
+        );
+        let req = p
+            .publish_request()
+            .title("doomed")
+            .context_type(ContextType::DataSnapshot)
+            .visibility(Visibility::Public)
+            .build()
+            .unwrap();
+
+        let s = store.clone();
+        let failing_minter = |_: &acdp::types::body::Body| {
+            Err(acdp::error::AcdpError::RegistryInternal(
+                "simulated KMS outage".into(),
+            ))
+        };
+        let outcome = tokio::task::spawn_blocking(move || {
+            s.commit_publish(PublishCommit {
+                req: &req,
+                authority: "reg.test",
+                idempotency: Some(PendingIdempotencyCommit {
+                    key: "mintfail-key",
+                    ttl: chrono::Duration::hours(1),
+                }),
+                tenant: None,
+                receipt_minter: Some(&failing_minter),
+            })
+        })
+        .await
+        .unwrap();
+        assert!(outcome.is_err(), "minting failure must fail the publish");
+
+        let page = store.list_contexts(100, None, None, None).await.unwrap();
+        assert!(
+            page.items.is_empty(),
+            "no context row may survive a failed receipt mint"
+        );
+        assert_eq!(
+            store.count_idempotency_records().await.unwrap(),
+            Some(0),
+            "no idempotency record may survive a failed receipt mint"
+        );
+    }
+
+    /// Receipts persist atomically with the row and round-trip on every
+    /// read path: the publish response, `get`, and `lineage`. Receipt
+    /// fields minted from the assigned body equal the row's identifiers
+    /// byte-for-byte, and every version in a receipts-era lineage carries
+    /// exactly one receipt.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn receipt_round_trips_through_publish_get_and_lineage() {
+        use crate::SqliteStore;
+        use acdp::crypto::SigningKey;
+        use acdp::producer::Producer;
+        use acdp::registry::store::{PublishCommit, PublishCommitOutcome, RegistryStore};
+        use acdp::types::primitives::{AgentDid, ContextType, Visibility};
+        use acdp_registry_store::ExtendedRegistryStore;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = SqliteStore::connect(tmp.path(), 2).await.unwrap();
+        store.migrate().await.unwrap();
+
+        let p = Producer::new(
+            SigningKey::from_bytes(&[22u8; 32]),
+            AgentDid::new("did:web:agents.test:rcpt".to_string()),
+            "did:web:agents.test:rcpt#key-1".to_string(),
+        );
+        // Minter mirroring the shape acdp's ReceiptSigner emits, built
+        // from the body the store hands back — so equality below proves
+        // the store invoked it against the FINAL assigned identifiers.
+        let minter = |body: &acdp::types::body::Body| {
+            Ok(serde_json::json!({
+                "ctx_id": body.ctx_id.as_str(),
+                "lineage_id": body.lineage_id.as_str(),
+                "origin_registry": body.origin_registry,
+                "content_hash": body.content_hash.0,
+            }))
+        };
+
+        let publish = |req: acdp::types::publish::PublishRequest| {
+            let s = store.clone();
+            tokio::task::spawn_blocking(move || {
+                s.commit_publish(PublishCommit {
+                    req: &req,
+                    authority: "reg.test",
+                    idempotency: None,
+                    tenant: None,
+                    receipt_minter: Some(&minter),
+                })
+            })
+        };
+
+        let v1 = p
+            .publish_request()
+            .title("rcpt-v1")
+            .context_type(ContextType::DataSnapshot)
+            .visibility(Visibility::Public)
+            .build()
+            .unwrap();
+        let r1 = match publish(v1).await.unwrap().unwrap() {
+            PublishCommitOutcome::Inserted(r) => r,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+        let receipt = r1
+            .registry_receipt
+            .clone()
+            .expect("publish response carries the minted receipt");
+        assert_eq!(receipt["ctx_id"], r1.ctx_id.as_str());
+        assert_eq!(receipt["lineage_id"], r1.lineage_id.as_str());
+
+        // get() surfaces the same stored receipt.
+        let s = store.clone();
+        let ctx_id = r1.ctx_id.clone();
+        let fetched = tokio::task::spawn_blocking(move || s.get(&ctx_id))
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("context exists");
+        assert_eq!(fetched.registry_receipt, Some(receipt));
+
+        // v2 supersession also mints; the whole lineage is receipt-complete.
+        let v2 = p
+            .supersede(r1.ctx_id.clone())
+            .version(2)
+            .title("rcpt-v2")
+            .context_type(ContextType::DataSnapshot)
+            .visibility(Visibility::Public)
+            .build()
+            .unwrap();
+        publish(v2).await.unwrap().unwrap();
+
+        let s = store.clone();
+        let lid = r1.lineage_id.clone();
+        let chain = tokio::task::spawn_blocking(move || s.lineage(&lid))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(chain.len(), 2);
+        for ctx in &chain {
+            let rcpt = ctx
+                .registry_receipt
+                .as_ref()
+                .expect("every receipts-era context carries exactly one receipt");
+            assert_eq!(rcpt["ctx_id"], ctx.body.ctx_id.as_str());
+            assert_eq!(rcpt["lineage_id"], ctx.body.lineage_id.as_str());
+        }
     }
 }

@@ -5,8 +5,7 @@ version = 4
 [[package]]
 name = "acdp"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7b15bc801b29bb205fc0b45b1babf32ecb58af3d3ef3972bb996fadcbfb6509"
+source = "git+https://github.com/agentcontextdistributionprotocol/acdp-rs.git?rev=77f5f7f915c144106f6de2b13a6cd18e470a9ceb#77f5f7f915c144106f6de2b13a6cd18e470a9ceb"
 dependencies = [
  "base64",
  "bs58",
@@ -68,6 +67,7 @@ dependencies = [
  "http",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tower 0.4.13",
  "tower-http 0.5.2",

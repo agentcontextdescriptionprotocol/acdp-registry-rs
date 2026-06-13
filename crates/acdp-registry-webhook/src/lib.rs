@@ -310,6 +310,8 @@ mod tests {
             created_at: Utc::now(),
             derived_from: Vec::new(),
             run_id: None,
+            key_fingerprint: None,
+            registry_receipt: None,
         }
     }
 

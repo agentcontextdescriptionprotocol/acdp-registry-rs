@@ -40,6 +40,11 @@ max_connections = 20
 
 [auth]
 enabled              = true
+# DID methods accepted from publishing producers, advertised as
+# `supported_did_methods`. `did:web` is mandatory; add `did:key` to accept
+# self-certifying did:key producers (ACDP 0.2.0, workstream C) — their
+# signatures verify offline from the DID itself, no document fetch:
+#   did_methods = ["did:web", "did:key"]
 did_methods          = ["did:web"]
 # Base64-encoded ≥32-byte random secret. Generate with:
 #   openssl rand -base64 32
@@ -97,4 +102,32 @@ challenge_rate_per_minute = 60
 [playground]
 # When true, the publish handler skips DID-signature verification. NEVER
 # enable in production — the registry will accept any forged signature.
+# Incompatible with [receipt]: a receipts-advertising registry has no
+# unverified publish path (RFC-ACDP-0010 §7), so startup refuses the combo.
 enabled = false
+
+[receipt]
+# Registry-receipt signing identity (RFC-ACDP-0010, ACDP 0.2.0). When a
+# signing key is configured the registry mints a signed receipt for every
+# publish (persisted atomically with the context row) and advertises
+# acdp_version 0.2.0 + the `acdp-registry-receipts` profile. Leave unset to
+# stay a 0.1.0 receipt-less registry.
+#
+# Exactly one key source. Generate a seed with: openssl rand -base64 32
+# Env override: ACDP_REGISTRY_RECEIPT__SIGNING_KEY_SEED_B64.
+# signing_key_seed_b64 = ""
+# ...or a mounted secret file whose contents are that base64 string:
+# signing_key_path = "/etc/acdp/receipt-key.seed"
+#
+# Fragment under the registry DID; receipts carry
+# `signature.key_id = "did:web:<authority>#<fragment>"`. Pick a FRESH
+# fragment on every rotation.
+key_id_fragment = "receipt-key-1"
+
+# Rotated-out receipt verification keys. RFC-ACDP-0010 §9: these stay in the
+# DID document's verificationMethod indefinitely (removed from
+# assertionMethod only). Dropping an entry bricks every receipt that key
+# signed — remove ONLY on confirmed compromise.
+# [[receipt.retired_keys]]
+# public_key_b64  = "<base64 of the raw 32-byte Ed25519 public key>"
+# key_id_fragment = "receipt-key-0"

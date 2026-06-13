@@ -37,6 +37,20 @@ pub enum WebhookEvent {
         /// used to link the event back to an orchestrator run record.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         run_id: Option<String>,
+        /// RFC-ACDP-0010 §6 fingerprint of the producer key the registry
+        /// actually resolved at publish time (`sha256:<hex>`). Present
+        /// only on receipts-advertising registries (ACDP 0.2.0); additive
+        /// — consumers tolerate the field's absence.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key_fingerprint: Option<String>,
+        /// The registry receipt minted for this publish (the full signed
+        /// object, RFC-ACDP-0010 §4) so the control plane can correlate
+        /// and re-verify without re-fetching the context. Present only on
+        /// receipts-advertising registries; additive. Boxed to keep the
+        /// enum's variants size-balanced (clippy::large_enum_variant);
+        /// serde serializes a `Box<T>` exactly like `T`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        registry_receipt: Option<Box<serde_json::Value>>,
     },
     /// A context was retrieved by an authenticated caller (visibility-filtered).
     ContextRetrieved {

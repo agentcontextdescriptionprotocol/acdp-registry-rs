@@ -102,6 +102,7 @@ fn config(playground: bool) -> RegistryConfig {
             enabled: playground,
             ..Default::default()
         },
+        receipt: Default::default(),
     }
 }
 
@@ -145,6 +146,14 @@ async fn build_harness(
     cfg: RegistryConfig,
     cross_registry: Option<Arc<acdp::client::CrossRegistryResolver>>,
 ) -> Harness {
+    build_harness_with_caps(cfg, caps(), cross_registry).await
+}
+
+async fn build_harness_with_caps(
+    cfg: RegistryConfig,
+    caps: CapabilitiesDocument,
+    cross_registry: Option<Arc<acdp::client::CrossRegistryResolver>>,
+) -> Harness {
     let db = tempfile::Builder::new()
         .prefix("acdp-test-")
         .suffix(".sqlite")
@@ -152,7 +161,18 @@ async fn build_harness(
         .unwrap();
     let store = SqliteStore::connect(db.path(), 1).await.unwrap();
     store.migrate().await.unwrap();
-    let server = Arc::new(RegistryServer::try_new(store, caps(), AUTHORITY).unwrap());
+    let server = RegistryServer::try_new(store, caps, AUTHORITY).unwrap();
+    // Mirror the binary's serve_with_store wiring: a configured receipt
+    // key attaches the signer (which also appends the receipts profile).
+    let server = if cfg.receipt.is_configured() {
+        let signer =
+            acdp_registry_core::receipt::build_signer(&cfg.receipt, &cfg.registry.authority)
+                .expect("receipt signer");
+        server.with_receipt_signer(signer).expect("receipt signer")
+    } else {
+        server
+    };
+    let server = Arc::new(server);
     let challenges: Arc<dyn ChallengeStore> = Arc::new(InMemoryChallengeStore::new());
     let secret = JwtSecret::from_bytes(&[42u8; 32]);
     let signer = JwtSigner::new(secret, format!("did:web:{AUTHORITY}"), AUTHORITY.into(), 30);
@@ -2505,4 +2525,381 @@ async fn admin_reload_pinned_keys_requires_admin_token() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+// ─── ACDP 0.2.0: registry receipts + did:key (RFC-ACDP-0010, workstreams A/C/D4) ───
+
+/// Test-only receipt signing seed. The corresponding public key is what the
+/// §8 signature checks below verify against.
+const RECEIPT_SEED: [u8; 32] = [99u8; 32];
+
+fn receipt_public_key() -> [u8; 32] {
+    SigningKey::from_bytes(&RECEIPT_SEED).verifying_key_bytes()
+}
+
+fn receipts_caps() -> CapabilitiesDocument {
+    let mut c = caps();
+    // with_receipt_signer requires >= 0.2.0 and appends the receipts
+    // profile itself — mirroring build_capabilities in the binary.
+    c.acdp_version = "0.2.0".into();
+    c.supported_did_methods = vec!["did:web".into(), "did:key".into()];
+    c
+}
+
+/// Production-path harness (playground OFF) with a receipt signer and
+/// did:key acceptance — did:key verification is pure/offline, so the full
+/// RFC-ACDP-0003 §2.1 pipeline runs without any network DID resolution.
+async fn receipts_harness() -> Harness {
+    let mut cfg = config(false);
+    cfg.receipt.signing_key_seed_b64 = B64.encode(RECEIPT_SEED);
+    cfg.auth.did_methods = vec!["did:web".into(), "did:key".into()];
+    build_harness_with_caps(cfg, receipts_caps(), None).await
+}
+
+fn did_key_producer(seed: u8) -> Producer {
+    Producer::new_did_key(SigningKey::from_bytes(&[seed; 32]))
+}
+
+fn did_key_fingerprint(seed: u8) -> String {
+    acdp::crypto::fingerprint::fingerprint_ed25519(
+        &SigningKey::from_bytes(&[seed; 32]).verifying_key_bytes(),
+    )
+}
+
+async fn get_json(app: &axum::Router, uri: &str) -> (StatusCode, Value) {
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let v = body_to_json(resp).await;
+    (status, v)
+}
+
+#[tokio::test]
+async fn receipts_registry_advertises_0_2_0_and_profile() {
+    let h = receipts_harness().await;
+    let (status, v) = get_json(&h.router, "/.well-known/acdp.json").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["acdp_version"], "0.2.0");
+    let profiles: Vec<&str> = v["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|p| p.as_str())
+        .collect();
+    assert!(
+        profiles.contains(&"acdp-registry-receipts"),
+        "with_receipt_signer must advertise the receipts profile: {profiles:?}"
+    );
+    let methods: Vec<&str> = v["supported_did_methods"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m.as_str())
+        .collect();
+    assert!(methods.contains(&"did:key"), "did:key advertised");
+}
+
+#[tokio::test]
+async fn did_json_serves_receipt_key_and_404s_without_one() {
+    // Receipts configured → the registry hosts its own did:web document.
+    let h = receipts_harness().await;
+    let (status, v) = get_json(&h.router, "/.well-known/did.json").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["id"], format!("did:web:{AUTHORITY}"));
+    let am = v["assertionMethod"].as_array().unwrap();
+    assert_eq!(
+        am.len(),
+        1,
+        "only the ACTIVE key authenticates new receipts"
+    );
+    assert_eq!(am[0], format!("did:web:{AUTHORITY}#receipt-key-1"));
+    let vm = v["verificationMethod"].as_array().unwrap();
+    assert!(vm
+        .iter()
+        .any(|m| m["id"] == format!("did:web:{AUTHORITY}#receipt-key-1")));
+
+    // No receipt key → no DID document.
+    let bare = harness(true).await;
+    let (status, _) = get_json(&bare.router, "/.well-known/did.json").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Acceptance criterion A: a did:key publish runs the FULL verified
+/// pipeline (offline steps 7–8), mints a receipt atomically, and the
+/// receipt passes every RFC-ACDP-0010 §8 cross-check a consumer with the
+/// registry's public key would perform.
+#[tokio::test]
+async fn did_key_publish_mints_verifiable_receipt() {
+    use acdp::types::receipt::RegistryReceipt;
+
+    let h = receipts_harness().await;
+    let p = did_key_producer(33);
+    let req = p
+        .publish_request()
+        .title("did-key receipts e2e")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (status, v) = publish(&h.router, &req, None).await;
+    assert_eq!(status, StatusCode::OK, "publish body = {v}");
+    let receipt_json = v["registry_receipt"].clone();
+    assert!(
+        receipt_json.is_object(),
+        "a receipts-advertising registry MUST return the receipt in the publish response: {v}"
+    );
+
+    // §8 step 6: canonical millisecond-precision created_at, byte-checked
+    // on the raw wire JSON.
+    RegistryReceipt::validate_created_at_form(&receipt_json).expect("created_at form");
+    // §4: closed schema parse.
+    let receipt = RegistryReceipt::from_value(&receipt_json).expect("closed-schema receipt");
+    // §8 step 1: signature over the JCS preimage, verified against the
+    // registry's (known) receipt public key.
+    receipt
+        .verify_signature_with_key(Some(&receipt_public_key()), None)
+        .expect("receipt signature");
+    // §8 steps 3–5: context / content / key bindings. The producer key
+    // fingerprint is derivable from the did:key DID itself.
+    let ctx_id = acdp::types::primitives::CtxId(v["ctx_id"].as_str().unwrap().to_string());
+    receipt
+        .cross_check(&ctx_id, &req.content_hash, &did_key_fingerprint(33))
+        .expect("receipt cross-checks");
+    assert_eq!(
+        receipt.signature.key_id,
+        format!("did:web:{AUTHORITY}#receipt-key-1")
+    );
+
+    // Full retrieval: receipt embedded TOP-LEVEL (outside body/registry_state)
+    // and byte-identical to the one minted at publish.
+    let (status, full) = get_json(
+        &h.router,
+        &format!("/contexts/{}", pct_encode_path_segment(ctx_id.as_str())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(full["registry_receipt"], receipt_json);
+    assert!(full["body"].get("registry_receipt").is_none());
+    // §8 step 3 body bindings against the served body.
+    let body: acdp::types::body::Body = serde_json::from_value(full["body"].clone()).unwrap();
+    receipt.cross_check_body(&body).expect("body bindings");
+
+    // Body-only endpoint stays bare (RFC-ACDP-0010 §7: never in /body).
+    let (status, bare) = get_json(
+        &h.router,
+        &format!(
+            "/contexts/{}/body",
+            pct_encode_path_segment(ctx_id.as_str())
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(bare.get("registry_receipt").is_none());
+}
+
+/// dk-003: a registry that does NOT advertise did:key rejects a
+/// cryptographically flawless did:key publish with `key_resolution_failed`
+/// (HTTP 400, permanent) — not unreachable, not unsupported_algorithm.
+#[tokio::test]
+async fn did_key_publish_rejected_when_not_advertised() {
+    let h = harness(false).await; // production path, caps advertise did:web only
+    let p = did_key_producer(34);
+    let req = p
+        .publish_request()
+        .title("dk-003")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (status, v) = publish(&h.router, &req, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {v}");
+    assert_eq!(v["error"]["code"], "key_resolution_failed");
+}
+
+/// D4 + A2: an idempotent replay returns the ORIGINAL response, including
+/// the original receipt — not a re-minted one.
+#[tokio::test]
+async fn idempotent_replay_returns_original_receipt() {
+    let h = receipts_harness().await;
+    let p = did_key_producer(35);
+    let req = p
+        .publish_request()
+        .title("replay-receipt")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (s1, v1) = publish(&h.router, &req, Some("rcpt-replay-key")).await;
+    assert_eq!(s1, StatusCode::OK, "body = {v1}");
+    let (s2, v2) = publish(&h.router, &req, Some("rcpt-replay-key")).await;
+    assert_eq!(s2, StatusCode::OK, "body = {v2}");
+    assert_eq!(v1["ctx_id"], v2["ctx_id"]);
+    assert_eq!(
+        v1["registry_receipt"], v2["registry_receipt"],
+        "replay must return the original receipt byte-for-byte"
+    );
+}
+
+/// D4 (spec clarification): idempotency keys are scoped per (agent_id,
+/// key). Two different agents reusing the same Idempotency-Key with
+/// different content is a non-event — both publishes succeed.
+#[tokio::test]
+async fn idempotency_keys_scoped_per_agent() {
+    let h = receipts_harness().await;
+    let make = |seed: u8, title: &str| {
+        did_key_producer(seed)
+            .publish_request()
+            .title(title)
+            .context_type(ContextType::DataSnapshot)
+            .visibility(Visibility::Public)
+            .build()
+            .unwrap()
+    };
+    let (s1, v1) = publish(&h.router, &make(36, "agent-a-row"), Some("shared-key")).await;
+    let (s2, v2) = publish(&h.router, &make(37, "agent-b-row"), Some("shared-key")).await;
+    assert_eq!(s1, StatusCode::OK, "body = {v1}");
+    assert_eq!(
+        s2,
+        StatusCode::OK,
+        "another agent's identical key must not interact: {v2}"
+    );
+    assert_ne!(v1["ctx_id"], v2["ctx_id"]);
+    // Same agent + same key + DIFFERENT content stays a 409.
+    let (s3, v3) = publish(&h.router, &make(36, "agent-a-changed"), Some("shared-key")).await;
+    assert_eq!(s3, StatusCode::CONFLICT, "body = {v3}");
+    assert_eq!(v3["error"]["code"], "duplicate_publish");
+}
+
+/// D3: the publish path anchors on the immediate predecessor; the admin
+/// audit endpoint re-walks the full chain and reports it clean.
+#[tokio::test]
+async fn lineage_audit_walks_a_clean_chain() {
+    let mut cfg = config(false);
+    cfg.receipt.signing_key_seed_b64 = B64.encode(RECEIPT_SEED);
+    cfg.auth.did_methods = vec!["did:web".into(), "did:key".into()];
+    cfg.auth.admin_tokens = vec!["audit-admin".into()];
+    let h = build_harness_with_caps(cfg, receipts_caps(), None).await;
+
+    let p = did_key_producer(38);
+    let v1 = p
+        .publish_request()
+        .title("audit-v1")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (s, r1) = publish(&h.router, &v1, None).await;
+    assert_eq!(s, StatusCode::OK, "body = {r1}");
+    let v2 = p
+        .supersede(acdp::types::primitives::CtxId(
+            r1["ctx_id"].as_str().unwrap().to_string(),
+        ))
+        .version(2)
+        .title("audit-v2")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (s, r2) = publish(&h.router, &v2, None).await;
+    assert_eq!(s, StatusCode::OK, "body = {r2}");
+
+    let lineage_id = r1["lineage_id"].as_str().unwrap();
+    // Unauthenticated → 403.
+    let (status, _) = get_json(
+        &h.router,
+        &format!(
+            "/admin/lineages/{}/audit",
+            pct_encode_path_segment(lineage_id)
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/admin/lineages/{}/audit",
+                    pct_encode_path_segment(lineage_id)
+                ))
+                .header("authorization", "Bearer audit-admin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_to_json(resp).await;
+    assert_eq!(v["ok"], true, "clean chain must audit clean: {v}");
+    assert_eq!(v["versions"], 2);
+    assert_eq!(
+        v["receiptless_contexts"], 0,
+        "every receipts-era context carries a receipt"
+    );
+}
+
+/// Upgrade boundary: enabling receipts must not break idempotent replays
+/// of records minted BEFORE the signer existed. The store replays the
+/// original (receipt-less) response and the §7 no-degraded-mode check
+/// applies only to newly inserted contexts — a producer retry across the
+/// receipts-enablement boundary gets its 200, not a 500.
+#[tokio::test]
+async fn pre_receipts_idempotency_record_replays_after_enabling_receipts() {
+    let h = receipts_harness().await;
+    let p = did_key_producer(40);
+    let req = p
+        .publish_request()
+        .title("pre-receipts publish")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+
+    // Seed the idempotency record a pre-receipts deployment would have
+    // stored: same (agent_id, key, content_hash), response WITHOUT a
+    // registry_receipt member.
+    let seeded_ctx_id = format!("acdp://{AUTHORITY}/00000000-0000-4000-8000-000000000040");
+    let seeded_response = json!({
+        "ctx_id": seeded_ctx_id,
+        "lineage_id": format!("lin:sha256:{}", "ab".repeat(32)),
+        "version": 1,
+        "created_at": "2026-06-01T00:00:00.000Z",
+        "status": "active",
+    });
+    let future_ms = (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp_millis();
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", h.db_path().display()))
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO idempotency_records \
+         (agent_id, key, content_hash, response_json, expires_at, expires_at_ms) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(req.agent_id.as_str())
+    .bind("upgrade-boundary-key")
+    .bind(req.content_hash.0.as_str())
+    .bind(seeded_response.to_string())
+    .bind((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339())
+    .bind(future_ms)
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let (status, v) = publish(&h.router, &req, Some("upgrade-boundary-key")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "replay of a pre-receipts record must succeed on a receipts registry: {v}"
+    );
+    assert_eq!(v["ctx_id"], seeded_ctx_id, "original response replayed");
+    assert!(
+        v.get("registry_receipt").is_none_or(|r| r.is_null()),
+        "the original receipt-less response is returned verbatim: {v}"
+    );
 }

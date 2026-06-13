@@ -1,0 +1,14 @@
+-- Registry receipts (RFC-ACDP-0010, ACDP 0.2.0 workstream A).
+--
+-- One receipt per context, written by the SAME INSERT as the context row so
+-- the §7 atomicity MUST holds by construction: a context published while the
+-- `acdp-registry-receipts` profile is advertised can never exist without its
+-- receipt, and a crash between "insert context" and "insert receipt" is not
+-- a reachable state. The column is immutable after insert.
+--
+-- NULL marks contexts published before receipts were enabled. Deliberately
+-- no backfill: a receipt attests publish-time facts (the producer key the
+-- registry actually resolved, the registry-assigned created_at); minting one
+-- after the fact would be a false attestation. Pre-upgrade contexts simply
+-- remain receipt-less.
+ALTER TABLE contexts ADD COLUMN IF NOT EXISTS registry_receipt JSONB;

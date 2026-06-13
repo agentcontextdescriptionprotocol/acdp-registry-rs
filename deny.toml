@@ -45,3 +45,6 @@ highlight = "all"
 unknown-registry = "warn"
 unknown-git = "warn"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# acdp 0.2.0 (trust hardening) is consumed from git until it ships on
+# crates.io — see the workspace Cargo.toml note on the `acdp` dependency.
+allow-git = ["https://github.com/agentcontextdistributionprotocol/acdp-rs"]

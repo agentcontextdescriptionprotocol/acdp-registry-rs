@@ -105,6 +105,7 @@ fn config(playground: bool) -> RegistryConfig {
             enabled: playground,
             ..Default::default()
         },
+        receipt: Default::default(),
     }
 }
 
@@ -477,4 +478,178 @@ async fn pg_search_and_tokens_intersect() {
         "Postgres plainto_tsquery should AND tokens; got {v}"
     );
     assert_eq!(matches[0]["title"], "foo bar baz");
+}
+
+// ─── ACDP 0.2.0: receipt atomicity + concurrent idempotency stress (Postgres) ───
+
+/// D4 stress (Postgres): N concurrent publishes sharing one
+/// (agent_id, Idempotency-Key) must yield exactly ONE persisted context;
+/// the losers replay the winner's response. Unlike the in-process SQLite
+/// variant, this runs against a real multi-connection Postgres pool, so
+/// the racers genuinely interleave inside the ON CONFLICT claim gate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[serial]
+async fn pg_concurrent_duplicate_publishes_yield_one_context() {
+    use acdp::registry::store::{
+        PendingIdempotencyCommit, PublishCommit, PublishCommitOutcome, RegistryStore,
+    };
+
+    let Some(url) = pg_url_or_skip() else { return };
+    let store = PgStore::connect(&url, 8).await.unwrap();
+    store.migrate().await.unwrap();
+    truncate(store.pool()).await;
+    let store = Arc::new(store);
+
+    let p = Producer::new(
+        SigningKey::from_bytes(&[71u8; 32]),
+        AgentDid::new("did:web:agents.test:pg-race".to_string()),
+        "did:web:agents.test:pg-race#key-1".to_string(),
+    );
+    let req = p
+        .publish_request()
+        .title("pg-race")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let store = store.clone();
+        let req = req.clone();
+        handles.push(tokio::task::spawn_blocking(move || {
+            store.commit_publish(PublishCommit {
+                req: &req,
+                authority: AUTHORITY,
+                idempotency: Some(PendingIdempotencyCommit {
+                    key: "pg-race-key",
+                    ttl: chrono::Duration::hours(1),
+                }),
+                tenant: None,
+                receipt_minter: None,
+            })
+        }));
+    }
+    let mut inserted = 0usize;
+    let mut ctx_ids = std::collections::HashSet::new();
+    for h in handles {
+        let outcome = h.await.unwrap().expect("every racer resolves cleanly");
+        match outcome {
+            PublishCommitOutcome::Inserted(r) => {
+                inserted += 1;
+                ctx_ids.insert(r.ctx_id.as_str().to_string());
+            }
+            PublishCommitOutcome::IdempotentReplay(r) => {
+                ctx_ids.insert(r.ctx_id.as_str().to_string());
+            }
+        }
+    }
+    assert_eq!(inserted, 1, "exactly one racer inserts");
+    assert_eq!(ctx_ids.len(), 1, "all racers resolve to the same ctx_id");
+
+    let page = store.list_contexts(100, None, None, None).await.unwrap();
+    assert_eq!(page.items.len(), 1, "one context row persisted");
+}
+
+/// RFC-ACDP-0010 §7 on Postgres: the receipt is minted inside the commit
+/// transaction and round-trips through the publish response and `get`;
+/// a failing minter aborts the whole publish (no row, no idempotency
+/// record).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn pg_receipt_atomicity_and_round_trip() {
+    use acdp::registry::store::{
+        PendingIdempotencyCommit, PublishCommit, PublishCommitOutcome, RegistryStore,
+    };
+
+    let Some(url) = pg_url_or_skip() else { return };
+    let store = PgStore::connect(&url, 4).await.unwrap();
+    store.migrate().await.unwrap();
+    truncate(store.pool()).await;
+    let store = Arc::new(store);
+
+    let p = Producer::new(
+        SigningKey::from_bytes(&[72u8; 32]),
+        AgentDid::new("did:web:agents.test:pg-rcpt".to_string()),
+        "did:web:agents.test:pg-rcpt#key-1".to_string(),
+    );
+
+    // 1. Failing minter → nothing persists.
+    let doomed = p
+        .publish_request()
+        .title("pg-rcpt-doomed")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let failing = |_: &acdp::types::body::Body| {
+        Err(acdp::error::AcdpError::RegistryInternal(
+            "simulated KMS outage".into(),
+        ))
+    };
+    let s = store.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        s.commit_publish(PublishCommit {
+            req: &doomed,
+            authority: AUTHORITY,
+            idempotency: Some(PendingIdempotencyCommit {
+                key: "pg-mintfail",
+                ttl: chrono::Duration::hours(1),
+            }),
+            tenant: None,
+            receipt_minter: Some(&failing),
+        })
+    })
+    .await
+    .unwrap();
+    assert!(outcome.is_err(), "minting failure fails the publish");
+    let page = store.list_contexts(100, None, None, None).await.unwrap();
+    assert!(page.items.is_empty(), "no row survives a failed mint");
+    assert_eq!(store.count_idempotency_records().await.unwrap(), Some(0));
+
+    // 2. Working minter → receipt rides the row and round-trips on get().
+    let req = p
+        .publish_request()
+        .title("pg-rcpt-ok")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let minter = |body: &acdp::types::body::Body| {
+        Ok(json!({
+            "ctx_id": body.ctx_id.as_str(),
+            "lineage_id": body.lineage_id.as_str(),
+        }))
+    };
+    let s = store.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        s.commit_publish(PublishCommit {
+            req: &req,
+            authority: AUTHORITY,
+            idempotency: None,
+            tenant: None,
+            receipt_minter: Some(&minter),
+        })
+    })
+    .await
+    .unwrap()
+    .expect("publish ok");
+    let response = match outcome {
+        PublishCommitOutcome::Inserted(r) => r,
+        other => panic!("expected Inserted, got {other:?}"),
+    };
+    let receipt = response
+        .registry_receipt
+        .clone()
+        .expect("response carries the minted receipt");
+    assert_eq!(receipt["ctx_id"], response.ctx_id.as_str());
+
+    let s = store.clone();
+    let ctx_id = response.ctx_id.clone();
+    let fetched = tokio::task::spawn_blocking(move || s.get(&ctx_id))
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("context exists");
+    assert_eq!(fetched.registry_receipt, Some(receipt));
 }
