@@ -176,6 +176,32 @@ fn validate_config(cfg: &RegistryConfig) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("receipt: {e}"))?;
     }
 
+    // RFC-ACDP-0010 §7/§11: advertising `acdp-registry-receipts` is a hard
+    // commitment to ALWAYS mint and serve receipts (and to claim
+    // acdp_version >= 0.2.0). An operator who lists the profile in
+    // `registry.profiles` but configures no `[receipt]` key would advertise a
+    // capability the registry can't honor: `build_capabilities` keeps the
+    // 0.1.0 version claim, no signer is attached so no receipt is ever minted,
+    // and `/.well-known/did.json` 404s — yet capabilities still promise
+    // receipts, which consumers treat as a registry fault (§7, no degraded
+    // mode). Refuse the inconsistent config at startup rather than ship a
+    // false advertisement. (The reverse — a receipt key with the profile
+    // omitted — is safe: `with_receipt_signer` appends the profile itself.)
+    if cfg
+        .registry
+        .profiles
+        .iter()
+        .any(|p| p == "acdp-registry-receipts")
+        && !cfg.receipt.is_configured()
+    {
+        anyhow::bail!(
+            "registry.profiles advertises 'acdp-registry-receipts' but no [receipt] signing \
+             key is configured. Advertising the profile is a hard commitment to mint a \
+             receipt on every publish (RFC-ACDP-0010 §7) — configure receipt.signing_key_seed_b64 \
+             or receipt.signing_key_path, or remove the profile from registry.profiles."
+        );
+    }
+
     // SEC: refuse an insecure default deployment — a non-loopback bind with
     // BOTH TLS and auth disabled exposes an unauthenticated, plaintext registry
     // on every interface. Require an explicit opt-in (the operator asserting a
@@ -733,6 +759,28 @@ mod tests {
         );
         cfg.receipt.retired_keys[0].key_id_fragment = "receipt-key-0".into();
         assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn receipts_profile_without_key_is_rejected() {
+        use base64::Engine as _;
+        // RFC-ACDP-0010 §7/§11: advertising the profile without a signing key
+        // is a false capability claim — must fail startup.
+        let mut cfg = RegistryConfig::defaults();
+        cfg.registry.profiles = vec!["acdp-registry-core".into(), "acdp-registry-receipts".into()];
+        let err = validate_config(&cfg)
+            .expect_err("receipts profile without a receipt key must be refused");
+        assert!(
+            err.to_string().contains("acdp-registry-receipts"),
+            "unexpected error: {err}"
+        );
+        // Configuring a key resolves the inconsistency.
+        cfg.receipt.signing_key_seed_b64 =
+            base64::engine::general_purpose::STANDARD.encode([5u8; 32]);
+        assert!(
+            validate_config(&cfg).is_ok(),
+            "profile + key together are conformant"
+        );
     }
 
     #[test]

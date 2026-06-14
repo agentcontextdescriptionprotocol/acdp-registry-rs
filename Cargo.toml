@@ -22,10 +22,9 @@ readme        = "README.md"
 
 [workspace.dependencies]
 # Protocol library — reuse types, crypto, validation, DID resolution.
-# Pinned to the acdp-rs 0.2.0 trust-hardening branch (registry receipts,
-# did:key, divergence diagnostics) until 0.2.0 is published to crates.io;
-# switch back to a plain version requirement at that point.
-acdp = { version = "0.1.0", git = "https://github.com/agentcontextdistributionprotocol/acdp-rs.git", rev = "77f5f7f915c144106f6de2b13a6cd18e470a9ceb", features = ["server", "client"] }
+# ACDP 0.2.0 (registry receipts, did:key producers, divergence diagnostics),
+# consumed from crates.io for reproducible, supply-chain-clean builds.
+acdp = { version = "0.2.0", features = ["server", "client"] }
 
 # HTTP
 axum       = { version = "0.7", features = ["macros"] }
