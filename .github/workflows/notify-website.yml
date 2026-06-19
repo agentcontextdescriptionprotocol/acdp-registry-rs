@@ -6,6 +6,9 @@ on:
     paths:
       - 'docs/**'
       - 'README.md'
+  # Manual trigger for on-demand re-syncs and for verifying the dispatch
+  # wiring (token + target repo) without having to push a docs change.
+  workflow_dispatch:
 
 jobs:
   notify:
