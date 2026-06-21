@@ -254,6 +254,23 @@ fn is_loopback_bind(bind: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Build the listen address from a `bind` host and `port`.
+///
+/// A bare IPv6 literal such as `::` (the IPv6 wildcard Railway and other
+/// IPv6-native platforms recommend) is *not* valid host:port syntax once a
+/// `:port` is appended — `:::8080` fails to parse. So when `bind` is a plain
+/// IP literal, combine it with the port via `SocketAddr::new`, which is
+/// bracket-agnostic. Only fall back to the `host:port` string form for inputs
+/// that are not bare IP literals (e.g. already-bracketed `[::1]`).
+fn resolve_bind_addr(bind: &str, port: u16) -> anyhow::Result<SocketAddr> {
+    if let Ok(ip) = bind.parse::<std::net::IpAddr>() {
+        return Ok(SocketAddr::new(ip, port));
+    }
+    format!("{bind}:{port}")
+        .parse()
+        .map_err(|e| anyhow::anyhow!("bind address {bind:?} port {port}: {e}"))
+}
+
 #[cfg(feature = "storage-sqlite")]
 async fn run(cfg: RegistryConfig) -> anyhow::Result<()> {
     use acdp_registry_auth::{SqliteChallengeStore, SqliteRevocationStore};
@@ -503,9 +520,7 @@ async fn serve_with_store<S: ExtendedRegistryStore + 'static>(
     let router = build_router(state);
 
     // Bind. TLS is optional — production typically terminates upstream.
-    let addr: SocketAddr = format!("{}:{}", cfg.registry.bind, cfg.registry.port)
-        .parse()
-        .map_err(|e| anyhow::anyhow!("bind address: {e}"))?;
+    let addr = resolve_bind_addr(&cfg.registry.bind, cfg.registry.port)?;
     tracing::info!(addr = %addr, "listening");
     // OPS-03: graceful shutdown on SIGTERM / Ctrl-C. In-flight requests
     // get up to 30s to complete before the handle drops the listener.
@@ -712,6 +727,37 @@ mod tests {
         assert!(!is_loopback_bind("0.0.0.0"));
         assert!(!is_loopback_bind("::"));
         assert!(!is_loopback_bind("10.0.0.5"));
+    }
+
+    #[test]
+    fn resolve_bind_addr_handles_ipv4_and_bare_ipv6() {
+        // Regression: a bare IPv6 wildcard (`::`, recommended on Railway and
+        // other IPv6-native hosts) must not be glued into `:::8080`, which
+        // fails with "invalid socket address syntax". `SocketAddr::new` keeps
+        // it valid regardless of bracketing.
+        assert_eq!(
+            resolve_bind_addr("0.0.0.0", 8080).unwrap().to_string(),
+            "0.0.0.0:8080"
+        );
+        assert_eq!(
+            resolve_bind_addr("127.0.0.1", 9191).unwrap().to_string(),
+            "127.0.0.1:9191"
+        );
+        assert_eq!(
+            resolve_bind_addr("::", 8080).unwrap().to_string(),
+            "[::]:8080"
+        );
+        assert_eq!(
+            resolve_bind_addr("::1", 8080).unwrap().to_string(),
+            "[::1]:8080"
+        );
+        // Already-bracketed IPv6 still resolves via the host:port fallback.
+        assert_eq!(
+            resolve_bind_addr("[::1]", 8080).unwrap().to_string(),
+            "[::1]:8080"
+        );
+        // A non-address host with no resolver yields a clear error, not a panic.
+        assert!(resolve_bind_addr("not an address", 8080).is_err());
     }
 
     // ACDP 0.2.0 — receipt + did:key startup validation.
