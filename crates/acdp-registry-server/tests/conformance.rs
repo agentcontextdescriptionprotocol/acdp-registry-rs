@@ -62,6 +62,7 @@ fn caps() -> CapabilitiesDocument {
             max_payload_bytes: 1_048_576,
             max_embedded_bytes: 65_536,
             idempotency_key_ttl_seconds: Some(86_400),
+            max_publish_per_minute: None,
         },
         read_authentication_methods: vec![],
         anonymous_public_reads: true,
