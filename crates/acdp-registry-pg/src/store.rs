@@ -1,6 +1,7 @@
 //! Postgres implementation of `RegistryStore` + `ExtendedRegistryStore`.
 
 use acdp::error::AcdpError;
+use acdp::pagination::try_paginate_rows;
 use acdp::registry::store::{PublishCommit, PublishCommitOutcome, RegistryStore};
 use acdp::registry::{IdempotencyRecord, ValidatedPublish};
 use acdp::types::body::{Body, FullContext, RegistryState};
@@ -161,35 +162,27 @@ impl ExtendedRegistryStore for PgStore {
         query = query.bind(limit + 1);
         let rows = query.fetch_all(&self.pool).await.map_err(map_sqlx_err)?;
 
-        // BUG-01: cursor signal must compare against the DB sentinel
-        // (`limit + 1` rows fetched), not against the post-visibility-
-        // filter item count. The previous comparison sent clients on a
-        // phantom next page whenever the in-Rust filter dropped a row on
-        // the final DB page.
-        let has_more_in_db = rows.len() > limit as usize;
-        let mut items = Vec::new();
-        // BUG (#13): anchor `next_cursor` on the last row *scanned* from the DB,
-        // not on `items.last()` (post-`visible_to` filter). If the tail of a
-        // page is filtered out, `items.last()` anchors too early and the next
-        // page re-scans (or, if the whole page is filtered, yields `None` and
-        // pagination stops while visible rows remain beyond). Mirrors `search`.
-        let mut last_scanned: Option<(i64, String)> = None;
-        for r in rows.iter().take(limit as usize) {
-            let ctx = row_to_context(r)?;
-            last_scanned = Some((
-                ctx.body.created_at.timestamp_millis(),
-                ctx.body.ctx_id.as_str().to_string(),
-            ));
-            if visible_to(&ctx, requester) {
-                items.push(ctx);
-            }
-        }
-        let next_cursor = if has_more_in_db {
-            last_scanned.map(|(ts, id)| encode_cursor(ts, &id))
-        } else {
-            None
-        };
-        Ok(Page { items, next_cursor })
+        // BUG-01 / BUG (#13): the "more rows?" signal comes from the raw
+        // DB row count (`limit + 1` sentinel), and `next_cursor` anchors
+        // on the last row *scanned*, not the last item kept by the
+        // `visible_to` filter. Both invariants (and their regression
+        // tests) are owned by `acdp::pagination::try_paginate_rows`.
+        let page = try_paginate_rows(
+            rows,
+            limit as usize,
+            |r| row_to_context(&r),
+            |ctx| visible_to(ctx, requester),
+            |ctx| {
+                encode_cursor(
+                    ctx.body.created_at.timestamp_millis(),
+                    ctx.body.ctx_id.as_str(),
+                )
+            },
+        )?;
+        Ok(Page {
+            items: page.items,
+            next_cursor: page.next_cursor,
+        })
     }
 }
 
@@ -548,36 +541,17 @@ impl RegistryStore for PgStore {
                 &validated,
             )?;
 
-            // 4. Build Body.
+            // 4. Build Body via the SDK's single materialization point
+            // (`from_publish_request` ms-truncates `created_at` and starts
+            // with empty extensions, exactly as the hand-rolled copy did).
             let created_at = acdp::time::trunc_ms(now);
-            let body = Body {
-                ctx_id: ctx_id.clone(),
-                lineage_id: lineage_id.clone(),
-                origin_registry: authority.clone(),
+            let body = Body::from_publish_request(
+                &req,
+                ctx_id.clone(),
+                lineage_id.clone(),
+                authority.clone(),
                 created_at,
-                content_hash: req.content_hash.clone(),
-                signature: req.signature.clone(),
-                version: req.version,
-                supersedes: req.supersedes.clone(),
-                agent_id: req.agent_id.clone(),
-                contributors: req.contributors.clone(),
-                title: req.title.clone(),
-                context_type: req.context_type.clone(),
-                data_refs: req.data_refs.clone(),
-                derived_from: req.derived_from.clone(),
-                visibility: req.visibility.clone(),
-                audience: req.audience.clone(),
-                acdp_version: req.acdp_version.clone(),
-                description: req.description.clone(),
-                summary: req.summary.clone(),
-                tags: req.tags.clone(),
-                domain: req.domain.clone(),
-                expires_at: req.expires_at,
-                data_period: req.data_period.clone(),
-                metadata: req.metadata.clone(),
-                schema_uri: req.schema_uri.clone(),
-                extensions: Default::default(),
-            };
+            );
 
             // 4.5. Mint the registry receipt (RFC-ACDP-0010 §7) inside the
             // transaction, against the fully-assigned body. The receipt is
@@ -830,48 +804,45 @@ impl RegistryStore for PgStore {
             }
             query = query.bind((limit as i64) + 1);
             let rows = query.fetch_all(&self.pool).await.map_err(map_sqlx_err)?;
-            let has_more_in_db = rows.len() > limit;
 
             let now = Utc::now();
             let want_status = params.status.as_deref().unwrap_or("active");
-            let mut matches: Vec<FullContext> = Vec::new();
-            // REG-P2-8: anchor the next cursor on the last RAW scanned row, not
-            // the last visible match — see the SQLite backend for the rationale
-            // (a fully-filtered page must not terminate pagination early).
-            let mut last_scanned: Option<(i64, String)> = None;
-            for r in rows.iter().take(limit) {
-                let body_json: serde_json::Value = r.try_get("body_json").map_err(map_sqlx_err)?;
-                let status: String = r.try_get("status").map_err(map_sqlx_err)?;
-                let body: Body = serde_json::from_value(body_json)
-                    .map_err(|e| AcdpError::RegistryInternal(format!("decode body: {e}")))?;
-                // Receipts aren't projected into SearchResult rows, so the
-                // search SELECT deliberately skips the column.
-                let mut ctx = full_context(body, parse_status(&status), None);
-                ctx.registry_state.status =
-                    project_status_inline(&ctx.registry_state.status, ctx.body.expires_at, now);
-                last_scanned = Some((
-                    ctx.body.created_at.timestamp_millis(),
-                    ctx.body.ctx_id.as_str().to_string(),
-                ));
-                if !can_surface_in_search(&ctx, requester, anonymous_public_reads) {
-                    continue;
-                }
-                if ctx.registry_state.status.as_str() != want_status {
-                    continue;
-                }
-                if let Some(df) = &params.derived_from {
-                    if !ctx.body.derived_from.iter().any(|c| c.as_str() == df) {
-                        continue;
-                    }
-                }
-                matches.push(ctx);
-            }
-
-            let next_cursor = if has_more_in_db {
-                last_scanned.as_ref().map(|(ts, id)| encode_cursor(*ts, id))
-            } else {
-                None
-            };
+            // REG-P2-8: the `limit + 1` sentinel and the "anchor the next
+            // cursor on the last RAW scanned row, not the last visible
+            // match" rule (a fully-filtered page must not terminate
+            // pagination early) are owned by `acdp::pagination`.
+            let page = try_paginate_rows(
+                rows,
+                limit,
+                |r| -> Result<FullContext, AcdpError> {
+                    let body_json: serde_json::Value =
+                        r.try_get("body_json").map_err(map_sqlx_err)?;
+                    let status: String = r.try_get("status").map_err(map_sqlx_err)?;
+                    let body: Body = serde_json::from_value(body_json)
+                        .map_err(|e| AcdpError::RegistryInternal(format!("decode body: {e}")))?;
+                    // Receipts aren't projected into SearchResult rows, so the
+                    // search SELECT deliberately skips the column.
+                    let mut ctx = full_context(body, parse_status(&status), None);
+                    ctx.registry_state.status =
+                        project_status_inline(&ctx.registry_state.status, ctx.body.expires_at, now);
+                    Ok(ctx)
+                },
+                |ctx| {
+                    can_surface_in_search(ctx, requester, anonymous_public_reads)
+                        && ctx.registry_state.status.as_str() == want_status
+                        && params
+                            .derived_from
+                            .as_ref()
+                            .is_none_or(|df| ctx.body.derived_from.iter().any(|c| c.as_str() == df))
+                },
+                |ctx| {
+                    encode_cursor(
+                        ctx.body.created_at.timestamp_millis(),
+                        ctx.body.ctx_id.as_str(),
+                    )
+                },
+            )?;
+            let (matches, next_cursor) = (page.items, page.next_cursor);
 
             let projected: Vec<SearchResult> = matches
                 .iter()
