@@ -429,9 +429,19 @@ impl RegistryStore for SqliteStore {
         let idem = idempotency.map(|i| (i.key.to_string(), i.ttl));
 
         self.block_on(async move {
+            // REG-3.3: `BEGIN IMMEDIATE` takes the write lock up front, so
+            // concurrent commits queue on SQLite's busy handler (5s default)
+            // and each observes the previous winner's committed state. A
+            // plain deferred BEGIN takes a read snapshot at the first SELECT
+            // and then fails the mid-transaction write upgrade with
+            // SQLITE_BUSY / SQLITE_BUSY_SNAPSHOT ("database is locked") —
+            // which the busy handler does NOT retry — surfacing transient
+            // 500s to racing publishers instead of the contract outcomes
+            // (idempotent replay / `superseded_target`). This is the SQLite
+            // analog of the Postgres backend's `SELECT ... FOR UPDATE`.
             let mut tx = self
                 .pool
-                .begin()
+                .begin_with("BEGIN IMMEDIATE")
                 .await
                 .map_err(|e| AcdpError::RegistryInternal(format!("tx begin: {e}")))?;
 
