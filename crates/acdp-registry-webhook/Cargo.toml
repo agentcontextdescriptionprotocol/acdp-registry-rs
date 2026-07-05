@@ -24,3 +24,8 @@ thiserror  = { workspace = true }
 tokio      = { workspace = true }
 tracing    = { workspace = true }
 uuid       = { workspace = true }
+
+[dev-dependencies]
+# `SsrfPolicy::allow_test_loopback()` is deprecated unless the
+# `test-transport` feature is on; tests use it to hit 127.0.0.1 servers.
+acdp = { workspace = true, features = ["test-transport"] }

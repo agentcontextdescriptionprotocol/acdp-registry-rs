@@ -606,6 +606,10 @@ fn build_capabilities(cfg: &RegistryConfig) -> CapabilitiesDocument {
             idempotency_key_ttl_seconds: Some(
                 u32::try_from(cfg.limits.idempotency_key_ttl_seconds).unwrap_or(u32::MAX),
             ),
+            // *(0.3.0)* advisory publish ceiling — not yet surfaced from
+            // config; the rate limiter's ceiling can be advertised here
+            // when the registry adopts the 0.3.0 capabilities surface.
+            max_publish_per_minute: None,
         },
         read_authentication_methods: if cfg.auth.enabled {
             vec!["bearer-jwt".into()]
