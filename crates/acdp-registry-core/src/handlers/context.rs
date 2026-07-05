@@ -582,6 +582,7 @@ pub async fn retrieve<S: ExtendedRegistryStore + 'static>(
             // matches the ctx_id authority the caller asked for, so
             // consumers re-verify it against the origin, not this proxy.
             registry_receipt: verified.inner.registry_receipt.clone(),
+            lineage_head_receipt: None,
             extensions: Default::default(),
         };
         if let Some(emitter) = &state.webhook {

@@ -990,6 +990,7 @@ fn full_context(body: Body, status: Status, receipt: Option<serde_json::Value>) 
             extensions: Default::default(),
         },
         registry_receipt: receipt,
+        lineage_head_receipt: None,
         extensions: Default::default(),
     }
 }
