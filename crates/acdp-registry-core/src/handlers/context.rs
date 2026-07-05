@@ -526,6 +526,7 @@ fn context_type_str(t: &acdp::types::primitives::ContextType) -> String {
         ContextType::Analysis => "analysis".into(),
         ContextType::Prediction => "prediction".into(),
         ContextType::Alert => "alert".into(),
+        ContextType::KeyRevocation => "key-revocation".into(),
         ContextType::Custom(s) => s.clone(),
     }
 }
@@ -573,6 +574,7 @@ pub async fn retrieve<S: ExtendedRegistryStore + 'static>(
             body: verified.body().clone(),
             registry_state: acdp::types::body::RegistryState {
                 status: acdp::types::primitives::Status::Active,
+                lifecycle_events: None,
                 extensions: Default::default(),
             },
             // Pass the upstream registry's receipt through verbatim (the
@@ -583,6 +585,7 @@ pub async fn retrieve<S: ExtendedRegistryStore + 'static>(
             // consumers re-verify it against the origin, not this proxy.
             registry_receipt: verified.inner.registry_receipt.clone(),
             lineage_head_receipt: None,
+            log_inclusion: None,
             extensions: Default::default(),
         };
         if let Some(emitter) = &state.webhook {

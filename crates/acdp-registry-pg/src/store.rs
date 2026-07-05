@@ -987,10 +987,12 @@ fn full_context(body: Body, status: Status, receipt: Option<serde_json::Value>) 
         body,
         registry_state: RegistryState {
             status,
+            lifecycle_events: None,
             extensions: Default::default(),
         },
         registry_receipt: receipt,
         lineage_head_receipt: None,
+        log_inclusion: None,
         extensions: Default::default(),
     }
 }
@@ -1004,6 +1006,7 @@ fn context_type_str(t: &acdp::types::primitives::ContextType) -> String {
         ContextType::Analysis => "analysis".into(),
         ContextType::Prediction => "prediction".into(),
         ContextType::Alert => "alert".into(),
+        ContextType::KeyRevocation => "key-revocation".into(),
         ContextType::Custom(s) => s.clone(),
     }
 }
@@ -1013,6 +1016,7 @@ fn parse_status(s: &str) -> Status {
         "active" => Status::Active,
         "superseded" => Status::Superseded,
         "expired" => Status::Expired,
+        "retracted" => Status::Retracted,
         other => Status::Other(other.to_string()),
     }
 }
