@@ -24,7 +24,7 @@ readme        = "README.md"
 # Protocol library — reuse types, crypto, validation, DID resolution.
 # ACDP 0.3.0 (pagination helpers, `Body::from_publish_request`), consumed
 # from the sibling checkout until 0.3.0 is published to crates.io.
-acdp = { path = "../acdp-rs", features = ["server", "client"] }
+acdp = { version = "0.4.0", features = ["server", "client"] }
 
 # HTTP
 axum       = { version = "0.7", features = ["macros"] }
