@@ -124,6 +124,12 @@ enabled = false
 # fragment on every rotation.
 key_id_fragment = "receipt-key-1"
 
+# Lineage-head receipts (RFC-ACDP-0011, ACDP 0.3.0): mint a registry-signed
+# head attestation on every GET /lineages/{id}/current response, signed with
+# the SAME receipt key (no new key role). Requires a signing key above;
+# advertises `acdp-registry-head-receipts` and acdp_version 0.3.0.
+# head_receipts = false
+
 # Rotated-out receipt verification keys. RFC-ACDP-0010 §9: these stay in the
 # DID document's verificationMethod indefinitely (removed from
 # assertionMethod only). Dropping an entry bricks every receipt that key
@@ -131,3 +137,13 @@ key_id_fragment = "receipt-key-1"
 # [[receipt.retired_keys]]
 # public_key_b64  = "<base64 of the raw 32-byte Ed25519 public key>"
 # key_id_fragment = "receipt-key-0"
+
+[lifecycle]
+# Lifecycle events & retraction (RFC-ACDP-0013, ACDP 0.3.0). When true the
+# registry serves POST /contexts/{ctx_id}/retract and /republish
+# (producer-signed events, verified like a publish), derives status with the
+# retracted > superseded > expired > active precedence, excludes retracted
+# contexts from default search and /current, and advertises
+# `acdp-registry-lifecycle` + acdp_version 0.3.0. Retraction is
+# mark-not-delete: bodies stay retrievable forever.
+enabled = false

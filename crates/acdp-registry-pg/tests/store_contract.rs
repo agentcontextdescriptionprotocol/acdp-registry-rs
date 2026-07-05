@@ -230,3 +230,248 @@ async fn concurrent_supersession_has_exactly_one_winner() {
         .expect("current exists");
     assert_eq!(current.body.ctx_id, winner.ctx_id);
 }
+
+// ─── Lifecycle events (RFC-ACDP-0013): the commit_lifecycle_event contract ───
+
+mod lifecycle {
+    use super::*;
+    use acdp::registry::LifecycleCommitOutcome;
+    use acdp::types::lifecycle::{LifecycleEvent, LifecycleEventType};
+    use acdp::types::primitives::{CtxId, LineageId, Status};
+
+    fn event(
+        actor: &AgentDid,
+        ctx_id: &CtxId,
+        event_type: LifecycleEventType,
+        reason: Option<&str>,
+    ) -> LifecycleEvent {
+        event_with_id(
+            &uuid::Uuid::new_v4().to_string(),
+            actor,
+            ctx_id,
+            event_type,
+            reason,
+        )
+    }
+
+    fn event_with_id(
+        event_id: &str,
+        actor: &AgentDid,
+        ctx_id: &CtxId,
+        event_type: LifecycleEventType,
+        reason: Option<&str>,
+    ) -> LifecycleEvent {
+        // Signature verification is the SERVER's §6 step 3; the store
+        // contract is exercised with unsigned events.
+        LifecycleEvent::new(
+            event_id.to_string(),
+            ctx_id.clone(),
+            event_type,
+            chrono::Utc::now(),
+            actor.clone(),
+            reason.map(str::to_string),
+        )
+        .expect("valid event")
+    }
+
+    async fn published_ctx(store: &Arc<PgStore>, seed: u8, title: &str) -> (CtxId, LineageId) {
+        let p = producer(seed);
+        let outcome = commit(Arc::clone(store), request(&p, title), None)
+            .await
+            .unwrap()
+            .unwrap();
+        let r = response(&outcome);
+        (r.ctx_id.clone(), r.lineage_id.clone())
+    }
+
+    /// Mirrors the SQLite `lifecycle_commit_contract` — see that test for
+    /// the step-by-step rationale. The shared Postgres database is not
+    /// truncated here, so search assertions key on a per-run unique token.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lifecycle_commit_contract() {
+        let Some(url) = pg_url_or_skip() else { return };
+        let store = store(&url).await;
+        let actor = AgentDid::new("did:web:agents.test:contract-61".to_string());
+        let token = format!("lc{}", uuid::Uuid::new_v4().simple());
+        let (ctx_id, lineage_id) = published_ctx(&store, 61, &token).await;
+
+        // Unknown ctx → NotFound (visibility is the server's job).
+        let ghost = CtxId(format!(
+            "acdp://{AUTHORITY}/00000000-0000-4000-8000-0000000000bb"
+        ));
+        let ghost_event = event(&actor, &ghost, LifecycleEventType::Retracted, None);
+        assert!(matches!(
+            store.commit_lifecycle_event(&ghost_event),
+            Err(AcdpError::NotFound(_))
+        ));
+
+        // Retract → Applied with the §7.2-projected state.
+        let retract = event(
+            &actor,
+            &ctx_id,
+            LifecycleEventType::Retracted,
+            Some("bad data"),
+        );
+        let ctx = match store.commit_lifecycle_event(&retract).unwrap() {
+            LifecycleCommitOutcome::Applied(c) => c,
+            other => panic!("expected Applied, got {other:?}"),
+        };
+        assert!(matches!(ctx.registry_state.status, Status::Retracted));
+        assert_eq!(
+            ctx.registry_state
+                .lifecycle_events
+                .as_deref()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Projections: get(), current(), and the search status filter.
+        let got = store.get(&ctx_id).unwrap().unwrap();
+        assert!(matches!(got.registry_state.status, Status::Retracted));
+        assert_eq!(got.body.title, token);
+        assert_eq!(
+            got.registry_state.lifecycle_events.as_deref().unwrap(),
+            std::slice::from_ref(&retract)
+        );
+        assert!(store.current(&lineage_id).unwrap().is_none());
+        let default_search = store
+            .search(
+                &acdp::types::search::SearchParams {
+                    q: Some(token.clone()),
+                    ..Default::default()
+                },
+                None,
+                true,
+            )
+            .unwrap();
+        assert!(default_search.matches.is_empty());
+        let retracted_search = store
+            .search(
+                &acdp::types::search::SearchParams {
+                    q: Some(token.clone()),
+                    status: Some("retracted".into()),
+                    ..Default::default()
+                },
+                None,
+                true,
+            )
+            .unwrap();
+        assert_eq!(retracted_search.matches.len(), 1);
+
+        // Byte-identical retry → IdempotentReplay, nothing appended.
+        let ctx = match store.commit_lifecycle_event(&retract).unwrap() {
+            LifecycleCommitOutcome::IdempotentReplay(c) => c,
+            other => panic!("expected IdempotentReplay, got {other:?}"),
+        };
+        assert_eq!(
+            ctx.registry_state
+                .lifecycle_events
+                .as_deref()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Same event_id, different content → SchemaViolation.
+        let divergent = event_with_id(
+            &retract.event_id,
+            &actor,
+            &ctx_id,
+            LifecycleEventType::Retracted,
+            Some("a different reason"),
+        );
+        assert!(matches!(
+            store.commit_lifecycle_event(&divergent),
+            Err(AcdpError::SchemaViolation(_))
+        ));
+
+        // Double retract (fresh id) → InvalidLifecycleTransition.
+        let double = event(&actor, &ctx_id, LifecycleEventType::Retracted, None);
+        assert!(matches!(
+            store.commit_lifecycle_event(&double),
+            Err(AcdpError::InvalidLifecycleTransition(_))
+        ));
+
+        // Unregistered event_type → SchemaViolation (§7.3).
+        let unregistered = event(
+            &actor,
+            &ctx_id,
+            LifecycleEventType::Other("annotated".into()),
+            None,
+        );
+        assert!(matches!(
+            store.commit_lifecycle_event(&unregistered),
+            Err(AcdpError::SchemaViolation(_))
+        ));
+
+        // Republish reverses; both events retained; head restored.
+        let republish = event(&actor, &ctx_id, LifecycleEventType::Republished, None);
+        let ctx = store
+            .commit_lifecycle_event(&republish)
+            .unwrap()
+            .into_context();
+        assert!(matches!(ctx.registry_state.status, Status::Active));
+        assert_eq!(
+            ctx.registry_state
+                .lifecycle_events
+                .as_deref()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(store.current(&lineage_id).unwrap().is_some());
+
+        // Republish of a not-retracted context → InvalidLifecycleTransition.
+        let spurious = event(&actor, &ctx_id, LifecycleEventType::Republished, None);
+        assert!(matches!(
+            store.commit_lifecycle_event(&spurious),
+            Err(AcdpError::InvalidLifecycleTransition(_))
+        ));
+    }
+
+    /// N concurrent retracts (distinct event_ids) racing the same
+    /// context: exactly ONE applies (the `FOR UPDATE` row lock is the
+    /// serialization point); every loser gets the contract outcome.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_retracts_have_exactly_one_winner() {
+        let Some(url) = pg_url_or_skip() else { return };
+        let store = store(&url).await;
+        let actor = AgentDid::new("did:web:agents.test:contract-62".to_string());
+        let token = format!("lcrace{}", uuid::Uuid::new_v4().simple());
+        let (ctx_id, _) = published_ctx(&store, 62, &token).await;
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                let e = event(&actor, &ctx_id, LifecycleEventType::Retracted, None);
+                tokio::task::spawn_blocking(move || store.commit_lifecycle_event(&e))
+            })
+            .collect();
+        let mut applied = 0usize;
+        let mut conflicts = 0usize;
+        for h in handles {
+            match h.await.unwrap() {
+                Ok(LifecycleCommitOutcome::Applied(_)) => applied += 1,
+                Ok(LifecycleCommitOutcome::IdempotentReplay(_)) => {
+                    panic!("distinct event_ids can never replay")
+                }
+                Err(AcdpError::InvalidLifecycleTransition(_)) => conflicts += 1,
+                Err(other) => panic!("unexpected error under race: {other:?}"),
+            }
+        }
+        assert_eq!(applied, 1, "exactly one retract wins");
+        assert_eq!(conflicts, THREADS - 1, "every loser gets the 409 outcome");
+
+        let ctx = store.get(&ctx_id).unwrap().unwrap();
+        assert_eq!(
+            ctx.registry_state
+                .lifecycle_events
+                .as_deref()
+                .unwrap()
+                .len(),
+            1,
+            "append-only history carries exactly the winner"
+        );
+    }
+}

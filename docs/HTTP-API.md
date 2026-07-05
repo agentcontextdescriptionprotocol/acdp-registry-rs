@@ -16,6 +16,8 @@ The complete inbound surface of `acdp-registry`. Routes are assembled in
 | GET  | `/contexts/{ctx_id}`             | optional bearer | always |
 | GET  | `/contexts/{ctx_id}/body`        | optional bearer | always |
 | GET  | `/contexts/search`               | optional bearer | always |
+| POST | `/contexts/{ctx_id}/retract`     | producer-signed event | always (501 unless `lifecycle.enabled`) |
+| POST | `/contexts/{ctx_id}/republish`   | producer-signed event | always (501 unless `lifecycle.enabled`) |
 | GET  | `/lineages/{lineage_id}`         | optional bearer | always |
 | GET  | `/lineages/{lineage_id}/current` | optional bearer | always |
 | POST | `/auth/challenge`                | none        | `auth.enabled` |
@@ -149,6 +151,13 @@ published before receipts were enabled omit it (no backfill — see
 [RECEIPTS.md](RECEIPTS.md)). Foreign retrievals pass the upstream's verified
 receipt through verbatim.
 
+On a lifecycle-advertising registry (`lifecycle.enabled`, ACDP 0.3.0) a
+context that has been retracted/republished carries its append-only
+`registry_state.lifecycle_events` array (RFC-ACDP-0013 §4.1; omitted when
+empty) and its `status` reflects the §7.2 precedence
+(`retracted` > `superseded` > `expired` > `active`). Retraction is
+mark-not-delete: the body of a retracted context is served unchanged.
+
 ### `GET /contexts/{ctx_id}/body`
 
 As above, but returns only the context `Body` (no envelope metadata, and
@@ -165,7 +174,7 @@ Query parameters (all optional):
 | `q` | Full-text query. |
 | `type` | Context type filter. |
 | `domain`, `tags`, `agent_id`, `schema_uri`, `derived_from` | Exact-match facets. |
-| `status` | Lifecycle status filter. |
+| `status` | Status filter (default `active`). A retracted context matches only `status=retracted` — never the default, nor `superseded`/`expired` even where those facts also hold (RFC-ACDP-0013 §8.2). |
 | `visibility` | Narrow to `public` / `restricted` / `private`. |
 | `created_after`, `created_before` | RFC 3339 bounds on creation time. |
 | `data_period_start_after`, `data_period_end_before` | Bounds on the context data period. |
@@ -182,11 +191,71 @@ is absent.
 ### `GET /lineages/{lineage_id}`
 
 Every version in a lineage as a `FullContext` array, visibility- and
-tenant-filtered. Optional bearer.
+tenant-filtered. Optional bearer. Each version carries its own projected
+`status` and (under the lifecycle profile) its `lifecycle_events` — the
+lineage array is the record, and the record includes withdrawals.
 
 ### `GET /lineages/{lineage_id}/current`
 
-The newest non-superseded version in the lineage. `404` if none is visible.
+The newest version that is **neither superseded nor retracted**
+(RFC-ACDP-0004 §5.2 as amended by RFC-ACDP-0013 §8.3 — an expired head is
+still a valid head). `404` when the lineage is unknown, no version is
+visible, or every version is superseded-or-retracted; retracting a linear
+lineage's head therefore takes the lineage off `/current` entirely until
+the producer republishes it or supersedes it with a fresh version.
+
+When `receipt.head_receipts = true` (ACDP 0.3.0 / RFC-ACDP-0011) the
+response additionally carries a top-level `lineage_head_receipt`: a
+registry-signed, per-response attestation that "as of `as_of`, the head of
+this lineage is `head_ctx_id` at `head_version` with `head_status`". It is
+minted after head selection (so it can never name a superseded or
+retracted head), signed with the RFC-ACDP-0010 receipt key, never
+persisted, and never attached to body-only responses. See
+[RECEIPTS.md](RECEIPTS.md#lineage-head-receipts-acdp-030--rfc-acdp-0011).
+
+### `POST /contexts/{ctx_id}/retract`, `POST /contexts/{ctx_id}/republish` *(ACDP 0.3.0)*
+
+Lifecycle events & retraction (RFC-ACDP-0013 §6). Mounted always; a
+registry without `lifecycle.enabled = true` answers
+`501 not_implemented`. The request body is a closed envelope with exactly
+one member:
+
+```json
+{
+  "event": {
+    "event_id": "018f6d0a-7b2e-4c4d-9e1f-3a5b7c9d1e2f",
+    "ctx_id": "acdp://registry.example.com/1234...",
+    "event_type": "retracted",
+    "occurred_at": "2026-07-04T09:15:42.000Z",
+    "actor": "did:web:agents.example.com:producer",
+    "reason": "underlying data source found to be fabricated",
+    "signature": { "algorithm": "ed25519", "key_id": "…#key-2", "value": "…" }
+  }
+}
+```
+
+Processing follows §6 in order: visibility-first resolution (an invisible
+context 404s — no existence oracle), closed-shape validation (any `body`
+member or body-field-named member → `400 immutable_field`; other unknown
+members → `schema_violation`; `event.ctx_id` must equal the path
+`{ctx_id}`; `event_type` must match the endpoint), actor authentication
+(`actor` must equal the context's `body.agent_id`; the event **must** be
+signed and the signature verifies through the same DID pipeline as a
+publish — `did:web` via resolution, `did:key` offline), then the strict
+alternation check (`retracted` only when not retracted, `republished` only
+when retracted; violation → `409 invalid_lifecycle_transition`) and the
+atomic append. Per-agent rate limiting applies as to publish, keyed by the
+event actor.
+
+Response: `200` with the post-transition full-retrieval envelope (`body` +
+`registry_state`, `status` re-derived, `lifecycle_events` including the
+new event). A retry with an already-appended `event_id` and byte-identical
+content is idempotent (200, nothing appended); the same `event_id` with
+different content is a `400 schema_violation`.
+
+Only the producer may use these endpoints (delegation and a
+registry-attested admin path are out of scope for now; registry-initiated
+events would be recorded directly by the operator against the store).
 
 ---
 
@@ -334,10 +403,12 @@ documents only the registry's HTTP-status projection of them.
 | 400 | `hash_mismatch` | Recomputed `content_hash` ≠ declared. |
 | 400 | `data_ref_hash_mismatch` | An embedded/remote `data_ref` hash ≠ declared. |
 | 400 | `key_resolution_failed` | DID document fetched but the key isn't usable. |
+| 400 | `immutable_field` | A lifecycle request tried to supply/alter body content (RFC-ACDP-0013 §6 step 2). |
 | 400 | (signature) | Bad signature / unsupported algorithm. |
 | 403 | `not_authorized` | Bad/expired/revoked bearer, challenge failure, visibility denial, tenant-scope denial in strict mode. |
 | 404 | `not_found` | Context/lineage absent or not visible to the caller. |
 | 409 | `duplicate_publish` / `superseded_target` | Idempotency/lineage conflict (race). |
+| 409 | `invalid_lifecycle_transition` | Double retract, or republish of a never-retracted context (RFC-ACDP-0013 §6 step 4). |
 | 413 | (payload) | Body over `max_payload_bytes`, or embedded data over `max_embedded_bytes`. |
 | 429 | `rate_limited` | Publish/challenge bucket drained; carries `Retry-After`. |
 | 500 | `internal_error` | Storage/config/internal failure (detail logged, not returned). |

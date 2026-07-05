@@ -76,6 +76,15 @@ impl RegistryStore for MemoryStore {
     fn commit_publish(&self, commit: PublishCommit<'_>) -> Result<PublishCommitOutcome, AcdpError> {
         self.inner.commit_publish(commit)
     }
+    fn commit_lifecycle_event(
+        &self,
+        event: &acdp::types::lifecycle::LifecycleEvent,
+    ) -> Result<acdp::registry::LifecycleCommitOutcome, AcdpError> {
+        // Delegate explicitly: without this the trait DEFAULT (a loud
+        // `not_implemented`) would shadow the inner store's real
+        // implementation (RFC-ACDP-0013).
+        self.inner.commit_lifecycle_event(event)
+    }
     fn search(
         &self,
         params: &SearchParams,

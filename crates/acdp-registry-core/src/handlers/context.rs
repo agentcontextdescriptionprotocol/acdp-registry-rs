@@ -915,6 +915,199 @@ pub async fn current<S: ExtendedRegistryStore + 'static>(
     Ok(Json(ctx))
 }
 
+/// `POST /contexts/{ctx_id}/retract` (RFC-ACDP-0013 §6).
+pub async fn retract<S: ExtendedRegistryStore + 'static>(
+    State(state): State<Arc<AppState<S>>>,
+    headers: HeaderMap,
+    Path(ctx_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<acdp::types::body::FullContext>, RegistryError> {
+    lifecycle_transition(
+        state,
+        headers,
+        ctx_id,
+        body,
+        acdp::types::lifecycle::LifecycleEventType::Retracted,
+    )
+    .await
+}
+
+/// `POST /contexts/{ctx_id}/republish` (RFC-ACDP-0013 §6).
+pub async fn republish<S: ExtendedRegistryStore + 'static>(
+    State(state): State<Arc<AppState<S>>>,
+    headers: HeaderMap,
+    Path(ctx_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<acdp::types::body::FullContext>, RegistryError> {
+    lifecycle_transition(
+        state,
+        headers,
+        ctx_id,
+        body,
+        acdp::types::lifecycle::LifecycleEventType::Republished,
+    )
+    .await
+}
+
+/// Shared RFC-ACDP-0013 §6 pipeline behind both lifecycle endpoints.
+///
+/// Ordering follows §6 (and §14: visibility before any other check, so
+/// the endpoints never leak existence):
+///
+/// 1. Profile gate — a registry not advertising `acdp-registry-lifecycle`
+///    returns `not_implemented` (HTTP 501) before touching the request.
+/// 2. Envelope + event shape (`acdp::registry::parse_lifecycle_request`):
+///    a body-content member is the `immutable_field` category error
+///    (fixture lc-002); the event parses through the closed §4 schema.
+/// 3. Path binding: `event.ctx_id` must equal the path `{ctx_id}`.
+/// 4. Per-agent rate limiting (RFC-ACDP-0008 §4.3 — lifecycle endpoints
+///    are writes), keyed by the event actor like publish is keyed by the
+///    signing agent.
+/// 5. Tenant gate (mirrors `retrieve`): a cross-tenant ctx_id 404s.
+/// 6. The SDK server pipeline: visibility-first resolution, event
+///    validation + endpoint binding, actor authentication
+///    (`actor == body.agent_id`), signature verification through the full
+///    RFC-ACDP-0001 §5.11 resolver pipeline (`did:web`) or the pure
+///    offline path (`did:key`), strict-alternation transition validation,
+///    and the atomic append — returning the post-transition
+///    full-retrieval envelope (or the current state on a byte-identical
+///    `event_id` retry).
+///
+/// The producer's authentication is the event signature itself (like a
+/// publish); a bearer token is only consulted for read visibility.
+async fn lifecycle_transition<S: ExtendedRegistryStore + 'static>(
+    state: Arc<AppState<S>>,
+    headers: HeaderMap,
+    ctx_id: String,
+    body: Bytes,
+    event_type: acdp::types::lifecycle::LifecycleEventType,
+) -> Result<Json<acdp::types::body::FullContext>, RegistryError> {
+    use acdp::error::AcdpError;
+    use acdp::types::lifecycle::LifecycleEventType;
+
+    // 1. Profile gate (§6: non-advertising registries MUST 501).
+    if !state.config.lifecycle.enabled {
+        return Err(RegistryError::Acdp(AcdpError::NotImplemented(
+            "this registry does not advertise acdp-registry-lifecycle \
+             (RFC-ACDP-0013 §6: lifecycle endpoints are not implemented)"
+                .into(),
+        )));
+    }
+
+    // 2. Closed envelope + closed event schema. `immutable_field` for
+    //    body-content members wins over the generic closed-shape error.
+    let raw: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| RegistryError::Acdp(AcdpError::SchemaViolation(e.to_string())))?;
+    let (event, _raw_event) =
+        acdp::registry::parse_lifecycle_request(&raw).map_err(RegistryError::Acdp)?;
+
+    // 3. §6 step 2: the event binds to exactly one context — the path's.
+    let path_ctx = CtxId::parse(ctx_id).map_err(RegistryError::Acdp)?;
+    if event.ctx_id != path_ctx {
+        return Err(RegistryError::Acdp(AcdpError::SchemaViolation(format!(
+            "event.ctx_id '{}' does not match the request path ctx_id '{path_ctx}' \
+             (RFC-ACDP-0013 §6 step 2)",
+            event.ctx_id
+        ))));
+    }
+
+    // 4. Per-agent write rate limit, keyed by the event actor.
+    if let Some(limiter) = &state.rate_limiter {
+        if let Err(retry_after_seconds) = limiter.check(event.actor.as_str()) {
+            return Err(RegistryError::RateLimited {
+                retry_after_seconds,
+            });
+        }
+    }
+
+    // 5. Tenant gate — same shape as `retrieve`: a ctx_id outside the
+    //    caller's tenant is indistinguishable from a missing one.
+    let requested_tenant = tenant_for_request(&state, &headers)?;
+    let stored_tenant = state
+        .server
+        .store()
+        .tenant_of_ctx(path_ctx.as_str())
+        .await?;
+    if let Some(tenant) = &requested_tenant {
+        if stored_tenant.as_deref().unwrap_or("default") != tenant {
+            return Err(RegistryError::Acdp(AcdpError::NotFound(
+                "context not found".into(),
+            )));
+        }
+    }
+
+    // 6. Full §6 pipeline in the SDK server. Visibility is evaluated for
+    //    the bearer-authenticated requester (anonymous otherwise) BEFORE
+    //    actor/signature checks — error ordering never lets an
+    //    unauthorized caller learn a context exists (§14).
+    let requester = caller_from_headers(&state, &headers)?;
+    let server = state.server.clone();
+    let ctx = if event.actor.as_str().starts_with("did:key:") {
+        // did:key verification is pure/offline — run on the blocking pool
+        // like the other synchronous store pipelines.
+        let event2 = event.clone();
+        let requester2 = requester.clone();
+        tokio::task::spawn_blocking(move || match event_type {
+            LifecycleEventType::Retracted => {
+                server.retract_verified_did_key(&event2, requester2.as_ref())
+            }
+            _ => server.republish_verified_did_key(&event2, requester2.as_ref()),
+        })
+        .await
+        .map_err(|e| RegistryError::Internal(format!("join: {e}")))??
+    } else {
+        // did:web (and any future resolvable method): the full
+        // RFC-ACDP-0001 §5.11 resolver pipeline, as at publish.
+        let resolver = state.auth.resolver.clone();
+        match event_type {
+            LifecycleEventType::Retracted => {
+                server
+                    .retract_verified(&event, requester.as_ref(), &resolver)
+                    .await?
+            }
+            _ => {
+                server
+                    .republish_verified(&event, requester.as_ref(), &resolver)
+                    .await?
+            }
+        }
+    };
+
+    if let Some(emitter) = &state.webhook {
+        let webhook_tenant = stored_tenant.filter(|t| t != "default");
+        let common = (
+            state.config.registry.authority.clone(),
+            ctx.body.ctx_id.as_str().to_string(),
+            ctx.body.lineage_id.as_str().to_string(),
+        );
+        let evt = match event.event_type {
+            acdp::types::lifecycle::LifecycleEventType::Retracted => {
+                WebhookEvent::ContextRetracted {
+                    registry_authority: common.0,
+                    ctx_id: common.1,
+                    lineage_id: common.2,
+                    actor: event.actor.as_str().to_string(),
+                    event_id: event.event_id.clone(),
+                    reason: event.reason.clone(),
+                    at: Utc::now(),
+                }
+            }
+            _ => WebhookEvent::ContextRepublished {
+                registry_authority: common.0,
+                ctx_id: common.1,
+                lineage_id: common.2,
+                actor: event.actor.as_str().to_string(),
+                event_id: event.event_id.clone(),
+                reason: event.reason.clone(),
+                at: Utc::now(),
+            },
+        };
+        emitter.emit_with_tenant(evt, webhook_tenant);
+    }
+
+    Ok(Json(ctx))
+}
+
 /// Pull an authenticated caller DID out of the `Authorization` header.
 ///
 /// Returns `Ok(None)` for unauthenticated requests (no header, non-Bearer

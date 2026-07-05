@@ -45,6 +45,11 @@ The binary validates config before serving and refuses to boot on a misconfig
 - **Receipts** — a configured `[receipt]` key must parse (exactly one source,
   valid base64, 32 bytes), and is incompatible with `playground.enabled`
   (RFC-ACDP-0010 §7: a receipts registry has no unverified publish path).
+- **0.3.0 profiles** — `receipt.head_receipts = true` requires a configured
+  `[receipt]` signing key (RFC-ACDP-0011 §9: head receipts are signed with
+  the receipt key). Listing `acdp-registry-head-receipts` or
+  `acdp-registry-lifecycle` in `registry.profiles` without enabling the
+  matching feature is refused as a false capability advertisement.
 
 ## Reference
 
@@ -193,6 +198,7 @@ operator runbook (rotation, retention, backfill policy).
 | `signing_key_seed_b64` | string | `""` | Standard base64 of the raw 32-byte Ed25519 seed. Exactly one of the two key sources may be set. |
 | `signing_key_path` | path | — | File (e.g. mounted secret) whose contents are that base64 string. |
 | `key_id_fragment` | string | `receipt-key-1` | Fragment under the registry DID; `signature.key_id = did:web:<authority>#<fragment>`. Pick a fresh fragment per rotation. |
+| `head_receipts` | bool | `false` | *(ACDP 0.3.0)* Mint a lineage-head receipt on every `GET /lineages/{id}/current` response (RFC-ACDP-0011). Requires a configured signing key (the same receipt key signs — no new key role); advertises `acdp-registry-head-receipts` and bumps the capability claim to `0.3.0`. |
 
 #### `[[receipt.retired_keys]]`
 
@@ -205,3 +211,18 @@ keys indefinitely; remove only on confirmed compromise.
 |-----|------|---------|-------|
 | `public_key_b64` | string | — | Standard base64 of the raw 32-byte Ed25519 **public** key. |
 | `key_id_fragment` | string | — | The fragment the key was published under while active. |
+
+### `[lifecycle]` *(ACDP 0.3.0)*
+
+Lifecycle events & retraction (RFC-ACDP-0013). When enabled the registry
+serves `POST /contexts/{ctx_id}/retract` / `/republish`, derives `status`
+with the `retracted > superseded > expired > active` precedence, excludes
+retracted contexts from default search and from `/current`, serves
+`registry_state.lifecycle_events`, advertises `acdp-registry-lifecycle`,
+and bumps the capability claim to `0.3.0`. When disabled (the default)
+both endpoints answer `501 not_implemented` and neither `lifecycle_events`
+nor the `retracted` status is ever emitted.
+
+| Key | Type | Default | Notes |
+|-----|------|---------|-------|
+| `enabled` | bool | `false` | Opt into the RFC-ACDP-0013 endpoint surface and status semantics. |

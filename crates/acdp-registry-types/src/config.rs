@@ -23,6 +23,8 @@ pub struct RegistryConfig {
     pub playground: PlaygroundConfig,
     #[serde(default)]
     pub receipt: ReceiptConfig,
+    #[serde(default)]
+    pub lifecycle: LifecycleConfig,
 }
 
 impl RegistryConfig {
@@ -92,6 +94,7 @@ impl RegistryConfig {
             limits: LimitsConfig::default(),
             playground: PlaygroundConfig::default(),
             receipt: ReceiptConfig::default(),
+            lifecycle: LifecycleConfig::default(),
         }
     }
 }
@@ -672,6 +675,17 @@ pub struct ReceiptConfig {
     /// an entry ONLY on confirmed key compromise.
     #[serde(default)]
     pub retired_keys: Vec<RetiredReceiptKey>,
+    /// Lineage-head receipts (RFC-ACDP-0011, ACDP 0.3.0). When `true`
+    /// (and a receipt signing key is configured — startup validation
+    /// enforces the prerequisite) every `GET /lineages/{id}/current`
+    /// response carries a freshly minted `lineage_head_receipt` signed
+    /// with the SAME receipt key (§5: head receipts introduce no new
+    /// key role), and the registry advertises the
+    /// `acdp-registry-head-receipts` profile plus `acdp_version` ≥
+    /// 0.3.0. Head receipts are ephemeral serve-time attestations —
+    /// never persisted, never attached to body-only responses (§6).
+    #[serde(default)]
+    pub head_receipts: bool,
 }
 
 impl Default for ReceiptConfig {
@@ -681,8 +695,34 @@ impl Default for ReceiptConfig {
             signing_key_path: None,
             key_id_fragment: default_receipt_key_fragment(),
             retired_keys: Vec::new(),
+            head_receipts: false,
         }
     }
+}
+
+/// Lifecycle events & retraction (RFC-ACDP-0013, ACDP 0.3.0).
+///
+/// When `enabled`, the registry:
+///   * serves `POST /contexts/{ctx_id}/retract` and
+///     `POST /contexts/{ctx_id}/republish` (producer-signed events,
+///     verified through the same DID pipeline as a publish);
+///   * derives `status` with the §7.2 precedence
+///     (`retracted` > `superseded` > `expired` > `active`);
+///   * excludes retracted contexts from default search and from
+///     `/lineages/{id}/current` (§8);
+///   * serves `registry_state.lifecycle_events` on full retrieval and
+///     the lineage array;
+///   * advertises the `acdp-registry-lifecycle` profile plus
+///     `acdp_version` ≥ 0.3.0.
+///
+/// When disabled (the default), both endpoints return
+/// `not_implemented` (HTTP 501) and neither `lifecycle_events` nor the
+/// `retracted` status is ever emitted (§6).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LifecycleConfig {
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 fn default_receipt_key_fragment() -> String {

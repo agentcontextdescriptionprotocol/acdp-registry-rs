@@ -157,6 +157,13 @@ fn acdp_wire_code(err: &AcdpError) -> &'static str {
         AcdpError::KeyResolution(_) => "key_resolution_failed",
         AcdpError::KeyResolutionUnreachable(_) => "key_resolution_unreachable",
         AcdpError::InvalidSignature(_) => "invalid_signature",
+        // RFC-ACDP-0013 §10 — the lifecycle wire codes (ACDP 0.3.0).
+        // `immutable_field` is the category error for body-content members
+        // on a lifecycle request (activated from the v0.1.0 reservation);
+        // `invalid_lifecycle_transition` is the state conflict (double
+        // retract / spurious republish).
+        AcdpError::ImmutableField(_) => "immutable_field",
+        AcdpError::InvalidLifecycleTransition(_) => "invalid_lifecycle_transition",
         AcdpError::NotImplemented(_) => "not_implemented",
         AcdpError::DuplicatePublish(_) => "duplicate_publish",
         AcdpError::SupersededTarget { .. } => "superseded_target",
@@ -183,11 +190,15 @@ fn http_status_for_acdp(err: &AcdpError) -> u16 {
         | AcdpError::KeyResolution(_)
         | AcdpError::InvalidSignature(_)
         | AcdpError::InvalidCursor(_)
-        | AcdpError::CursorExpired => 400,
+        | AcdpError::CursorExpired
+        // RFC-ACDP-0013 §6 step 2 / §10: `immutable_field` is HTTP 400.
+        | AcdpError::ImmutableField(_) => 400,
         AcdpError::PayloadTooLarge(_) | AcdpError::EmbeddedTooLarge(_) => 413,
         AcdpError::KeyNotAuthorized(_) | AcdpError::NotAuthorized(_) => 403,
         AcdpError::NotFound(_) => 404,
-        AcdpError::DuplicatePublish(_) => 409,
+        // RFC-ACDP-0013 §6 step 4 / §10: a lifecycle-transition conflict is
+        // HTTP 409 — a state conflict, like the 409 arm of superseded_target.
+        AcdpError::DuplicatePublish(_) | AcdpError::InvalidLifecycleTransition(_) => 409,
         // RFC-ACDP-0007 §5 / RFC-ACDP-0003 §3.1: `superseded_target` is
         // 400 for static violations and 409 only for true race conditions.
         AcdpError::SupersededTarget { reason, .. } => match reason {
@@ -281,6 +292,23 @@ mod tests {
             acdp(AcdpError::Canonicalization("x".into())).wire_code(),
             "hash_mismatch"
         );
+    }
+
+    /// RFC-ACDP-0013 §10 — the two lifecycle wire codes map to their
+    /// registered code/status pairs: `immutable_field` is 400 (category
+    /// error, fixture lc-002), `invalid_lifecycle_transition` is 409
+    /// (state conflict, like the 409 arm of `superseded_target`).
+    #[test]
+    fn lifecycle_wire_codes_match_rfc0013_s10() {
+        let imm = acdp(AcdpError::ImmutableField("body member on /retract".into()));
+        assert_eq!(imm.wire_code(), "immutable_field");
+        assert_eq!(imm.http_status(), 400);
+
+        let conflict = acdp(AcdpError::InvalidLifecycleTransition(
+            "already retracted".into(),
+        ));
+        assert_eq!(conflict.wire_code(), "invalid_lifecycle_transition");
+        assert_eq!(conflict.http_status(), 409);
     }
 
     /// #11 — `data_ref_hash_mismatch` and `hash_mismatch` are distinct (both

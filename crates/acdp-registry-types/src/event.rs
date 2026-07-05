@@ -60,6 +60,40 @@ pub enum WebhookEvent {
         requester_did: Option<String>,
         at: DateTime<Utc>,
     },
+    /// A context was formally retracted (RFC-ACDP-0013 §6). Mark-not-delete:
+    /// the body remains retrievable; `status` becomes `retracted` and the
+    /// context falls out of default searches and `/current`.
+    ContextRetracted {
+        /// Authority of the emitting registry — see `ContextPublished`.
+        registry_authority: String,
+        ctx_id: String,
+        lineage_id: String,
+        /// The DID of the party performing the retraction — the producer
+        /// (`body.agent_id`) for endpoint-submitted events.
+        actor: String,
+        /// The actor-minted lifecycle `event_id` (RFC 9562 UUID).
+        event_id: String,
+        /// Optional human-readable explanation from the signed event.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        at: DateTime<Utc>,
+    },
+    /// A prior retraction was reversed (RFC-ACDP-0013 §6). `status`
+    /// re-derives as though never retracted; both events stay in history.
+    ContextRepublished {
+        /// Authority of the emitting registry — see `ContextPublished`.
+        registry_authority: String,
+        ctx_id: String,
+        lineage_id: String,
+        /// The DID of the party performing the republication.
+        actor: String,
+        /// The actor-minted lifecycle `event_id` (RFC 9562 UUID).
+        event_id: String,
+        /// Optional human-readable explanation from the signed event.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        at: DateTime<Utc>,
+    },
     /// A search query was executed.
     SearchExecuted {
         /// Authority of the emitting registry — see `ContextPublished`.
@@ -77,6 +111,8 @@ impl WebhookEvent {
         match self {
             Self::ContextPublished { .. } => "context.published",
             Self::ContextRetrieved { .. } => "context.retrieved",
+            Self::ContextRetracted { .. } => "context.retracted",
+            Self::ContextRepublished { .. } => "context.republished",
             Self::SearchExecuted { .. } => "search.executed",
         }
     }

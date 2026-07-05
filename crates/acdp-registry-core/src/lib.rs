@@ -52,6 +52,14 @@ pub fn build_router<S: ExtendedRegistryStore + 'static>(state: AppState<S>) -> R
         .route("/contexts/search", get(handlers::search::<S>))
         .route("/contexts/:ctx_id", get(handlers::retrieve::<S>))
         .route("/contexts/:ctx_id/body", get(handlers::retrieve_body::<S>))
+        // Lifecycle events & retraction (RFC-ACDP-0013 §6). Always
+        // mounted: a registry not advertising `acdp-registry-lifecycle`
+        // answers 501 not_implemented from the handler, per §6.
+        .route("/contexts/:ctx_id/retract", post(handlers::retract::<S>))
+        .route(
+            "/contexts/:ctx_id/republish",
+            post(handlers::republish::<S>),
+        )
         // Lineages
         .route("/lineages/:lineage_id", get(handlers::lineage::<S>))
         .route("/lineages/:lineage_id/current", get(handlers::current::<S>));

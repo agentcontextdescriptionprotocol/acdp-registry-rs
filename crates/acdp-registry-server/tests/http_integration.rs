@@ -104,6 +104,7 @@ fn config(playground: bool) -> RegistryConfig {
             ..Default::default()
         },
         receipt: Default::default(),
+        lifecycle: Default::default(),
     }
 }
 
@@ -170,6 +171,20 @@ async fn build_harness_with_caps(
             acdp_registry_core::receipt::build_signer(&cfg.receipt, &cfg.registry.authority)
                 .expect("receipt signer");
         server.with_receipt_signer(signer).expect("receipt signer")
+    } else {
+        server
+    };
+    // RFC-ACDP-0011: head receipts on /current (requires the signer).
+    let server = if cfg.receipt.head_receipts {
+        server
+            .with_lineage_head_receipts()
+            .expect("head receipts enabled")
+    } else {
+        server
+    };
+    // RFC-ACDP-0013: lifecycle events & retraction.
+    let server = if cfg.lifecycle.enabled {
+        server.with_lifecycle().expect("lifecycle enabled")
     } else {
         server
     };
@@ -2902,5 +2917,560 @@ async fn pre_receipts_idempotency_record_replays_after_enabling_receipts() {
     assert!(
         v.get("registry_receipt").is_none_or(|r| r.is_null()),
         "the original receipt-less response is returned verbatim: {v}"
+    );
+}
+
+// ─── ACDP 0.3.0: lifecycle events (RFC-ACDP-0013) + lineage-head receipts (RFC-ACDP-0011) ───
+
+/// 0.3.0 capabilities: did:key accepted (offline verification — no live
+/// DID hosting needed in tests) and the version claim the 0.3.0 profile
+/// builders require.
+fn caps_030() -> CapabilitiesDocument {
+    let mut c = caps();
+    c.acdp_version = "0.3.0".into();
+    c.supported_did_methods = vec!["did:web".into(), "did:key".into()];
+    c
+}
+
+/// Production-path harness (playground OFF) with lifecycle enabled and,
+/// optionally, receipts + head receipts — mirroring the binary's
+/// `serve_with_store` chaining.
+async fn lifecycle_harness(head_receipts: bool) -> Harness {
+    let mut cfg = config(false);
+    cfg.auth.did_methods = vec!["did:web".into(), "did:key".into()];
+    cfg.lifecycle.enabled = true;
+    if head_receipts {
+        cfg.receipt.signing_key_seed_b64 = B64.encode(RECEIPT_SEED);
+        cfg.receipt.head_receipts = true;
+    }
+    build_harness_with_caps(cfg, caps_030(), None).await
+}
+
+/// Build a signed lifecycle event envelope (`{"event": {...}}`) for the
+/// did:key producer derived from `seed` — the same identity
+/// `did_key_producer(seed)` publishes under, so `actor == body.agent_id`.
+fn signed_event_envelope(seed: u8, ctx_id: &str, event_type: &str, reason: Option<&str>) -> Value {
+    json!({ "event": signed_event(seed, ctx_id, event_type, reason) })
+}
+
+fn signed_event(seed: u8, ctx_id: &str, event_type: &str, reason: Option<&str>) -> Value {
+    signed_event_with_id(
+        seed,
+        &uuid::Uuid::new_v4().to_string(),
+        ctx_id,
+        event_type,
+        reason,
+    )
+}
+
+fn signed_event_with_id(
+    seed: u8,
+    event_id: &str,
+    ctx_id: &str,
+    event_type: &str,
+    reason: Option<&str>,
+) -> Value {
+    use acdp::types::lifecycle::{LifecycleEvent, LifecycleEventType};
+    let key = SigningKey::from_bytes(&[seed; 32]);
+    let did = acdp::did::key::did_key_from_ed25519(&key.verifying_key_bytes());
+    let key_id = acdp::did::key::did_key_url(&did).expect("did:key url");
+    let event = LifecycleEvent::new(
+        event_id.to_string(),
+        acdp::types::primitives::CtxId(ctx_id.to_string()),
+        LifecycleEventType::parse(event_type).unwrap(),
+        chrono::Utc::now(),
+        AgentDid::new(did),
+        reason.map(str::to_string),
+    )
+    .expect("valid event")
+    .sign_with(key, key_id)
+    .expect("signed event");
+    serde_json::to_value(&event).unwrap()
+}
+
+async fn post_lifecycle(
+    app: &axum::Router,
+    ctx_id: &str,
+    endpoint: &str,
+    envelope: &Value,
+) -> (StatusCode, Value) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/contexts/{}/{endpoint}",
+                    pct_encode_path_segment(ctx_id)
+                ))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(envelope).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let v = body_to_json(resp).await;
+    (status, v)
+}
+
+/// lc-001 — the full retraction flow: authenticated `/retract` →
+/// `status: retracted` with the signed event in `registry_state`; body
+/// still retrievable byte-for-byte (and `/body` unchanged); excluded
+/// from default search but returned under `status=retracted`; double
+/// retract → 409 `invalid_lifecycle_transition`; byte-identical retry →
+/// idempotent 200; `/republish` reverses with both events retained.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lc001_retraction_flow_end_to_end() {
+    let h = lifecycle_harness(false).await;
+    let p = did_key_producer(50);
+    let req = p
+        .publish_request()
+        .title("lc001 flow")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (status, v) = publish(&h.router, &req, None).await;
+    assert_eq!(status, StatusCode::OK, "publish body = {v}");
+    let ctx_id = v["ctx_id"].as_str().unwrap().to_string();
+
+    // Retract.
+    let envelope = signed_event_envelope(50, &ctx_id, "retracted", Some("fabricated source"));
+    let (status, v) = post_lifecycle(&h.router, &ctx_id, "retract", &envelope).await;
+    assert_eq!(status, StatusCode::OK, "retract body = {v}");
+    assert_eq!(v["registry_state"]["status"], "retracted");
+    let events = v["registry_state"]["lifecycle_events"].as_array().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0], envelope["event"], "event served verbatim");
+
+    // Full retrieval: 200, body intact, status retracted, events served.
+    let (status, full) = get_json(
+        &h.router,
+        &format!("/contexts/{}", pct_encode_path_segment(&ctx_id)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(full["body"]["title"], "lc001 flow");
+    assert_eq!(full["registry_state"]["status"], "retracted");
+    assert_eq!(
+        full["registry_state"]["lifecycle_events"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Body-only endpoint unaffected: bare signed body, no registry state.
+    let (status, bare) = get_json(
+        &h.router,
+        &format!("/contexts/{}/body", pct_encode_path_segment(&ctx_id)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bare["title"], "lc001 flow");
+    assert!(bare.get("registry_state").is_none());
+    assert!(bare.get("lifecycle_events").is_none());
+
+    // §8.2: excluded from the default (status=active) search…
+    let (status, res) = get_json(&h.router, "/contexts/search?q=lc001").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(res["matches"].as_array().unwrap().len(), 0);
+    // …and from status=superseded/expired; found under status=retracted.
+    let (_, res) = get_json(&h.router, "/contexts/search?q=lc001&status=retracted").await;
+    assert_eq!(res["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(res["matches"][0]["status"], "retracted");
+
+    // Double retract (fresh event_id) → 409 invalid_lifecycle_transition.
+    let double = signed_event_envelope(50, &ctx_id, "retracted", None);
+    let (status, v) = post_lifecycle(&h.router, &ctx_id, "retract", &double).await;
+    assert_eq!(status, StatusCode::CONFLICT, "body = {v}");
+    assert_eq!(v["error"]["code"], "invalid_lifecycle_transition");
+
+    // Byte-identical retry of the FIRST event → idempotent 200, nothing appended.
+    let (status, v) = post_lifecycle(&h.router, &ctx_id, "retract", &envelope).await;
+    assert_eq!(status, StatusCode::OK, "idempotent retry body = {v}");
+    assert_eq!(
+        v["registry_state"]["lifecycle_events"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Same event_id, DIFFERENT content, properly re-signed → the
+    // atomic commit's duplicate check rejects with schema_violation
+    // (§4: event_id MUST be unique within lifecycle_events).
+    let first_event_id = envelope["event"]["event_id"].as_str().unwrap();
+    let divergent = json!({
+        "event": signed_event_with_id(
+            50,
+            first_event_id,
+            &ctx_id,
+            "retracted",
+            Some("a different reason"),
+        )
+    });
+    let (status, v) = post_lifecycle(&h.router, &ctx_id, "retract", &divergent).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {v}");
+    assert_eq!(v["error"]["code"], "schema_violation");
+
+    // Republish → status re-derives to active; BOTH events retained.
+    let republish = signed_event_envelope(50, &ctx_id, "republished", Some("source cleared"));
+    let (status, v) = post_lifecycle(&h.router, &ctx_id, "republish", &republish).await;
+    assert_eq!(status, StatusCode::OK, "republish body = {v}");
+    assert_eq!(v["registry_state"]["status"], "active");
+    let events = v["registry_state"]["lifecycle_events"].as_array().unwrap();
+    assert_eq!(events.len(), 2, "append-only history retains both events");
+    assert_eq!(events[0]["event_type"], "retracted");
+    assert_eq!(events[1]["event_type"], "republished");
+
+    // Back in the default search.
+    let (_, res) = get_json(&h.router, "/contexts/search?q=lc001").await;
+    assert_eq!(res["matches"].as_array().unwrap().len(), 1);
+
+    // Republish of a not-retracted context → 409.
+    let spurious = signed_event_envelope(50, &ctx_id, "republished", None);
+    let (status, v) = post_lifecycle(&h.router, &ctx_id, "republish", &spurious).await;
+    assert_eq!(status, StatusCode::CONFLICT, "body = {v}");
+    assert_eq!(v["error"]["code"], "invalid_lifecycle_transition");
+}
+
+/// lc-002 — request-shape policing and authentication: body-content
+/// members → `immutable_field` (the category error, NOT a generic
+/// schema_violation); other unknown members → `schema_violation`;
+/// actor ≠ `agent_id` → `not_authorized`; unsigned producer events are
+/// rejected; the event must bind to the path ctx_id; non-advertising
+/// registries 501.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lc002_immutable_field_and_authentication() {
+    let h = lifecycle_harness(false).await;
+    let p = did_key_producer(51);
+    let req = p
+        .publish_request()
+        .title("lc002 target")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (status, v) = publish(&h.router, &req, None).await;
+    assert_eq!(status, StatusCode::OK, "publish body = {v}");
+    let ctx_id = v["ctx_id"].as_str().unwrap().to_string();
+
+    // Scenario A: a `body` member → immutable_field (HTTP 400).
+    let mut envelope = signed_event_envelope(51, &ctx_id, "retracted", None);
+    envelope["body"] = json!({ "title": "corrected title" });
+    let (status, v) = post_lifecycle(&h.router, &ctx_id, "retract", &envelope).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {v}");
+    assert_eq!(v["error"]["code"], "immutable_field");
+
+    // Scenario B: a body-field-named member (`summary`) → immutable_field.
+    let mut envelope = signed_event_envelope(51, &ctx_id, "retracted", None);
+    envelope["summary"] = json!("please update the summary too");
+    let (status, v) = post_lifecycle(&h.router, &ctx_id, "retract", &envelope).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(v["error"]["code"], "immutable_field");
+
+    // An unknown member NOT naming body content → plain schema_violation.
+    let mut envelope = signed_event_envelope(51, &ctx_id, "retracted", None);
+    envelope["note"] = json!("hello");
+    let (status, v) = post_lifecycle(&h.router, &ctx_id, "retract", &envelope).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(v["error"]["code"], "schema_violation");
+
+    // Actor ≠ body.agent_id → 403 not_authorized (the supersession rule).
+    let foreign = signed_event_envelope(52, &ctx_id, "retracted", None);
+    let (status, v) = post_lifecycle(&h.router, &ctx_id, "retract", &foreign).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body = {v}");
+    assert_eq!(v["error"]["code"], "not_authorized");
+
+    // Unsigned producer event → rejected (schema_violation, §5).
+    let mut unsigned = signed_event_envelope(51, &ctx_id, "retracted", None);
+    unsigned["event"]
+        .as_object_mut()
+        .unwrap()
+        .remove("signature");
+    let (status, v) = post_lifecycle(&h.router, &ctx_id, "retract", &unsigned).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {v}");
+    assert_eq!(v["error"]["code"], "schema_violation");
+
+    // event_type must match the endpoint: a republished event on /retract.
+    let wrong = signed_event_envelope(51, &ctx_id, "republished", None);
+    let (status, v) = post_lifecycle(&h.router, &ctx_id, "retract", &wrong).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(v["error"]["code"], "schema_violation");
+
+    // event.ctx_id must equal the path ctx_id.
+    let other_ctx = format!("acdp://{AUTHORITY}/00000000-0000-4000-8000-00000000dead");
+    let mismatched = signed_event_envelope(51, &other_ctx, "retracted", None);
+    let (status, v) = post_lifecycle(&h.router, &ctx_id, "retract", &mismatched).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(v["error"]["code"], "schema_violation");
+
+    // Tampered signed member → invalid_signature.
+    let mut tampered = signed_event_envelope(51, &ctx_id, "retracted", Some("original"));
+    tampered["event"]["reason"] = json!("tampered");
+    let (status, v) = post_lifecycle(&h.router, &ctx_id, "retract", &tampered).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {v}");
+    assert_eq!(v["error"]["code"], "invalid_signature");
+
+    // Unknown ctx → 404 without leaking anything else.
+    let ghost = format!("acdp://{AUTHORITY}/00000000-0000-4000-8000-0000000000aa");
+    let ghost_env = signed_event_envelope(51, &ghost, "retracted", None);
+    let (status, v) = post_lifecycle(&h.router, &ghost, "retract", &ghost_env).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "body = {v}");
+    assert_eq!(v["error"]["code"], "not_found");
+
+    // A registry NOT advertising the profile → 501 not_implemented.
+    let bare = harness(false).await;
+    let envelope = signed_event_envelope(51, &ctx_id, "retracted", None);
+    let (status, v) = post_lifecycle(&bare.router, &ctx_id, "retract", &envelope).await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "body = {v}");
+    assert_eq!(v["error"]["code"], "not_implemented");
+}
+
+/// lc-003 — `/current` semantics under retraction (§8.3): retracting the
+/// head of a linear lineage takes the lineage off `/current` entirely
+/// (older versions are superseded — 404, never a silent fallback); the
+/// lineage array still shows every version with per-version status;
+/// recovery via v3 superseding the retracted v2 restores a head, with
+/// the once-retracted v2 keeping `retracted` under the §7.2 precedence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lc003_retracted_head_takes_lineage_off_current() {
+    let h = lifecycle_harness(false).await;
+    let p = did_key_producer(53);
+    let v1 = p
+        .publish_request()
+        .title("lc003 v1")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (status, r1) = publish(&h.router, &v1, None).await;
+    assert_eq!(status, StatusCode::OK, "body = {r1}");
+    let v1_ctx = r1["ctx_id"].as_str().unwrap().to_string();
+    let lineage_id = r1["lineage_id"].as_str().unwrap().to_string();
+
+    let v2 = p
+        .supersede(acdp::types::primitives::CtxId(v1_ctx.clone()))
+        .version(2)
+        .title("lc003 v2")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (status, r2) = publish(&h.router, &v2, None).await;
+    assert_eq!(status, StatusCode::OK, "body = {r2}");
+    let v2_ctx = r2["ctx_id"].as_str().unwrap().to_string();
+
+    // Sanity: current == v2.
+    let current_uri = format!("/lineages/{}/current", pct_encode_path_segment(&lineage_id));
+    let (status, cur) = get_json(&h.router, &current_uri).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cur["body"]["ctx_id"], v2_ctx.as_str());
+
+    // Retract the head → every version is superseded-or-retracted → 404.
+    let envelope = signed_event_envelope(53, &v2_ctx, "retracted", Some("bad head"));
+    let (status, v) = post_lifecycle(&h.router, &v2_ctx, "retract", &envelope).await;
+    assert_eq!(status, StatusCode::OK, "retract body = {v}");
+    let (status, v) = get_json(&h.router, &current_uri).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a superseded predecessor must NOT be served as a fallback head: {v}"
+    );
+    assert_eq!(v["error"]["code"], "not_found");
+
+    // The lineage array remains the full record with per-version status.
+    let (status, arr) = get_json(
+        &h.router,
+        &format!("/lineages/{}", pct_encode_path_segment(&lineage_id)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let arr = arr.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[0]["registry_state"]["status"], "superseded");
+    assert_eq!(arr[1]["registry_state"]["status"], "retracted");
+    assert_eq!(
+        arr[1]["registry_state"]["lifecycle_events"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Recovery: v3 supersedes the RETRACTED v2 (permitted — §8.3).
+    let v3 = p
+        .supersede(acdp::types::primitives::CtxId(v2_ctx.clone()))
+        .version(3)
+        .title("lc003 v3")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (status, r3) = publish(&h.router, &v3, None).await;
+    assert_eq!(status, StatusCode::OK, "v3 publish body = {r3}");
+    let v3_ctx = r3["ctx_id"].as_str().unwrap().to_string();
+
+    let (status, cur) = get_json(&h.router, &current_uri).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cur["body"]["ctx_id"], v3_ctx.as_str());
+
+    // §7.2 precedence: the superseded-and-once-retracted v2 keeps
+    // reporting `retracted`.
+    let (_, full) = get_json(
+        &h.router,
+        &format!("/contexts/{}", pct_encode_path_segment(&v2_ctx)),
+    )
+    .await;
+    assert_eq!(full["registry_state"]["status"], "retracted");
+}
+
+/// RFC-ACDP-0011 — head receipts on `/current`: minted per response after
+/// head selection, verifiable end-to-end against the registry's receipt
+/// key (§7 steps 1–6 minus the network-resolution half), absent on
+/// body-only responses, and never naming a retracted head (§8.3: the 404
+/// carries no receipt; post-recovery the receipt names the new head).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn head_receipt_minted_on_current_and_verifies() {
+    use acdp::types::receipt::LineageHeadReceipt;
+
+    let h = lifecycle_harness(true).await;
+
+    // Capabilities: 0.3.0 + all three profiles advertised.
+    let (_, caps_doc) = get_json(&h.router, "/.well-known/acdp.json").await;
+    assert_eq!(caps_doc["acdp_version"], "0.3.0");
+    let profiles: Vec<&str> = caps_doc["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|p| p.as_str())
+        .collect();
+    for expected in [
+        "acdp-registry-receipts",
+        "acdp-registry-head-receipts",
+        "acdp-registry-lifecycle",
+    ] {
+        assert!(
+            profiles.contains(&expected),
+            "missing {expected}: {profiles:?}"
+        );
+    }
+
+    let p = did_key_producer(54);
+    let v1 = p
+        .publish_request()
+        .title("lhr e2e v1")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (status, r1) = publish(&h.router, &v1, None).await;
+    assert_eq!(status, StatusCode::OK, "body = {r1}");
+    let v1_ctx = r1["ctx_id"].as_str().unwrap().to_string();
+    let lineage_id = r1["lineage_id"].as_str().unwrap().to_string();
+    let current_uri = format!("/lineages/{}/current", pct_encode_path_segment(&lineage_id));
+
+    // Helper: fetch /current and fully verify the attached head receipt.
+    let fetch_and_verify = |expect_ctx: String, expect_version: u32| {
+        let router = h.router.clone();
+        let lineage_id = lineage_id.clone();
+        let current_uri = current_uri.clone();
+        async move {
+            let (status, cur) = get_json(&router, &current_uri).await;
+            assert_eq!(status, StatusCode::OK, "body = {cur}");
+            assert_eq!(cur["body"]["ctx_id"], expect_ctx.as_str());
+            let receipt_json = cur["lineage_head_receipt"].clone();
+            assert!(
+                receipt_json.is_object(),
+                "REQUIRED on /current under the profile (§6 rule 1): {cur}"
+            );
+            // §7 step 1: closed-schema parse + §4 invariants.
+            let receipt = LineageHeadReceipt::from_value(&receipt_json).expect("closed schema");
+            // §7 step 2: signature over the JCS preimage of the RAW wire
+            // JSON, under the registry's (known) receipt key.
+            let hash = LineageHeadReceipt::preimage_hash_of_value(&receipt_json).expect("preimage");
+            receipt
+                .verify_signature_against_hash(&hash, Some(&receipt_public_key()), None)
+                .expect("head receipt signature");
+            assert_eq!(
+                receipt.signature.key_id,
+                format!("did:web:{AUTHORITY}#receipt-key-1"),
+                "same key role as RFC-ACDP-0010 receipts (§5)"
+            );
+            // §7 step 4: lineage binding.
+            receipt
+                .cross_check_lineage(&acdp::types::primitives::LineageId(lineage_id.clone()))
+                .expect("lineage binding");
+            // §7 step 5: head binding — byte-match against the served head.
+            let served_status = acdp::types::primitives::Status::parse(
+                cur["registry_state"]["status"].as_str().unwrap(),
+            )
+            .unwrap();
+            receipt
+                .cross_check_head(
+                    &acdp::types::primitives::CtxId(expect_ctx.clone()),
+                    expect_version,
+                    &served_status,
+                    true,
+                )
+                .expect("head binding");
+            // §7 step 6: ms-truncated as_of, not future-dated.
+            receipt
+                .check_as_of_skew(chrono::Utc::now(), chrono::Duration::seconds(120))
+                .expect("as_of skew");
+        }
+    };
+
+    fetch_and_verify(v1_ctx.clone(), 1).await;
+
+    // Body-only responses stay receipt-free of every kind (§6 rule 3).
+    let (_, bare) = get_json(
+        &h.router,
+        &format!("/contexts/{}/body", pct_encode_path_segment(&v1_ctx)),
+    )
+    .await;
+    assert!(bare.get("lineage_head_receipt").is_none());
+
+    // Supersede: the fresh receipt names the new head.
+    let v2 = p
+        .supersede(acdp::types::primitives::CtxId(v1_ctx.clone()))
+        .version(2)
+        .title("lhr e2e v2")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (status, r2) = publish(&h.router, &v2, None).await;
+    assert_eq!(status, StatusCode::OK, "body = {r2}");
+    let v2_ctx = r2["ctx_id"].as_str().unwrap().to_string();
+    fetch_and_verify(v2_ctx.clone(), 2).await;
+
+    // Retraction changes the head: retracting v2 empties /current — a
+    // 404 with NO head receipt (there is no head claim to attest, §8.3).
+    let envelope = signed_event_envelope(54, &v2_ctx, "retracted", None);
+    let (status, v) = post_lifecycle(&h.router, &v2_ctx, "retract", &envelope).await;
+    assert_eq!(status, StatusCode::OK, "retract body = {v}");
+    let (status, gone) = get_json(&h.router, &current_uri).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(gone.get("lineage_head_receipt").is_none());
+
+    // Republish restores v2 as head; the fresh receipt must verify and
+    // must never carry head_status=retracted (mint refusal is the
+    // backstop — this exercises the full path after a retraction).
+    let republish = signed_event_envelope(54, &v2_ctx, "republished", None);
+    let (status, v) = post_lifecycle(&h.router, &v2_ctx, "republish", &republish).await;
+    assert_eq!(status, StatusCode::OK, "republish body = {v}");
+    fetch_and_verify(v2_ctx.clone(), 2).await;
+
+    // The retraction history rides /current's registry_state too.
+    let (_, cur) = get_json(&h.router, &current_uri).await;
+    assert_eq!(
+        cur["registry_state"]["lifecycle_events"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
     );
 }

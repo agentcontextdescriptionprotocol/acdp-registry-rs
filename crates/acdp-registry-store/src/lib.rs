@@ -7,6 +7,7 @@
 use acdp::error::AcdpError;
 use acdp::registry::RegistryStore;
 use acdp::types::body::FullContext;
+use acdp::types::lifecycle::LifecycleEvent;
 use acdp::types::primitives::AgentDid;
 use async_trait::async_trait;
 
@@ -82,6 +83,26 @@ pub trait ExtendedRegistryStore: RegistryStore + Send + Sync {
     /// stay compatible.
     async fn set_tenant_of_ctx(&self, _ctx_id: &str, _tenant_id: &str) -> Result<(), AcdpError> {
         Ok(())
+    }
+
+    /// A context's lifecycle events (RFC-ACDP-0013 §4.1), in registry
+    /// acceptance order — the exact array served as
+    /// `registry_state.lifecycle_events`. Empty when the context has no
+    /// events (or does not exist; callers resolve existence separately).
+    ///
+    /// The default reads through the protocol-level
+    /// [`RegistryStore::get`] projection so backends that already
+    /// populate `registry_state.lifecycle_events` (the SQL stores, the
+    /// SDK `InMemoryStore`) need no override; a backend with a cheaper
+    /// direct query may override.
+    async fn lifecycle_events_of_ctx(
+        &self,
+        ctx_id: &str,
+    ) -> Result<Vec<LifecycleEvent>, AcdpError> {
+        let ctx = self.get(&acdp::types::primitives::CtxId(ctx_id.to_string()))?;
+        Ok(ctx
+            .and_then(|c| c.registry_state.lifecycle_events)
+            .unwrap_or_default())
     }
 
     /// Batch tenant lookup. Returns a map of `ctx_id → tenant_id`.

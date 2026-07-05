@@ -3,8 +3,9 @@
 use acdp::error::AcdpError;
 use acdp::pagination::try_paginate_rows;
 use acdp::registry::store::{PublishCommit, PublishCommitOutcome, RegistryStore};
-use acdp::registry::{IdempotencyRecord, ValidatedPublish};
+use acdp::registry::{IdempotencyRecord, LifecycleCommitOutcome, ValidatedPublish};
 use acdp::types::body::{Body, FullContext, RegistryState};
+use acdp::types::lifecycle::{retraction_state, LifecycleEvent, LifecycleEventType};
 use acdp::types::primitives::{AgentDid, ContentHash, CtxId, LineageId, Status, Visibility};
 use acdp::types::publish::PublishResponse;
 use acdp::types::search::{SearchParams, SearchResponse, SearchResult};
@@ -128,8 +129,9 @@ impl ExtendedRegistryStore for PgStore {
         // is range-clamped above so there is no injection risk today, but
         // the inline pattern was contrary to every other query in this
         // file and is fragile if the clamp is ever loosened.
-        let mut q =
-            String::from("SELECT body_json, status, registry_receipt FROM contexts WHERE 1=1");
+        let mut q = String::from(
+            "SELECT body_json, status, registry_receipt, retracted FROM contexts WHERE 1=1",
+        );
         let mut next_pos = 1usize;
         // Plan §7: SQL-level tenant filter — see sqlite/list_contexts
         // and store/lib.rs for rationale. The composite
@@ -184,6 +186,13 @@ impl ExtendedRegistryStore for PgStore {
             next_cursor: page.next_cursor,
         })
     }
+
+    async fn lifecycle_events_of_ctx(
+        &self,
+        ctx_id: &str,
+    ) -> Result<Vec<LifecycleEvent>, AcdpError> {
+        events_for_ctx(&self.pool, ctx_id).await
+    }
 }
 
 fn visible_to(ctx: &FullContext, requester: Option<&AgentDid>) -> bool {
@@ -218,7 +227,8 @@ impl RegistryStore for PgStore {
     fn get(&self, ctx_id: &CtxId) -> Result<Option<FullContext>, AcdpError> {
         self.block_on(async {
             let row = sqlx::query(
-                "SELECT body_json, status, registry_receipt FROM contexts WHERE ctx_id = $1",
+                "SELECT body_json, status, registry_receipt, retracted FROM contexts \
+                 WHERE ctx_id = $1",
             )
             .bind(ctx_id.as_str())
             .fetch_optional(&self.pool)
@@ -227,35 +237,209 @@ impl RegistryStore for PgStore {
             let Some(row) = row else {
                 return Ok(None);
             };
-            Ok(Some(project_context(row_to_context(&row)?, Utc::now())))
+            let mut ctx = row_to_context(&row)?;
+            // RFC-ACDP-0013 §4.1: full retrieval serves the event array
+            // inside registry_state (omitted, not [], when empty).
+            let events = events_for_ctx(&self.pool, ctx_id.as_str()).await?;
+            if !events.is_empty() {
+                ctx.registry_state.lifecycle_events = Some(events);
+            }
+            Ok(Some(project_context(ctx, Utc::now())))
         })
     }
 
     fn lineage(&self, lineage_id: &LineageId) -> Result<Vec<FullContext>, AcdpError> {
         self.block_on(async {
             let rows = sqlx::query(
-                "SELECT body_json, status, registry_receipt FROM contexts WHERE lineage_id = $1 \
+                "SELECT body_json, status, registry_receipt, retracted FROM contexts \
+                 WHERE lineage_id = $1 \
                  ORDER BY version ASC, created_at ASC",
             )
             .bind(lineage_id.as_str())
             .fetch_all(&self.pool)
             .await
             .map_err(map_sqlx_err)?;
+            // RFC-ACDP-0013 §4.1: the lineage array carries each version's
+            // lifecycle_events. One batch query for the whole lineage.
+            let mut events_by_ctx = events_for_lineage(&self.pool, lineage_id.as_str()).await?;
             let now = Utc::now();
-            rows.iter()
-                .map(|r| row_to_context(r).map(|c| project_context(c, now)))
-                .collect()
+            let mut out = Vec::with_capacity(rows.len());
+            for r in &rows {
+                let mut ctx = row_to_context(r)?;
+                if let Some(events) = events_by_ctx.remove(ctx.body.ctx_id.as_str()) {
+                    if !events.is_empty() {
+                        ctx.registry_state.lifecycle_events = Some(events);
+                    }
+                }
+                out.push(project_context(ctx, now));
+            }
+            Ok(out)
         })
     }
 
     fn current(&self, lineage_id: &LineageId) -> Result<Option<FullContext>, AcdpError> {
         let all = self.lineage(lineage_id)?;
         for ctx in all.into_iter().rev() {
-            if !matches!(ctx.registry_state.status, Status::Superseded) {
+            // RFC-ACDP-0004 §5.2 as amended by RFC-ACDP-0013 §8.3: the head
+            // is the newest version that is neither superseded nor retracted
+            // (an expired head is still a valid head; a retracted one never
+            // is — fixture lc-003).
+            if !matches!(
+                ctx.registry_state.status,
+                Status::Superseded | Status::Retracted
+            ) {
                 return Ok(Some(ctx));
             }
         }
         Ok(None)
+    }
+
+    fn commit_lifecycle_event(
+        &self,
+        event: &LifecycleEvent,
+    ) -> Result<LifecycleCommitOutcome, AcdpError> {
+        let event = event.clone();
+        self.block_on(async move {
+            let now = Utc::now();
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| AcdpError::RegistryInternal(format!("tx begin: {e}")))?;
+
+            // 1. Resolve and ROW-LOCK the context (`FOR UPDATE`, the
+            //    Postgres analog of SQLite's BEGIN IMMEDIATE): two racing
+            //    lifecycle writes serialize here, so the loser observes
+            //    the winner's committed history and gets the contract
+            //    outcome (idempotent replay / invalid_lifecycle_transition)
+            //    instead of a lost update.
+            let row = sqlx::query(
+                "SELECT body_json, status, registry_receipt, retracted, tenant_id \
+                 FROM contexts WHERE ctx_id = $1 FOR UPDATE",
+            )
+            .bind(event.ctx_id.as_str())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_sqlx_err)?;
+            let Some(row) = row else {
+                return Err(AcdpError::NotFound(format!(
+                    "context '{}' not found in this registry",
+                    event.ctx_id
+                )));
+            };
+            let tenant_id: String = row.try_get("tenant_id").map_err(map_sqlx_err)?;
+            let ctx = row_to_context(&row)?;
+
+            // 2. Load the append-ordered event history under the row lock.
+            let ev_rows = sqlx::query(
+                "SELECT event_id, ctx_id, event_type, occurred_at, actor, reason, signature \
+                 FROM lifecycle_events WHERE ctx_id = $1 ORDER BY seq ASC",
+            )
+            .bind(event.ctx_id.as_str())
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(map_sqlx_err)?;
+            let mut events = Vec::with_capacity(ev_rows.len() + 1);
+            for r in &ev_rows {
+                events.push(event_from_row(r)?);
+            }
+
+            // 3. §6 retry idempotency / duplicate event_id (step 2).
+            if let Some(prior) = events.iter().find(|e| e.event_id == event.event_id) {
+                if *prior == event {
+                    tx.rollback().await.ok();
+                    let ctx = attach_events(ctx, events);
+                    return Ok(LifecycleCommitOutcome::IdempotentReplay(project_context(
+                        ctx, now,
+                    )));
+                }
+                return Err(AcdpError::SchemaViolation(format!(
+                    "event_id '{}' was already appended with different content \
+                     (RFC-ACDP-0013 §4: event_id MUST be unique within lifecycle_events)",
+                    event.event_id
+                )));
+            }
+
+            // 4. §6 step 4 — strict retracted/republished alternation
+            //    against the §7.1 retraction state.
+            let currently_retracted = retraction_state(&events);
+            match &event.event_type {
+                LifecycleEventType::Retracted if currently_retracted => {
+                    return Err(AcdpError::InvalidLifecycleTransition(format!(
+                        "context '{}' is already retracted — double retract violates the \
+                         strict alternation rule (RFC-ACDP-0013 §6 step 4)",
+                        event.ctx_id
+                    )));
+                }
+                LifecycleEventType::Republished if !currently_retracted => {
+                    return Err(AcdpError::InvalidLifecycleTransition(format!(
+                        "context '{}' is not retracted — republish requires a prior \
+                         retraction (RFC-ACDP-0013 §6 step 4)",
+                        event.ctx_id
+                    )));
+                }
+                LifecycleEventType::Other(other) => {
+                    return Err(AcdpError::SchemaViolation(format!(
+                        "event_type '{other}' is not registered for acceptance in 0.3.0 — \
+                         only 'retracted' and 'republished' transition state \
+                         (RFC-ACDP-0013 §7.3)"
+                    )));
+                }
+                LifecycleEventType::Retracted | LifecycleEventType::Republished => {}
+            }
+
+            // 5. §6 step 5 — append the event AND apply its status effect
+            //    (the denormalized `retracted` flag the read paths project
+            //    from) in ONE transaction. Stored `status` keeps tracking
+            //    supersession only.
+            let signature_json = event
+                .signature
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|e| AcdpError::RegistryInternal(format!("encode signature: {e}")))?;
+            sqlx::query(
+                "INSERT INTO lifecycle_events \
+                 (ctx_id, event_id, event_type, occurred_at, actor, reason, signature, tenant_id) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+            )
+            .bind(event.ctx_id.as_str())
+            .bind(event.event_id.as_str())
+            .bind(event.event_type.as_str())
+            .bind(canonical_ms(event.occurred_at))
+            .bind(event.actor.as_str())
+            .bind(event.reason.clone())
+            .bind(signature_json)
+            .bind(&tenant_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx_err)?;
+            let retracted_now = matches!(event.event_type, LifecycleEventType::Retracted);
+            sqlx::query("UPDATE contexts SET retracted = $1 WHERE ctx_id = $2")
+                .bind(retracted_now)
+                .bind(event.ctx_id.as_str())
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx_err)?;
+            tx.commit()
+                .await
+                .map_err(|e| AcdpError::RegistryInternal(format!("tx commit: {e}")))?;
+
+            // Post-transition projection: recompute the served status from
+            // the NEW retraction state (row_to_context above applied the
+            // pre-transition flag).
+            events.push(event.clone());
+            let mut ctx = attach_events(ctx, events);
+            ctx.registry_state.status = if retracted_now {
+                Status::Retracted
+            } else {
+                // Republished: re-derive from the stored (supersession-only)
+                // status + expiry, as though never retracted (§7.2).
+                let stored: String = row.try_get("status").map_err(map_sqlx_err)?;
+                project_status_inline(&parse_status(&stored), ctx.body.expires_at, now)
+            };
+            Ok(LifecycleCommitOutcome::Applied(ctx))
+        })
     }
 
     fn mark_superseded(&self, ctx_id: &CtxId) -> Result<(), AcdpError> {
@@ -674,7 +858,8 @@ impl RegistryStore for PgStore {
             let dp_end_before = parse_opt_rfc3339(&params.data_period_end_before)?;
 
             // Parameterized query: every value is bound with $N placeholders.
-            let mut sql = String::from("SELECT body_json, status FROM contexts WHERE 1=1");
+            let mut sql =
+                String::from("SELECT body_json, status, retracted FROM contexts WHERE 1=1");
             let mut idx = 1usize;
             let mut next = || {
                 let i = idx;
@@ -818,11 +1003,21 @@ impl RegistryStore for PgStore {
                     let body_json: serde_json::Value =
                         r.try_get("body_json").map_err(map_sqlx_err)?;
                     let status: String = r.try_get("status").map_err(map_sqlx_err)?;
+                    // RFC-ACDP-0013 §8.2: project the retraction flag so a
+                    // retracted context falls out of the default (active)
+                    // filter — and out of status=superseded / status=expired
+                    // even where those facts also hold (§7.2 precedence).
+                    let retracted: bool = r.try_get("retracted").map_err(map_sqlx_err)?;
                     let body: Body = serde_json::from_value(body_json)
                         .map_err(|e| AcdpError::RegistryInternal(format!("decode body: {e}")))?;
                     // Receipts aren't projected into SearchResult rows, so the
                     // search SELECT deliberately skips the column.
-                    let mut ctx = full_context(body, parse_status(&status), None);
+                    let stored = if retracted {
+                        Status::Retracted
+                    } else {
+                        parse_status(&status)
+                    };
+                    let mut ctx = full_context(body, stored, None);
                     ctx.registry_state.status =
                         project_status_inline(&ctx.registry_state.status, ctx.body.expires_at, now);
                     Ok(ctx)
@@ -973,13 +1168,112 @@ async fn insert_body<'c>(
     Ok(())
 }
 
+/// STATUS PROJECTION (RFC-ACDP-0013 §7.2): the stored `status` column
+/// tracks supersession ONLY; the denormalized `retracted` flag (kept in
+/// lockstep with `lifecycle_events` by `commit_lifecycle_event`) dominates
+/// it here, so the materialized context always carries the
+/// `retracted > superseded > expired > active` precedence. Expiry is
+/// projected afterwards by [`project_context`].
 fn row_to_context(r: &PgRow) -> Result<FullContext, AcdpError> {
     let body_json: serde_json::Value = r.try_get("body_json").map_err(map_sqlx_err)?;
     let status: String = r.try_get("status").map_err(map_sqlx_err)?;
+    let retracted: bool = r.try_get("retracted").map_err(map_sqlx_err)?;
     let receipt: Option<serde_json::Value> = r.try_get("registry_receipt").map_err(map_sqlx_err)?;
     let body: Body = serde_json::from_value(body_json)
         .map_err(|e| AcdpError::RegistryInternal(format!("decode body: {e}")))?;
-    Ok(full_context(body, parse_status(&status), receipt))
+    let status = if retracted {
+        Status::Retracted
+    } else {
+        parse_status(&status)
+    };
+    Ok(full_context(body, status, receipt))
+}
+
+/// Canonical millisecond-precision RFC 3339 UTC text (RFC-ACDP-0001 §5.3)
+/// — the exact byte form the strict event serde emits; `occurred_at` is a
+/// signed member and must be stored/re-served byte-identically.
+fn canonical_ms(dt: DateTime<Utc>) -> String {
+    dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+}
+
+/// Decode one `lifecycle_events` row back into a validated
+/// [`LifecycleEvent`] through the closed RFC-ACDP-0013 §4 schema. Every
+/// column was written from a strictly parsed event, so this round-trips
+/// byte-identically (including the signed `occurred_at` form).
+fn event_from_row(r: &PgRow) -> Result<LifecycleEvent, AcdpError> {
+    let event_id: String = r.try_get("event_id").map_err(map_sqlx_err)?;
+    let ctx_id: String = r.try_get("ctx_id").map_err(map_sqlx_err)?;
+    let event_type: String = r.try_get("event_type").map_err(map_sqlx_err)?;
+    let occurred_at: String = r.try_get("occurred_at").map_err(map_sqlx_err)?;
+    let actor: String = r.try_get("actor").map_err(map_sqlx_err)?;
+    let reason: Option<String> = r.try_get("reason").map_err(map_sqlx_err)?;
+    let signature: Option<serde_json::Value> = r.try_get("signature").map_err(map_sqlx_err)?;
+    let mut value = serde_json::json!({
+        "event_id": event_id,
+        "ctx_id": ctx_id,
+        "event_type": event_type,
+        "occurred_at": occurred_at,
+        "actor": actor,
+    });
+    if let Some(reason) = reason {
+        value["reason"] = serde_json::Value::String(reason);
+    }
+    if let Some(sig) = signature {
+        value["signature"] = sig;
+    }
+    LifecycleEvent::from_value(&value)
+}
+
+/// One context's lifecycle events in registry acceptance order (`seq`).
+async fn events_for_ctx(pool: &PgPool, ctx_id: &str) -> Result<Vec<LifecycleEvent>, AcdpError> {
+    let rows = sqlx::query(
+        "SELECT event_id, ctx_id, event_type, occurred_at, actor, reason, signature \
+         FROM lifecycle_events WHERE ctx_id = $1 ORDER BY seq ASC",
+    )
+    .bind(ctx_id)
+    .fetch_all(pool)
+    .await
+    .map_err(map_sqlx_err)?;
+    rows.iter().map(event_from_row).collect()
+}
+
+/// All lifecycle events across a lineage, grouped by ctx_id, each group
+/// in acceptance order — one round-trip for the whole lineage array.
+async fn events_for_lineage(
+    pool: &PgPool,
+    lineage_id: &str,
+) -> Result<std::collections::HashMap<String, Vec<LifecycleEvent>>, AcdpError> {
+    let rows = sqlx::query(
+        "SELECT e.event_id, e.ctx_id, e.event_type, e.occurred_at, e.actor, e.reason, e.signature \
+         FROM lifecycle_events e \
+         JOIN contexts c ON c.ctx_id = e.ctx_id \
+         WHERE c.lineage_id = $1 ORDER BY e.seq ASC",
+    )
+    .bind(lineage_id)
+    .fetch_all(pool)
+    .await
+    .map_err(map_sqlx_err)?;
+    let mut grouped: std::collections::HashMap<String, Vec<LifecycleEvent>> =
+        std::collections::HashMap::new();
+    for r in &rows {
+        let event = event_from_row(r)?;
+        grouped
+            .entry(event.ctx_id.as_str().to_string())
+            .or_default()
+            .push(event);
+    }
+    Ok(grouped)
+}
+
+/// Attach a (possibly empty) event history to a context, honoring the
+/// absent-vs-empty wire rule (RFC-ACDP-0013 §4.1: omit, never `[]`).
+fn attach_events(mut ctx: FullContext, events: Vec<LifecycleEvent>) -> FullContext {
+    ctx.registry_state.lifecycle_events = if events.is_empty() {
+        None
+    } else {
+        Some(events)
+    };
+    ctx
 }
 
 fn full_context(body: Body, status: Status, receipt: Option<serde_json::Value>) -> FullContext {

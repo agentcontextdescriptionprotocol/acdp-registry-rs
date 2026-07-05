@@ -202,6 +202,52 @@ fn validate_config(cfg: &RegistryConfig) -> anyhow::Result<()> {
         );
     }
 
+    // ACDP 0.3.0 / RFC-ACDP-0011 §9: head receipts reuse the RFC-ACDP-0010
+    // receipt signing key wholesale — the profile's prerequisite is
+    // `acdp-registry-receipts`, so a head-receipts opt-in without a receipt
+    // key has nothing to sign with and must fail startup, not 500 on the
+    // first /current.
+    if cfg.receipt.head_receipts && !cfg.receipt.is_configured() {
+        anyhow::bail!(
+            "receipt.head_receipts=true but no [receipt] signing key is configured. \
+             Lineage-head receipts are signed with the RFC-ACDP-0010 receipt key \
+             (RFC-ACDP-0011 §5: no new key role) — configure receipt.signing_key_seed_b64 \
+             or receipt.signing_key_path, or disable receipt.head_receipts."
+        );
+    }
+    // Same false-advertisement guard as the receipts profile: listing a
+    // 0.3.0 profile in `registry.profiles` without enabling the feature
+    // that honors it would advertise a capability the registry can't
+    // serve (RFC-ACDP-0011 §6 / RFC-ACDP-0013 §10: no degraded mode).
+    // (The reverse is safe: the `with_*` builders append the profiles.)
+    if cfg
+        .registry
+        .profiles
+        .iter()
+        .any(|p| p == "acdp-registry-head-receipts")
+        && !cfg.receipt.head_receipts
+    {
+        anyhow::bail!(
+            "registry.profiles advertises 'acdp-registry-head-receipts' but \
+             receipt.head_receipts is not enabled. Advertising the profile commits the \
+             registry to mint a head receipt on every /current response (RFC-ACDP-0011 §6) \
+             — set receipt.head_receipts=true (with a [receipt] key) or remove the profile."
+        );
+    }
+    if cfg
+        .registry
+        .profiles
+        .iter()
+        .any(|p| p == "acdp-registry-lifecycle")
+        && !cfg.lifecycle.enabled
+    {
+        anyhow::bail!(
+            "registry.profiles advertises 'acdp-registry-lifecycle' but lifecycle.enabled \
+             is false. Advertising the profile commits the registry to the RFC-ACDP-0013 \
+             §6 endpoint surface — set lifecycle.enabled=true or remove the profile."
+        );
+    }
+
     // SEC: refuse an insecure default deployment — a non-loopback bind with
     // BOTH TLS and auth disabled exposes an unauthenticated, plaintext registry
     // on every interface. Require an explicit opt-in (the operator asserting a
@@ -407,6 +453,32 @@ async fn serve_with_store<S: ExtendedRegistryStore + 'static>(
     } else {
         server
     };
+    // ACDP 0.3.0 / RFC-ACDP-0011: lineage-head receipts on /current.
+    // `with_lineage_head_receipts` enforces its own prerequisites (a
+    // configured receipt signer, acdp_version >= 0.3.0) and appends the
+    // `acdp-registry-head-receipts` profile. Minting is per-response and
+    // never persisted (§6).
+    let server = if cfg.receipt.head_receipts {
+        tracing::info!("lineage-head receipts enabled — advertising acdp-registry-head-receipts");
+        server
+            .with_lineage_head_receipts()
+            .map_err(|e| anyhow::anyhow!("head receipts: {e}"))?
+    } else {
+        server
+    };
+    // ACDP 0.3.0 / RFC-ACDP-0013: lifecycle events & retraction.
+    // `with_lifecycle` enforces acdp_version >= 0.3.0 and appends the
+    // `acdp-registry-lifecycle` profile; the §7.2 status precedence,
+    // §8.2 search exclusion, and §8.3 /current head exclusion are
+    // implemented by the storage backends.
+    let server = if cfg.lifecycle.enabled {
+        tracing::info!("lifecycle events enabled — advertising acdp-registry-lifecycle");
+        server
+            .with_lifecycle()
+            .map_err(|e| anyhow::anyhow!("lifecycle: {e}"))?
+    } else {
+        server
+    };
     let server = Arc::new(server);
 
     // Auth.
@@ -577,11 +649,16 @@ fn spawn_shutdown_watcher(handle: axum_server::Handle) {
 
 fn build_capabilities(cfg: &RegistryConfig) -> CapabilitiesDocument {
     CapabilitiesDocument {
-        // Plan A4: the 0.2.0 version claim is gated on the receipt signer
-        // being configured, exactly like the receipts profile (which
-        // `with_receipt_signer` appends and which requires >= 0.2.0).
-        // A key-less deployment keeps the 0.1.0 claim it actually honors.
-        acdp_version: if cfg.receipt.is_configured() {
+        // Plan A4: the version claim is gated on what the deployment
+        // actually honors, exactly like the profiles (which the
+        // `with_*` builders append and version-gate). The ACDP 0.3.0
+        // surfaces (lineage-head receipts, RFC-ACDP-0011 §9; lifecycle,
+        // RFC-ACDP-0013 §10) require >= 0.3.0; a receipt key alone
+        // claims 0.2.0 (RFC-ACDP-0010 §11); a bare deployment keeps the
+        // 0.1.0 claim it actually honors.
+        acdp_version: if cfg.receipt.head_receipts || cfg.lifecycle.enabled {
+            "0.3.0".into()
+        } else if cfg.receipt.is_configured() {
             "0.2.0".into()
         } else {
             "0.1.0".into()
