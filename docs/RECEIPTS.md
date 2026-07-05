@@ -49,6 +49,44 @@ Advertising the profile is a **hard commitment** — there is no
 playground path never resolves the producer key, so any fingerprint it
 attested would be false.
 
+## Lineage-head receipts (ACDP 0.3.0 / RFC-ACDP-0011)
+
+Registry receipts attest **publish-time** facts; a **lineage-head receipt**
+attests a **serve-time** claim: "as of `as_of`, the head of `lineage_id` is
+`head_ctx_id` at `head_version` with `head_status`". Enable it on top of a
+configured receipt key:
+
+```toml
+[receipt]
+signing_key_seed_b64 = "<seed>"
+key_id_fragment      = "receipt-key-1"
+head_receipts        = true              # ACDP 0.3.0 / RFC-ACDP-0011
+```
+
+With `head_receipts = true` the registry:
+
+- advertises `acdp_version: "0.3.0"` and the `acdp-registry-head-receipts`
+  profile (prerequisite: `acdp-registry-receipts` — startup validation
+  refuses the flag without a signing key);
+- mints a **fresh** receipt on every `GET /lineages/{id}/current` response,
+  attached as the top-level `lineage_head_receipt` envelope member. `as_of`
+  is the registry clock at response time, millisecond-truncated; the head
+  fields are copied verbatim from the served, visibility-filtered head, so
+  the RFC-ACDP-0011 §7 step-5 byte-match holds by construction;
+- **never persists** head receipts (they are ephemeral evidence about one
+  response instant), never attaches them to `GET /contexts/{ctx_id}/body`,
+  and never mints one naming a superseded or retracted head — minting runs
+  *after* head selection, and when `/current` 404s (all versions
+  superseded-or-retracted) there is no head claim to attest;
+- signs with the **same receipt key** — head receipts introduce no new key
+  role, no new DID-document entry, and no new rotation procedure (the
+  `receipt_version: "acdp-lhr/1"` member domain-separates the preimage).
+
+Because head receipts are requester-relative (the head is selected under
+the requester's visibility), `/current` responses must not be cached across
+differently-authorized requesters — the existing `Cache-Control: private`
+posture for non-public content covers this.
+
 ## Serving `/.well-known/did.json`
 
 A receipt's signature references `did:web:<authority>#<fragment>`, and

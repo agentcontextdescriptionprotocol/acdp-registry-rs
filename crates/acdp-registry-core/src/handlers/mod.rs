@@ -5,7 +5,7 @@ mod context;
 mod meta;
 
 pub use auth::{issue_challenge, issue_token, revoke_token};
-pub use context::{current, lineage, publish, retrieve, retrieve_body, search};
+pub use context::{current, lineage, publish, republish, retract, retrieve, retrieve_body, search};
 pub use meta::{capabilities, health, jwks, registry_did_document};
 
 mod admin;
