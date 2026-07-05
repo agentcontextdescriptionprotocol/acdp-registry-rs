@@ -108,6 +108,7 @@ fn config(playground: bool) -> RegistryConfig {
         },
         receipt: Default::default(),
         lifecycle: Default::default(),
+        log: Default::default(),
     }
 }
 

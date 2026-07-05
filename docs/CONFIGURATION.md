@@ -47,9 +47,14 @@ The binary validates config before serving and refuses to boot on a misconfig
   (RFC-ACDP-0010 §7: a receipts registry has no unverified publish path).
 - **0.3.0 profiles** — `receipt.head_receipts = true` requires a configured
   `[receipt]` signing key (RFC-ACDP-0011 §9: head receipts are signed with
-  the receipt key). Listing `acdp-registry-head-receipts` or
-  `acdp-registry-lifecycle` in `registry.profiles` without enabling the
-  matching feature is refused as a false capability advertisement.
+  the receipt key). `log.enabled = true` likewise requires a `[receipt]` key
+  (RFC-ACDP-0012 §11: leaves bind receipt hashes and checkpoints sign with
+  the receipt key), a durable storage backend (SQLite/Postgres — the memory
+  backend cannot honor the append-only history commitment), and a
+  well-formed `log.instance` (`[a-z0-9-]{1,32}`). Listing
+  `acdp-registry-head-receipts`, `acdp-registry-lifecycle`, or
+  `acdp-registry-transparency-log` in `registry.profiles` without enabling
+  the matching feature is refused as a false capability advertisement.
 
 ## Reference
 
@@ -226,3 +231,33 @@ nor the `retracted` status is ever emitted.
 | Key | Type | Default | Notes |
 |-----|------|---------|-------|
 | `enabled` | bool | `false` | Opt into the RFC-ACDP-0013 endpoint surface and status semantics. |
+
+### `[log]` *(ACDP 0.3.0)*
+
+Registry transparency log (RFC-ACDP-0012): a per-registry, append-only
+RFC 6962-style Merkle tree over publish events. When enabled the registry
+appends one leaf per accepted publish **in the same storage transaction as
+the context row and its receipt** (§7.1 — the body, the receipt, and the
+leaf commit together, or none does; a publish that cannot durably append
+its leaf fails), serves `GET /log/checkpoint`, `GET /log/proof`, and
+`GET /log/entries`, signs checkpoints with the `[receipt]` key (§6: no new
+key role), advertises `acdp-registry-transparency-log`, and bumps the
+capability claim to `0.3.0`. When disabled (the default) the three
+`/log/*` endpoints answer `501 not_implemented`. There is no degraded mode
+and no `log_unavailable` error.
+
+Prerequisites (enforced at startup): a configured `[receipt]` signing key
+and a durable storage backend (`sqlite` or `postgres`).
+
+Storage: leaves live in the `log_leaves` table — dense 0-based
+`leaf_index` in acceptance order, one leaf per `ctx_id`, and the **exact
+JCS-canonical leaf bytes** plus their `sha256:` leaf hash, so every leaf
+is byte-exactly reproducible forever. Roots and proofs are recomputed per
+request from the ordered leaf hashes (O(n); the head root is cached).
+Contexts published *before* enablement are not backfilled automatically;
+per §7.3 their history would be time-unanchored anyway.
+
+| Key | Type | Default | Notes |
+|-----|------|---------|-------|
+| `enabled` | bool | `false` | Opt into the RFC-ACDP-0012 log: atomic leaf appends + the three `/log/*` endpoints. |
+| `instance` | string | `"1"` | The `<instance>` component of `log_id = did:web:<authority>/log/<instance>` (matches `[a-z0-9-]{1,32}`). **Change only on catastrophic tree loss** (§7.4) — a new instance is an explicit, loudly detectable history reset. |

@@ -475,3 +475,243 @@ mod lifecycle {
         );
     }
 }
+
+// ─── ACDP 0.3.0: transparency log (RFC-ACDP-0012) ──────────────────────────
+//
+// Same env-gating as the tests above. The shared truncate-less database
+// accretes rows across runs, so these tests assert PER-PUBLISH and
+// GLOBAL-INVARIANT properties (leaf presence, byte-exact reproducibility,
+// index density) rather than absolute counts.
+
+mod transparency_log {
+    use super::*;
+    use acdp::types::body::Body;
+    use acdp::types::log::{decode_sha256_hex, encode_sha256_hex};
+    use acdp::types::receipt::ReceiptSigner;
+
+    const REGISTRY_DID: &str = "did:web:reg.test";
+
+    async fn log_store(url: &str) -> Arc<PgStore> {
+        let store = PgStore::connect(url, 8)
+            .await
+            .expect("pg connect")
+            .with_transparency_log();
+        store.migrate().await.expect("pg migrate");
+        Arc::new(store)
+    }
+
+    fn signer() -> ReceiptSigner {
+        ReceiptSigner::new(
+            SigningKey::from_bytes(&[99u8; 32]),
+            REGISTRY_DID,
+            format!("{REGISTRY_DID}#receipt-key-1"),
+        )
+        .unwrap()
+    }
+
+    fn mint_fn(
+        signer: ReceiptSigner,
+    ) -> impl Fn(&Body) -> Result<serde_json::Value, AcdpError> + Send + Sync {
+        move |body: &Body| {
+            let receipt = signer.mint(
+                &body.ctx_id,
+                &body.lineage_id,
+                &body.origin_registry,
+                body.created_at,
+                &body.content_hash,
+                &format!("sha256:{}", "c".repeat(64)),
+            )?;
+            serde_json::to_value(receipt).map_err(AcdpError::from)
+        }
+    }
+
+    /// Run-unique producer so assertions never collide with prior runs
+    /// against the shared database.
+    fn unique_producer() -> (Producer, String) {
+        let seed: [u8; 16] = *uuid::Uuid::new_v4().as_bytes();
+        let mut key = [0u8; 32];
+        key[..16].copy_from_slice(&seed);
+        key[16..].copy_from_slice(&seed);
+        let did = format!("did:web:agents.test:log-{}", uuid::Uuid::new_v4().simple());
+        (
+            Producer::new(
+                SigningKey::from_bytes(&key),
+                AgentDid::new(did.clone()),
+                format!("{did}#key-1"),
+            ),
+            did,
+        )
+    }
+
+    /// §7.1 + §4/§5.1: the leaf commits with the publish, is retrievable
+    /// by ctx_id and index, its stored bytes reproduce its stored hash,
+    /// the global index stays dense, and the leaf's own inclusion path
+    /// folds to the head root.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn logged_publish_appends_reproducible_leaf() {
+        let Some(url) = pg_url_or_skip() else { return };
+        let store = log_store(&url).await;
+        let (p, _did) = unique_producer();
+        let req = request(&p, "pg-log-leaf");
+        let mint = mint_fn(signer());
+        let outcome = tokio::task::block_in_place(|| {
+            store.commit_publish(PublishCommit {
+                req: &req,
+                authority: AUTHORITY,
+                idempotency: None,
+                tenant: None,
+                receipt_minter: Some(&mint),
+            })
+        })
+        .expect("logged publish succeeds");
+        let ctx_id = response(&outcome).ctx_id.as_str().to_string();
+
+        let record = store
+            .log_leaf_by_ctx(&ctx_id)
+            .await
+            .unwrap()
+            .expect("leaf exists the moment the publish response does (§7.1)");
+        // Byte-exact reproducibility (§5.1).
+        let rehashed = acdp::crypto::merkle::leaf_hash(record.leaf_json.as_bytes());
+        assert_eq!(encode_sha256_hex(&rehashed), record.leaf_hash);
+        assert_eq!(
+            record.leaf().unwrap().leaf_hash_hex().unwrap(),
+            record.leaf_hash
+        );
+        let by_idx = store
+            .log_leaf_by_index(record.leaf_index)
+            .await
+            .unwrap()
+            .expect("index-addressed lookup agrees");
+        assert_eq!(by_idx.ctx_id, ctx_id);
+
+        // Global density + the leaf's inclusion path folds to the root.
+        let size = store.log_tree_size().await.unwrap();
+        let hashes = store.log_leaf_hashes(size).await.unwrap();
+        assert_eq!(hashes.len() as u64, size, "dense indexes (§5.3)");
+        let path =
+            acdp::crypto::merkle::inclusion_path(record.leaf_index as usize, &hashes).unwrap();
+        let root = acdp::crypto::merkle::merkle_tree_hash(&hashes);
+        assert!(
+            acdp::crypto::merkle::verify_inclusion(
+                &decode_sha256_hex(&record.leaf_hash).unwrap(),
+                record.leaf_index,
+                size,
+                &path,
+                &root,
+            ),
+            "stored leaf proves against the recomputed head root (§9.1)"
+        );
+    }
+
+    /// §7.1/§11 no degraded mode: no receipt → the whole publish fails,
+    /// nothing persists for this producer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn publish_without_receipt_minter_is_refused_entirely() {
+        let Some(url) = pg_url_or_skip() else { return };
+        let store = log_store(&url).await;
+        let (p, did) = unique_producer();
+        let req = request(&p, "pg-log-no-receipt");
+        let err = tokio::task::block_in_place(|| {
+            store.commit_publish(PublishCommit {
+                req: &req,
+                authority: AUTHORITY,
+                idempotency: None,
+                tenant: None,
+                receipt_minter: None,
+            })
+        })
+        .expect_err("log-enabled publish without a receipt must fail");
+        assert!(matches!(err, AcdpError::RegistryInternal(_)), "{err:?}");
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM contexts WHERE agent_id = $1")
+            .bind(&did)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "no context row survives (§7.1)");
+    }
+
+    /// §7.1 crash-consistency: a failing minter aborts everything — no
+    /// context row, no orphan leaf, density preserved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failing_minter_leaves_no_orphan_leaf() {
+        let Some(url) = pg_url_or_skip() else { return };
+        let store = log_store(&url).await;
+        let (p, did) = unique_producer();
+        let req = request(&p, "pg-log-minter-fails");
+        let failing = |_: &Body| -> Result<serde_json::Value, AcdpError> {
+            Err(AcdpError::RegistryInternal("kms outage".into()))
+        };
+        let err = tokio::task::block_in_place(|| {
+            store.commit_publish(PublishCommit {
+                req: &req,
+                authority: AUTHORITY,
+                idempotency: None,
+                tenant: None,
+                receipt_minter: Some(&failing),
+            })
+        })
+        .expect_err("failing minter must abort the publish");
+        assert!(matches!(err, AcdpError::RegistryInternal(_)), "{err:?}");
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM contexts WHERE agent_id = $1")
+            .bind(&did)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+        let size = store.log_tree_size().await.unwrap();
+        assert_eq!(
+            store.log_leaf_hashes(size).await.unwrap().len() as u64,
+            size,
+            "log stays dense — no orphan leaf (§5.3/§7.1)"
+        );
+    }
+
+    /// §5.3 under concurrency: racing logged publishes serialize on the
+    /// pg_advisory_xact_lock and still assign dense, unique indexes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_logged_publishes_assign_dense_indexes() {
+        let Some(url) = pg_url_or_skip() else { return };
+        let store = log_store(&url).await;
+        let handles: Vec<_> = (0..6)
+            .map(|i| {
+                let store = Arc::clone(&store);
+                tokio::task::spawn_blocking(move || {
+                    let (p, _) = unique_producer();
+                    let req = request(&p, &format!("pg-log-race-{i}"));
+                    let mint = mint_fn(signer());
+                    store.commit_publish(PublishCommit {
+                        req: &req,
+                        authority: AUTHORITY,
+                        idempotency: None,
+                        tenant: None,
+                        receipt_minter: Some(&mint),
+                    })
+                })
+            })
+            .collect();
+        let mut ctx_ids = Vec::new();
+        for h in handles {
+            let outcome = h.await.unwrap().expect("every racer commits");
+            ctx_ids.push(response(&outcome).ctx_id.as_str().to_string());
+        }
+        let size = store.log_tree_size().await.unwrap();
+        let hashes = store.log_leaf_hashes(size).await.unwrap();
+        assert_eq!(hashes.len() as u64, size, "dense after the race (§5.3)");
+        // Every racer's leaf landed at a distinct index.
+        let mut indexes = Vec::new();
+        for ctx_id in &ctx_ids {
+            indexes.push(
+                store
+                    .log_leaf_by_ctx(ctx_id)
+                    .await
+                    .unwrap()
+                    .expect("leaf per racer")
+                    .leaf_index,
+            );
+        }
+        indexes.sort_unstable();
+        indexes.dedup();
+        assert_eq!(indexes.len(), ctx_ids.len(), "unique leaf indexes");
+    }
+}

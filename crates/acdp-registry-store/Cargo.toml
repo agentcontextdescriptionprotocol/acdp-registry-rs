@@ -16,3 +16,4 @@ acdp-registry-types = { path = "../acdp-registry-types", version = "0.1.0", defa
 async-trait         = { workspace = true }
 chrono              = { workspace = true }
 serde               = { workspace = true }
+serde_json          = { workspace = true }

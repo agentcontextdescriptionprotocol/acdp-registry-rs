@@ -20,6 +20,9 @@ The complete inbound surface of `acdp-registry`. Routes are assembled in
 | POST | `/contexts/{ctx_id}/republish`   | producer-signed event | always (501 unless `lifecycle.enabled`) |
 | GET  | `/lineages/{lineage_id}`         | optional bearer | always |
 | GET  | `/lineages/{lineage_id}/current` | optional bearer | always |
+| GET  | `/log/checkpoint`                | none        | always (501 unless `log.enabled`) |
+| GET  | `/log/proof`                     | optional bearer | always (501 unless `log.enabled`) |
+| GET  | `/log/entries`                   | optional bearer | always (501 unless `log.enabled`) |
 | POST | `/auth/challenge`                | none        | `auth.enabled` |
 | POST | `/auth/token`                    | challenge signature | `auth.enabled` |
 | POST | `/auth/token/revoke`             | bearer      | `auth.enabled` |
@@ -257,6 +260,80 @@ Only the producer may use these endpoints (delegation and a
 registry-attested admin path are out of scope for now; registry-initiated
 events would be recorded directly by the operator against the store).
 
+### `GET /log/checkpoint`, `GET /log/proof`, `GET /log/entries` *(ACDP 0.3.0)*
+
+Registry transparency log (RFC-ACDP-0012). Mounted always; a registry
+without `log.enabled = true` answers `501 not_implemented` from every
+`/log/*` path. There is **no `log_unavailable`** anywhere (§7.1): with the
+profile advertised, every accepted publish appends its leaf in the same
+storage transaction as the context row and its receipt, so the proof for a
+context exists the moment its publish response does.
+
+**`GET /log/checkpoint`** — the current signed tree head, bare:
+
+```json
+{
+  "checkpoint_version": "acdp-log/1",
+  "log_id": "did:web:registry.example.com/log/1",
+  "tree_size": 5,
+  "root_hash": "sha256:…",
+  "timestamp": "2026-07-04T12:00:00.000Z",
+  "signature": { "algorithm": "ed25519", "key_id": "…#receipt-key-1", "value": "…" }
+}
+```
+
+Signed with the RFC-ACDP-0010 **receipt key** (§6 — no new key role);
+`timestamp` is fresh per evaluation. Publicly readable wherever
+capabilities are.
+
+**`GET /log/proof`** — one path, two mutually exclusive parameter sets:
+
+- *Inclusion mode:* exactly one of `?ctx_id=<ctx_id>` (the consumer
+  surface — **retrieval visibility applies exactly as for
+  `GET /contexts/{ctx_id}`**: an unauthorized or unlogged ctx_id is
+  `404 not_found`, indistinguishable from absence) or `?leaf_index=<n>`
+  (the auditor surface — positions are public, no visibility gate).
+  Optional `&tree_size=<n>` requests the proof against a historical size
+  (`leaf_index < tree_size ≤` current); the registry signs a checkpoint at
+  that size on demand (§8.2). The response is the `log_inclusion` object
+  (`log_id`, `leaf_index`, `tree_size`, `inclusion_path[]`,
+  `log_checkpoint`), plus a convenience `leaf` echo **only** when the
+  requester is authorized to retrieve the context — verifiers reconstruct
+  the leaf from verified body + receipt material instead (§9.1 step 1).
+- *Consistency mode:* `?first=<m>&second=<n>` with
+  `0 < m ≤ n ≤` current size. Response: `log_id`, `first_tree_size`,
+  `second_tree_size`, `consistency_path[]` (empty when `m == n`), and a
+  `log_checkpoint` at the second size. The caller verifies against its own
+  **retained** earlier root — that retained root is the whole point
+  (§9.2). Hash-only; no visibility gate.
+
+Mixing the parameter sets, omitting both, malformed integers, or
+out-of-range positions/sizes → `400 schema_violation`.
+
+**`GET /log/entries?start=<i>&end=<j>`** — leaves `[start, end)`
+(`start < end ≤` current size). Every entry carries `leaf_index` and
+`leaf_hash` unconditionally — the ordered leaf hashes alone recompute
+every root, which is what makes third-party auditing possible (§8.3). The
+`leaf` body is present **only** for entries whose context the requester is
+authorized to retrieve (public contexts: always); otherwise it is absent,
+never `null`. The page is capped at 256 entries; continue from
+`start + len(entries)`.
+
+```json
+{
+  "log_id": "did:web:registry.example.com/log/1",
+  "start": 0,
+  "entries": [
+    { "leaf_index": 0, "leaf_hash": "sha256:…", "leaf": { "leaf_version": "acdp-log-leaf/1", … } },
+    { "leaf_index": 1, "leaf_hash": "sha256:…" }
+  ]
+}
+```
+
+Visibility note (§15): leaf *hashes*, positions, and tree size are public
+by design — a registry with confidentiality requirements over publication
+volume/timing metadata must weigh that before enabling `[log]`.
+
 ---
 
 ## Auth
@@ -412,8 +489,9 @@ documents only the registry's HTTP-status projection of them.
 | 413 | (payload) | Body over `max_payload_bytes`, or embedded data over `max_embedded_bytes`. |
 | 429 | `rate_limited` | Publish/challenge bucket drained; carries `Retry-After`. |
 | 500 | `internal_error` | Storage/config/internal failure (detail logged, not returned). |
-| 501 | `not_implemented` | Unimplemented protocol feature. |
+| 501 | `not_implemented` | Unimplemented protocol feature (incl. `/log/*` and lifecycle endpoints when their profiles are not enabled). |
 | 502 | `key_resolution_unreachable` / `cross_registry_resolution_failed` | DID document or foreign registry unreachable (also covers SSRF-policy rejection). |
+| 502 | `invalid_log_proof` | A transparency-log proof/checkpoint failed RFC-ACDP-0012 §9 verification. Emitted only when validating an *upstream's* proofs (federation); this registry's own `/log/*` handlers never raise it — their failures are `schema_violation`, `not_found`, or `not_implemented`, and there is no `log_unavailable`. |
 
 Note: auth failures surface as `403 not_authorized`, not `401` — the registry
 does not emit a `WWW-Authenticate` challenge.
