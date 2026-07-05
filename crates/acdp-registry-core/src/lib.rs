@@ -5,6 +5,7 @@
 //! specific storage crate — the binary picks one via Cargo features.
 
 pub mod handlers;
+pub mod log;
 pub mod playground;
 pub mod rate_limit;
 pub mod receipt;
@@ -62,7 +63,14 @@ pub fn build_router<S: ExtendedRegistryStore + 'static>(state: AppState<S>) -> R
         )
         // Lineages
         .route("/lineages/:lineage_id", get(handlers::lineage::<S>))
-        .route("/lineages/:lineage_id/current", get(handlers::current::<S>));
+        .route("/lineages/:lineage_id/current", get(handlers::current::<S>))
+        // Transparency log (RFC-ACDP-0012 §8). Always mounted: a
+        // registry not advertising `acdp-registry-transparency-log`
+        // answers 501 not_implemented from the handler (the lifecycle
+        // posture); there is never a `log_unavailable` (§7.1).
+        .route("/log/checkpoint", get(handlers::log_checkpoint::<S>))
+        .route("/log/proof", get(handlers::log_proof::<S>))
+        .route("/log/entries", get(handlers::log_entries::<S>));
 
     if auth_enabled {
         acdp = acdp

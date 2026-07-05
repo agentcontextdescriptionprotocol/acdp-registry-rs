@@ -105,6 +105,7 @@ fn config(playground: bool) -> RegistryConfig {
         },
         receipt: Default::default(),
         lifecycle: Default::default(),
+        log: Default::default(),
     }
 }
 
@@ -162,6 +163,13 @@ async fn build_harness_with_caps(
         .tempfile()
         .unwrap();
     let store = SqliteStore::connect(db.path(), 1).await.unwrap();
+    // RFC-ACDP-0012: mirror the binary's run() wiring — an enabled [log]
+    // makes every commit_publish append the leaf atomically.
+    let store = if cfg.log.enabled {
+        store.with_transparency_log()
+    } else {
+        store
+    };
     store.migrate().await.unwrap();
     let server = RegistryServer::try_new(store, caps, AUTHORITY).unwrap();
     // Mirror the binary's serve_with_store wiring: a configured receipt
@@ -3472,5 +3480,482 @@ async fn head_receipt_minted_on_current_and_verifies() {
             .unwrap()
             .len(),
         2
+    );
+}
+
+// ─── ACDP 0.3.0: registry transparency log (RFC-ACDP-0012) ───
+
+/// The log_id this harness serves: `did:web:<authority>/log/<instance>`
+/// with the default instance "1" (RFC-ACDP-0012 §6).
+fn log_id() -> String {
+    format!("did:web:{AUTHORITY}/log/1")
+}
+
+fn log_caps() -> CapabilitiesDocument {
+    let mut c = receipts_caps();
+    c.acdp_version = "0.3.0".into();
+    c.profiles.push("acdp-registry-transparency-log".into());
+    c
+}
+
+/// Production-path harness with receipts + the transparency log. The
+/// store is built `with_transparency_log()` (mirroring the binary), so
+/// every accepted publish appends its leaf atomically (§7.1).
+async fn log_harness() -> Harness {
+    let mut cfg = config(false);
+    cfg.receipt.signing_key_seed_b64 = B64.encode(RECEIPT_SEED);
+    cfg.auth.did_methods = vec!["did:web".into(), "did:key".into()];
+    cfg.log.enabled = true;
+    build_harness_with_caps(cfg, log_caps(), None).await
+}
+
+/// Publish one did:key context on the full verified pipeline; returns
+/// `(ctx_id, publish response)`.
+async fn log_publish(
+    h: &Harness,
+    seed: u8,
+    title: &str,
+    visibility: Visibility,
+) -> (String, Value) {
+    let req = did_key_producer(seed)
+        .publish_request()
+        .title(title)
+        .context_type(ContextType::DataSnapshot)
+        .visibility(visibility)
+        .build()
+        .unwrap();
+    let (status, v) = publish(&h.router, &req, None).await;
+    assert_eq!(status, StatusCode::OK, "publish body = {v}");
+    (v["ctx_id"].as_str().unwrap().to_string(), v)
+}
+
+/// §9.1 step 1 — reconstruct the leaf INDEPENDENTLY from retrieved,
+/// verified material (body + receipt), never from the echoed `leaf`.
+async fn reconstruct_leaf(
+    h: &Harness,
+    ctx_id: &str,
+    producer_seed: u8,
+) -> acdp::types::log::LogLeaf {
+    use acdp::types::log::{LogLeaf, LOG_LEAF_VERSION};
+    use acdp::types::receipt::RegistryReceipt;
+    let (status, full) = get_json(
+        &h.router,
+        &format!("/contexts/{}", pct_encode_path_segment(ctx_id)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "retrieve body = {full}");
+    let body: acdp::types::body::Body = serde_json::from_value(full["body"].clone()).unwrap();
+    let receipt = &full["registry_receipt"];
+    assert!(
+        receipt.is_object(),
+        "log-profile context must carry a receipt"
+    );
+    LogLeaf {
+        leaf_version: LOG_LEAF_VERSION.into(),
+        ctx_id: body.ctx_id.clone(),
+        lineage_id: body.lineage_id.clone(),
+        origin_registry: body.origin_registry.clone(),
+        created_at: body.created_at,
+        content_hash: body.content_hash.clone(),
+        key_fingerprint: did_key_fingerprint(producer_seed),
+        receipt_hash: RegistryReceipt::preimage_hash_of_value(receipt).unwrap().0,
+    }
+}
+
+/// §11: a registry without `log.enabled` answers 501 not_implemented on
+/// every /log/* path — never `log_unavailable` (which does not exist).
+#[tokio::test]
+async fn log_endpoints_are_501_when_profile_not_advertised() {
+    let h = receipts_harness().await; // receipts on, log OFF
+    for uri in [
+        "/log/checkpoint",
+        "/log/proof?leaf_index=0",
+        "/log/entries?start=0&end=1",
+    ] {
+        let (status, v) = get_json(&h.router, uri).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{uri}: {v}");
+        assert_eq!(v["error"]["code"], "not_implemented", "{uri}: {v}");
+    }
+}
+
+/// §8.1/§6: the checkpoint is signed with the receipt key, binds this
+/// registry, starts at the empty-tree root, and advances with publishes.
+#[tokio::test]
+async fn log_checkpoint_signs_verifies_and_advances() {
+    use acdp::types::log::LogCheckpoint;
+    let h = log_harness().await;
+
+    // Empty log: tree_size 0, root = SHA-256("") (§5.2).
+    let (status, v) = get_json(&h.router, "/log/checkpoint").await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let cp0 = LogCheckpoint::from_value(&v).expect("closed-schema checkpoint");
+    assert_eq!(cp0.tree_size, 0);
+    assert_eq!(
+        cp0.root_hash,
+        "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+
+    for i in 0..5u8 {
+        log_publish(&h, 60 + i, &format!("log-ctx-{i}"), Visibility::Public).await;
+    }
+
+    let (status, v) = get_json(&h.router, "/log/checkpoint").await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    // §9.3 step 2: verify over the RAW wire JSON's recomputed preimage.
+    let cp = LogCheckpoint::from_value(&v).expect("closed-schema checkpoint");
+    let raw_hash = LogCheckpoint::preimage_hash_of_value(&v).unwrap();
+    cp.verify_signature_against_hash(&raw_hash, Some(&receipt_public_key()), None)
+        .expect("checkpoint signature verifies with the receipt key (§6: no new key role)");
+    // §9.3 step 3: registry binding.
+    cp.cross_check_registry_binding(AUTHORITY, &format!("did:web:{AUTHORITY}"))
+        .unwrap();
+    assert_eq!(cp.log_id, log_id());
+    assert_eq!(
+        cp.tree_size, 5,
+        "checkpoint commits to every acknowledged publish (§7.2)"
+    );
+    // §9.3 step 4: fresh, ms-truncated timestamp within skew.
+    cp.check_timestamp_skew(chrono::Utc::now(), chrono::Duration::seconds(120))
+        .unwrap();
+}
+
+/// §8.2/§9.1: an inclusion proof for every published ctx_id folds to the
+/// checkpoint root over the INDEPENDENTLY reconstructed leaf.
+#[tokio::test]
+async fn log_inclusion_proof_folds_for_every_ctx() {
+    use acdp::types::log::LogInclusion;
+    let h = log_harness().await;
+    let mut ctxs = Vec::new();
+    for i in 0..5u8 {
+        let seed = 70 + i;
+        let (ctx_id, _) = log_publish(&h, seed, &format!("incl-{i}"), Visibility::Public).await;
+        ctxs.push((ctx_id, seed));
+    }
+
+    for (i, (ctx_id, seed)) in ctxs.iter().enumerate() {
+        let (status, v) = get_json(
+            &h.router,
+            &format!("/log/proof?ctx_id={}", pct_encode_path_segment(ctx_id)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "proof for {ctx_id}: {v}");
+        let inclusion = LogInclusion::from_value(&v).expect("closed-schema inclusion");
+        assert_eq!(
+            inclusion.leaf_index, i as u64,
+            "acceptance-order indexing (§5.3)"
+        );
+        assert_eq!(inclusion.tree_size, 5);
+        assert_eq!(inclusion.log_id, log_id());
+
+        // §9.1 steps 1–2: reconstruct the leaf from verified material.
+        let leaf = reconstruct_leaf(&h, ctx_id, *seed).await;
+        // §9.1 steps 4–6: bindings + fold the audit path to the root.
+        inclusion
+            .verify_reconstructed_leaf(&leaf)
+            .expect("inclusion path folds to the checkpoint root");
+        // §9.3: the embedded checkpoint's signature verifies.
+        let raw_hash =
+            acdp::types::log::LogCheckpoint::preimage_hash_of_value(&v["log_checkpoint"]).unwrap();
+        inclusion
+            .log_checkpoint
+            .verify_signature_against_hash(&raw_hash, Some(&receipt_public_key()), None)
+            .expect("embedded checkpoint signature");
+        // §8.2: the echoed leaf (requester is authorized — public ctx)
+        // matches the reconstruction byte-for-byte.
+        let echoed = inclusion
+            .leaf
+            .as_ref()
+            .expect("leaf echoed for authorized requester");
+        assert_eq!(
+            echoed, &leaf,
+            "echoed leaf ≡ independently reconstructed leaf"
+        );
+    }
+}
+
+/// §8.2 historical tree sizes: a proof at `tree_size < current` verifies
+/// against a checkpoint signed at that size on demand.
+#[tokio::test]
+async fn log_inclusion_proof_at_historical_tree_size() {
+    use acdp::types::log::LogInclusion;
+    let h = log_harness().await;
+    let (first_ctx, _) = log_publish(&h, 80, "hist-0", Visibility::Public).await;
+    for i in 1..5u8 {
+        log_publish(&h, 80 + i, &format!("hist-{i}"), Visibility::Public).await;
+    }
+    let (status, v) = get_json(
+        &h.router,
+        &format!(
+            "/log/proof?ctx_id={}&tree_size=3",
+            pct_encode_path_segment(&first_ctx)
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let inclusion = LogInclusion::from_value(&v).unwrap();
+    assert_eq!(inclusion.tree_size, 3);
+    assert_eq!(
+        inclusion.log_checkpoint.tree_size, 3,
+        "checkpoint at the historical size (§8.2)"
+    );
+    let leaf = reconstruct_leaf(&h, &first_ctx, 80).await;
+    inclusion
+        .verify_reconstructed_leaf(&leaf)
+        .expect("historical proof folds");
+    inclusion
+        .log_checkpoint
+        .verify_signature_with_key(Some(&receipt_public_key()), None)
+        .expect("on-demand historical checkpoint signature");
+}
+
+/// §8.2 consistency mode + §9.2: the tree at a retained earlier size is
+/// a prefix of the later tree, verified against the RETAINED root.
+#[tokio::test]
+async fn log_consistency_between_sizes_verifies() {
+    use acdp::types::log::{LogCheckpoint, LogConsistencyProof};
+    let h = log_harness().await;
+    for i in 0..3u8 {
+        log_publish(&h, 90 + i, &format!("cons-{i}"), Visibility::Public).await;
+    }
+    // Retain the size-3 checkpoint (the verifier's own retained root is
+    // the whole point, §9.2).
+    let (status, v3) = get_json(&h.router, "/log/checkpoint").await;
+    assert_eq!(status, StatusCode::OK);
+    let retained = LogCheckpoint::from_value(&v3).unwrap();
+    assert_eq!(retained.tree_size, 3);
+
+    for i in 3..5u8 {
+        log_publish(&h, 90 + i, &format!("cons-{i}"), Visibility::Public).await;
+    }
+
+    let (status, v) = get_json(&h.router, "/log/proof?first=3&second=5").await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let proof = LogConsistencyProof::from_value(&v).expect("closed-schema consistency proof");
+    assert_eq!(proof.first_tree_size, 3);
+    assert_eq!(proof.second_tree_size, 5);
+    proof
+        .verify_against_first_root(&retained.root_hash)
+        .expect("size-3 history is a prefix of size-5 (§9.2)");
+    proof
+        .log_checkpoint
+        .verify_signature_with_key(Some(&receipt_public_key()), None)
+        .expect("second checkpoint signature");
+
+    // first == second → empty path, trivially consistent (§8.2).
+    let (status, v) = get_json(&h.router, "/log/proof?first=5&second=5").await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let proof = LogConsistencyProof::from_value(&v).unwrap();
+    assert!(proof.consistency_path.is_empty());
+    proof
+        .verify_against_first_root(&proof.log_checkpoint.root_hash)
+        .unwrap();
+}
+
+/// §8.3: `leaf_hash` for every entry unconditionally; the ordered hashes
+/// alone recompute the checkpoint root; served leaf bytes are
+/// byte-exactly reproducible (JCS + 0x00-prefix rehash == leaf_hash).
+#[tokio::test]
+async fn log_entries_hashes_reproduce_root_and_leaf_bytes() {
+    use acdp::types::log::{decode_sha256_hex, encode_sha256_hex, LogCheckpoint};
+    let h = log_harness().await;
+    for i in 0..4u8 {
+        log_publish(&h, 100 + i, &format!("entries-{i}"), Visibility::Public).await;
+    }
+
+    let (status, v) = get_json(&h.router, "/log/entries?start=0&end=4").await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["log_id"], log_id());
+    assert_eq!(v["start"], 0);
+    let entries = v["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 4);
+
+    let mut hashes: Vec<[u8; 32]> = Vec::new();
+    for (i, e) in entries.iter().enumerate() {
+        assert_eq!(e["leaf_index"], i as u64);
+        let leaf_hash = e["leaf_hash"]
+            .as_str()
+            .expect("leaf_hash always present (§8.3)");
+        hashes.push(decode_sha256_hex(leaf_hash).unwrap());
+
+        // Public context → leaf present; its JCS bytes rehash to
+        // leaf_hash (leaf reproducibility, §4/§5.1).
+        let leaf = e.get("leaf").expect("public context leaf present");
+        let leaf_typed = acdp::types::log::LogLeaf::from_value(leaf).unwrap();
+        assert_eq!(
+            leaf_typed.leaf_hash_hex().unwrap(),
+            leaf_hash,
+            "served leaf bytes must reproduce the served hash"
+        );
+    }
+
+    // The ordered hashes recompute the head root (§8.3: what makes
+    // third-party auditing possible).
+    let (status, cp_v) = get_json(&h.router, "/log/checkpoint").await;
+    assert_eq!(status, StatusCode::OK);
+    let cp = LogCheckpoint::from_value(&cp_v).unwrap();
+    assert_eq!(
+        encode_sha256_hex(&acdp::crypto::merkle::merkle_tree_hash(&hashes)),
+        cp.root_hash
+    );
+}
+
+/// §8.2 visibility (RFC-ACDP-0008 §4.5) + §8.3: a private context's
+/// ctx_id-addressed proof 404s for a stranger (indistinguishable from
+/// absence); its leaf HASH still appears in /log/entries and its
+/// position still proves via ?leaf_index= — but with no leaf echo.
+#[tokio::test]
+async fn log_visibility_private_context() {
+    let h = log_harness().await;
+    let (public_ctx, _) = log_publish(&h, 110, "vis-public", Visibility::Public).await;
+    let (private_ctx, _) = log_publish(&h, 111, "vis-private", Visibility::Private).await;
+
+    // Anonymous ctx_id-addressed proof for the private context → 404,
+    // same shape as a never-logged ctx_id.
+    let (status, v) = get_json(
+        &h.router,
+        &format!(
+            "/log/proof?ctx_id={}",
+            pct_encode_path_segment(&private_ctx)
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{v}");
+    assert_eq!(v["error"]["code"], "not_found");
+
+    // The public one proves fine anonymously.
+    let (status, v) = get_json(
+        &h.router,
+        &format!("/log/proof?ctx_id={}", pct_encode_path_segment(&public_ctx)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert!(v.get("leaf").is_some(), "public ctx echoes its leaf");
+
+    // Position-addressed proof of the private leaf: 200 (hash-only data
+    // is public by design, §15) but NO leaf echo — absent, never null.
+    let (status, v) = get_json(&h.router, "/log/proof?leaf_index=1").await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["leaf_index"], 1);
+    assert!(
+        v.get("leaf").is_none(),
+        "unauthorized requester gets no leaf echo: {v}"
+    );
+
+    // /log/entries: hash always, leaf only where retrieval-authorized.
+    let (status, v) = get_json(&h.router, "/log/entries?start=0&end=2").await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let entries = v["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(entries[0]["leaf_hash"].is_string());
+    assert!(
+        entries[1]["leaf_hash"].is_string(),
+        "private leaf HASH is served (§8.3)"
+    );
+    assert!(entries[0].get("leaf").is_some(), "public leaf body served");
+    assert!(
+        entries[1].get("leaf").is_none(),
+        "private leaf body absent (never null) for a stranger: {v}"
+    );
+}
+
+/// §8.2/§8.3 request validation: mixed / omitted / malformed / out-of-
+/// range parameters are schema_violation (400); there is no
+/// log_unavailable, and nothing here is not_found.
+#[tokio::test]
+async fn log_query_validation_is_schema_violation() {
+    let h = log_harness().await;
+    log_publish(&h, 120, "qv-0", Visibility::Public).await;
+
+    for uri in [
+        // Mixing the parameter sets.
+        "/log/proof?leaf_index=0&first=1&second=1",
+        "/log/proof?ctx_id=x&second=1",
+        // Omitting both sets / half a set.
+        "/log/proof",
+        "/log/proof?first=1",
+        "/log/proof?tree_size=1",
+        // Both inclusion selectors.
+        "/log/proof?ctx_id=x&leaf_index=0",
+        // Malformed integers.
+        "/log/proof?leaf_index=abc",
+        "/log/proof?first=-1&second=1",
+        // Out-of-range sizes (tree has exactly 1 leaf).
+        "/log/proof?leaf_index=5",
+        "/log/proof?leaf_index=0&tree_size=2",
+        "/log/proof?leaf_index=0&tree_size=0",
+        "/log/proof?first=0&second=1",
+        "/log/proof?first=2&second=1",
+        "/log/proof?first=1&second=9",
+        // Entries: malformed / empty / inverted / beyond-size ranges.
+        "/log/entries",
+        "/log/entries?start=0",
+        "/log/entries?start=0&end=0",
+        "/log/entries?start=1&end=1",
+        "/log/entries?start=0&end=2",
+        "/log/entries?start=2&end=1",
+    ] {
+        let (status, v) = get_json(&h.router, uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {v}");
+        assert_eq!(v["error"]["code"], "schema_violation", "{uri}: {v}");
+    }
+
+    // An unknown / unlogged ctx_id is not_found (404), NOT a 400.
+    let (status, v) = get_json(
+        &h.router,
+        "/log/proof?ctx_id=acdp%3A%2F%2Fregistry.test%2Fnope",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{v}");
+    assert_eq!(v["error"]["code"], "not_found");
+}
+
+/// §7.1 atomicity through the HTTP surface: a failed publish appends no
+/// leaf, and the tree size always equals the number of accepted
+/// publishes under the profile.
+#[tokio::test]
+async fn log_failed_publish_appends_no_leaf() {
+    use acdp::types::log::LogCheckpoint;
+    let h = log_harness().await;
+    log_publish(&h, 130, "atomic-0", Visibility::Public).await;
+    log_publish(&h, 131, "atomic-1", Visibility::Public).await;
+
+    // A publish that fails inside the commit (supersedes target absent →
+    // superseded_target, checked within the same transaction).
+    let dead = acdp::types::primitives::CtxId(format!(
+        "acdp://{AUTHORITY}/00000000-0000-4000-8000-00000000dead"
+    ));
+    let bad = did_key_producer(132)
+        .supersede(dead.clone())
+        .title("atomic-fail")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .version(2)
+        .expected_lineage_id(acdp::crypto::derive_lineage_id(&dead))
+        .build()
+        .unwrap();
+    let (status, v) = publish(&h.router, &bad, None).await;
+    assert!(
+        status.is_client_error(),
+        "expected rejection, got {status}: {v}"
+    );
+
+    // And a schema-level failure too (tampered signature).
+    let mut tampered = did_key_producer(133)
+        .publish_request()
+        .title("atomic-tampered")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    tampered.signature.value = "AAAA".into();
+    let (status, _) = publish(&h.router, &tampered, None).await;
+    assert!(status.is_client_error());
+
+    let (status, v) = get_json(&h.router, "/log/checkpoint").await;
+    assert_eq!(status, StatusCode::OK);
+    let cp = LogCheckpoint::from_value(&v).unwrap();
+    assert_eq!(
+        cp.tree_size, 2,
+        "failed publishes must leave no leaf (§7.1)"
     );
 }

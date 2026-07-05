@@ -147,3 +147,24 @@ key_id_fragment = "receipt-key-1"
 # `acdp-registry-lifecycle` + acdp_version 0.3.0. Retraction is
 # mark-not-delete: bodies stay retrievable forever.
 enabled = false
+
+[log]
+# Registry transparency log (RFC-ACDP-0012, ACDP 0.3.0): a per-registry,
+# append-only RFC 6962-style Merkle tree over publish events. When true the
+# registry appends one leaf per accepted publish ATOMICALLY with the context
+# row and its receipt (no degraded mode — a publish that cannot append its
+# leaf fails), serves GET /log/checkpoint, /log/proof, and /log/entries,
+# signs checkpoints with the [receipt] key (no new key role), and advertises
+# `acdp-registry-transparency-log` + acdp_version 0.3.0.
+#
+# Prerequisites: a configured [receipt] signing key and a durable storage
+# backend (sqlite or postgres) — both enforced at startup.
+enabled = false
+
+# The <instance> component of the log identifier
+# log_id = "did:web:<authority>/log/<instance>" (matches [a-z0-9-]{1,32}).
+# A registry operates exactly ONE live instantiation. Change this ONLY on
+# catastrophic tree loss (RFC-ACDP-0012 §7.4): a new instance is an
+# explicit, loudly detectable history reset — consistency proofs do not
+# span instances.
+# instance = "1"

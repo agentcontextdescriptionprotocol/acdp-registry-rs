@@ -13,7 +13,7 @@ use acdp::types::lifecycle::{retraction_state, LifecycleEvent, LifecycleEventTyp
 use acdp::types::primitives::{AgentDid, ContentHash, CtxId, LineageId, Status, Visibility};
 use acdp::types::publish::PublishResponse;
 use acdp::types::search::{SearchParams, SearchResponse, SearchResult};
-use acdp_registry_store::{ExtendedRegistryStore, Page};
+use acdp_registry_store::{ExtendedRegistryStore, LogEntryRecord, Page};
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
@@ -25,6 +25,11 @@ use sqlx::{Row, SqlitePool};
 #[derive(Clone)]
 pub struct SqliteStore {
     pool: SqlitePool,
+    /// RFC-ACDP-0012: when true, `commit_publish` appends a transparency-
+    /// log leaf in the SAME transaction as the context row + receipt
+    /// (§7.1 — no degraded mode). Enabled via
+    /// [`Self::with_transparency_log`] when `[log]` is configured.
+    log_enabled: bool,
 }
 
 impl SqliteStore {
@@ -47,7 +52,10 @@ impl SqliteStore {
             .connect_with(opts)
             .await
             .map_err(|e| AcdpError::RegistryInternal(format!("sqlite connect: {e}")))?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            log_enabled: false,
+        })
     }
 
     /// In-memory store, primarily for tests.
@@ -66,7 +74,20 @@ impl SqliteStore {
             .connect("sqlite::memory:")
             .await
             .map_err(|e| AcdpError::RegistryInternal(format!("sqlite mem: {e}")))?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            log_enabled: false,
+        })
+    }
+
+    /// Enable the RFC-ACDP-0012 transparency log: every subsequent
+    /// `commit_publish` appends a §4 leaf atomically with the context
+    /// row and its receipt (§7.1), and refuses to publish at all when no
+    /// receipt is minted — the log profile's prerequisite is the
+    /// receipts profile (§11), and there is no degraded mode.
+    pub fn with_transparency_log(mut self) -> Self {
+        self.log_enabled = true;
+        self
     }
 
     fn block_on<F: std::future::Future<Output = T>, T>(&self, fut: F) -> T {
@@ -233,6 +254,91 @@ impl ExtendedRegistryStore for SqliteStore {
     ) -> Result<Vec<LifecycleEvent>, AcdpError> {
         events_for_ctx(&self.pool, ctx_id).await
     }
+
+    // ── Transparency log reads (RFC-ACDP-0012) ─────────────────────────
+
+    async fn log_tree_size(&self) -> Result<u64, AcdpError> {
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM log_leaves")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| AcdpError::RegistryInternal(format!("log_tree_size: {e}")))?;
+        Ok(n.max(0) as u64)
+    }
+
+    async fn log_leaf_hashes(&self, up_to: u64) -> Result<Vec<[u8; 32]>, AcdpError> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT leaf_hash FROM log_leaves WHERE leaf_index < ? ORDER BY leaf_index ASC",
+        )
+        .bind(i64::try_from(up_to).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AcdpError::RegistryInternal(format!("log_leaf_hashes: {e}")))?;
+        if rows.len() as u64 != up_to {
+            return Err(AcdpError::RegistryInternal(format!(
+                "transparency log is not dense: {} leaves stored below index {up_to} \
+                 (RFC-ACDP-0012 §5.3)",
+                rows.len()
+            )));
+        }
+        rows.iter()
+            .map(|(h,)| acdp::types::log::decode_sha256_hex(h))
+            .collect()
+    }
+
+    async fn log_leaf_by_ctx(&self, ctx_id: &str) -> Result<Option<LogEntryRecord>, AcdpError> {
+        let row = sqlx::query(
+            "SELECT leaf_index, ctx_id, leaf_hash, leaf_json FROM log_leaves WHERE ctx_id = ?",
+        )
+        .bind(ctx_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| AcdpError::RegistryInternal(format!("log_leaf_by_ctx: {e}")))?;
+        row.map(|r| log_row_to_record(&r)).transpose()
+    }
+
+    async fn log_leaf_by_index(
+        &self,
+        leaf_index: u64,
+    ) -> Result<Option<LogEntryRecord>, AcdpError> {
+        let Ok(idx) = i64::try_from(leaf_index) else {
+            return Ok(None);
+        };
+        let row = sqlx::query(
+            "SELECT leaf_index, ctx_id, leaf_hash, leaf_json FROM log_leaves \
+             WHERE leaf_index = ?",
+        )
+        .bind(idx)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| AcdpError::RegistryInternal(format!("log_leaf_by_index: {e}")))?;
+        row.map(|r| log_row_to_record(&r)).transpose()
+    }
+
+    async fn log_entries(&self, start: u64, end: u64) -> Result<Vec<LogEntryRecord>, AcdpError> {
+        let rows = sqlx::query(
+            "SELECT leaf_index, ctx_id, leaf_hash, leaf_json FROM log_leaves \
+             WHERE leaf_index >= ? AND leaf_index < ? ORDER BY leaf_index ASC",
+        )
+        .bind(i64::try_from(start).unwrap_or(i64::MAX))
+        .bind(i64::try_from(end).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AcdpError::RegistryInternal(format!("log_entries: {e}")))?;
+        rows.iter().map(log_row_to_record).collect()
+    }
+}
+
+/// Decode one `log_leaves` row.
+fn log_row_to_record(r: &sqlx::sqlite::SqliteRow) -> Result<LogEntryRecord, AcdpError> {
+    let leaf_index: i64 = r.try_get("leaf_index").map_err(map_sqlx_err)?;
+    Ok(LogEntryRecord {
+        leaf_index: u64::try_from(leaf_index).map_err(|_| {
+            AcdpError::RegistryInternal(format!("negative leaf_index {leaf_index}"))
+        })?,
+        ctx_id: r.try_get("ctx_id").map_err(map_sqlx_err)?,
+        leaf_hash: r.try_get("leaf_hash").map_err(map_sqlx_err)?,
+        leaf_json: r.try_get("leaf_json").map_err(map_sqlx_err)?,
+    })
 }
 
 fn visible_to(ctx: &FullContext, requester: Option<&AgentDid>) -> bool {
@@ -839,6 +945,35 @@ impl RegistryStore for SqliteStore {
                 receipt.as_ref(),
             )
             .await?;
+
+            // 5.5. Append the transparency-log leaf (RFC-ACDP-0012 §7.1)
+            // in the SAME transaction as the context row and its receipt:
+            // the three commit together, or none does. leaf_index is the
+            // dense acceptance-order position (§5.3) — COUNT(*) is safe
+            // here because BEGIN IMMEDIATE serializes writers.
+            if self.log_enabled {
+                let Some(receipt) = receipt.as_ref() else {
+                    return Err(AcdpError::RegistryInternal(
+                        "transparency log is enabled but no receipt was minted for this \
+                         publish — the log profile's prerequisite is the receipts profile \
+                         (RFC-ACDP-0012 §11) and there is no degraded mode (§7.1); \
+                         aborting the publish"
+                            .into(),
+                    ));
+                };
+                let (leaf_json, leaf_hash) =
+                    acdp_registry_store::build_leaf_record(&body, receipt)?;
+                sqlx::query(
+                    "INSERT INTO log_leaves (leaf_index, ctx_id, leaf_json, leaf_hash) \
+                     VALUES ((SELECT COUNT(*) FROM log_leaves), ?, ?, ?)",
+                )
+                .bind(body.ctx_id.as_str())
+                .bind(&leaf_json)
+                .bind(&leaf_hash)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx_err)?;
+            }
 
             // 6. Mark predecessor superseded.
             if let Some(prev) = &req.supersedes {

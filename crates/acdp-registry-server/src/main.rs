@@ -248,6 +248,56 @@ fn validate_config(cfg: &RegistryConfig) -> anyhow::Result<()> {
         );
     }
 
+    // ACDP 0.3.0 / RFC-ACDP-0012 §11: the transparency-log profile's
+    // prerequisite is `acdp-registry-receipts` — load-bearing twice over:
+    // leaves bind receipt hashes (§4) and checkpoints sign with the
+    // receipt key (§6). A log opt-in without a receipt key has nothing to
+    // put in a leaf and nothing to sign checkpoints with.
+    if cfg.log.enabled && !cfg.receipt.is_configured() {
+        anyhow::bail!(
+            "log.enabled=true but no [receipt] signing key is configured. The transparency \
+             log's prerequisite is the receipts profile (RFC-ACDP-0012 §11: leaves bind \
+             receipt hashes and checkpoints sign with the receipt key) — configure \
+             receipt.signing_key_seed_b64 or receipt.signing_key_path, or disable [log]."
+        );
+    }
+    // §7.1/§7.4: the log is a durable, append-only history commitment;
+    // the ephemeral memory backend loses the tree on every restart, which
+    // would force a log_id reset per §7.4 — refuse the combination.
+    if cfg.log.enabled && matches!(cfg.storage.backend, StorageBackend::Memory) {
+        anyhow::bail!(
+            "log.enabled=true requires a durable storage backend (sqlite or postgres): the \
+             transparency log is an append-only history the registry commits to across \
+             restarts (RFC-ACDP-0012 §7.1/§7.4); the memory backend cannot honor that."
+        );
+    }
+    // §6: the instance component must match [a-z0-9-]{1,32}; validate the
+    // full log_id shape at startup, not on the first /log/checkpoint.
+    if cfg.log.enabled {
+        let log_id = format!(
+            "{}/log/{}",
+            authority_to_did_web(&cfg.registry.authority),
+            cfg.log.instance.trim()
+        );
+        acdp::types::log::parse_log_id(&log_id)
+            .map_err(|e| anyhow::anyhow!("log.instance: {e}"))?;
+    }
+    // Same false-advertisement guard as the other 0.3.0 profiles.
+    if cfg
+        .registry
+        .profiles
+        .iter()
+        .any(|p| p == "acdp-registry-transparency-log")
+        && !cfg.log.enabled
+    {
+        anyhow::bail!(
+            "registry.profiles advertises 'acdp-registry-transparency-log' but log.enabled \
+             is false. Advertising the profile is the RFC-ACDP-0012 §7 commitment (log every \
+             accepted publish atomically, serve all three /log/* endpoints, no degraded \
+             mode) — set log.enabled=true or remove the profile."
+        );
+    }
+
     // SEC: refuse an insecure default deployment — a non-loopback bind with
     // BOTH TLS and auth disabled exposes an unauthenticated, plaintext registry
     // on every interface. Require an explicit opt-in (the operator asserting a
@@ -332,6 +382,13 @@ async fn run(cfg: RegistryConfig) -> anyhow::Result<()> {
         .clone()
         .ok_or_else(|| anyhow::anyhow!("storage.sqlite_path missing"))?;
     let store = SqliteStore::connect(&path, cfg.storage.max_connections).await?;
+    // RFC-ACDP-0012 §7.1: with [log] enabled, every commit_publish appends
+    // the leaf in the same transaction as the context row + receipt.
+    let store = if cfg.log.enabled {
+        store.with_transparency_log()
+    } else {
+        store
+    };
     store.migrate().await?;
     {
         let evictor = store.clone();
@@ -373,6 +430,13 @@ async fn run(cfg: RegistryConfig) -> anyhow::Result<()> {
         .clone()
         .ok_or_else(|| anyhow::anyhow!("storage.postgres_url missing"))?;
     let store = PgStore::connect(&url, cfg.storage.max_connections).await?;
+    // RFC-ACDP-0012 §7.1: with [log] enabled, every commit_publish appends
+    // the leaf in the same transaction as the context row + receipt.
+    let store = if cfg.log.enabled {
+        store.with_transparency_log()
+    } else {
+        store
+    };
     store.migrate().await?;
     {
         let evictor = store.clone();
@@ -656,7 +720,7 @@ fn build_capabilities(cfg: &RegistryConfig) -> CapabilitiesDocument {
         // RFC-ACDP-0013 §10) require >= 0.3.0; a receipt key alone
         // claims 0.2.0 (RFC-ACDP-0010 §11); a bare deployment keeps the
         // 0.1.0 claim it actually honors.
-        acdp_version: if cfg.receipt.head_receipts || cfg.lifecycle.enabled {
+        acdp_version: if cfg.receipt.head_receipts || cfg.lifecycle.enabled || cfg.log.enabled {
             "0.3.0".into()
         } else if cfg.receipt.is_configured() {
             "0.2.0".into()
@@ -666,13 +730,25 @@ fn build_capabilities(cfg: &RegistryConfig) -> CapabilitiesDocument {
         registry_did: authority_to_did_web(&cfg.registry.authority),
         supported_signature_algorithms: vec!["ed25519".into()],
         supported_did_methods: cfg.auth.did_methods.clone(),
-        profiles: if cfg.registry.profiles.is_empty() {
-            vec![
-                "acdp-registry-core".into(),
-                "acdp-registry-discovery".into(),
-            ]
-        } else {
-            cfg.registry.profiles.clone()
+        profiles: {
+            let mut profiles = if cfg.registry.profiles.is_empty() {
+                vec![
+                    "acdp-registry-core".into(),
+                    "acdp-registry-discovery".into(),
+                ]
+            } else {
+                cfg.registry.profiles.clone()
+            };
+            // RFC-ACDP-0012 §11: advertising the profile is the §7
+            // commitment. The receipts / head-receipts / lifecycle
+            // profiles are appended by the SDK's `with_*` builders; the
+            // log has no SDK builder (the registry owns the endpoint
+            // surface), so append it here.
+            let log_profile = "acdp-registry-transparency-log";
+            if cfg.log.enabled && !profiles.iter().any(|p| p == log_profile) {
+                profiles.push(log_profile.into());
+            }
+            profiles
         },
         limits: Limits {
             max_payload_bytes: cfg.limits.max_payload_bytes,
@@ -925,6 +1001,65 @@ mod tests {
             validate_config(&cfg).is_err(),
             "methods the pipeline can't verify must be refused"
         );
+    }
+
+    // RFC-ACDP-0012 — transparency-log startup validation.
+
+    #[test]
+    fn log_without_receipt_key_is_rejected() {
+        let mut cfg = RegistryConfig::defaults();
+        cfg.log.enabled = true;
+        let err = validate_config(&cfg).expect_err("log without a receipt key must be refused");
+        assert!(err.to_string().contains("RFC-ACDP-0012"), "{err}");
+        // A receipt key resolves the prerequisite.
+        cfg.receipt.signing_key_seed_b64 =
+            base64::engine::general_purpose::STANDARD.encode([5u8; 32]);
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn log_profile_without_enabled_is_rejected() {
+        let mut cfg = RegistryConfig::defaults();
+        cfg.receipt.signing_key_seed_b64 =
+            base64::engine::general_purpose::STANDARD.encode([5u8; 32]);
+        cfg.registry.profiles = vec![
+            "acdp-registry-core".into(),
+            "acdp-registry-transparency-log".into(),
+        ];
+        let err = validate_config(&cfg)
+            .expect_err("advertising the log profile without log.enabled must be refused");
+        assert!(err.to_string().contains("transparency-log"), "{err}");
+        cfg.log.enabled = true;
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn log_on_memory_backend_is_rejected() {
+        let mut cfg = RegistryConfig::defaults();
+        cfg.receipt.signing_key_seed_b64 =
+            base64::engine::general_purpose::STANDARD.encode([5u8; 32]);
+        cfg.log.enabled = true;
+        cfg.storage.backend = StorageBackend::Memory;
+        let err =
+            validate_config(&cfg).expect_err("the ephemeral memory backend cannot host a log");
+        assert!(err.to_string().contains("durable"), "{err}");
+    }
+
+    #[test]
+    fn log_malformed_instance_is_rejected() {
+        let mut cfg = RegistryConfig::defaults();
+        cfg.receipt.signing_key_seed_b64 =
+            base64::engine::general_purpose::STANDARD.encode([5u8; 32]);
+        cfg.log.enabled = true;
+        for bad in ["UPPER", "", "with space", &"a".repeat(33)] {
+            cfg.log.instance = bad.into();
+            assert!(
+                validate_config(&cfg).is_err(),
+                "instance '{bad}' must be refused (RFC-ACDP-0012 §6)"
+            );
+        }
+        cfg.log.instance = "1".into();
+        assert!(validate_config(&cfg).is_ok());
     }
 
     // #17 — multi-tenant config must enforce strict tenant scoping.

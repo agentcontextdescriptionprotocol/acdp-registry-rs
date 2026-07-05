@@ -4,12 +4,16 @@
 //! protocol-level store contract — paginated listing, a backend health
 //! check, and migration runner.
 
+pub mod log;
+
 use acdp::error::AcdpError;
 use acdp::registry::RegistryStore;
 use acdp::types::body::FullContext;
 use acdp::types::lifecycle::LifecycleEvent;
 use acdp::types::primitives::AgentDid;
 use async_trait::async_trait;
+
+pub use log::{build_leaf_record, LogEntryRecord};
 
 /// Cursor-keyed page returned by [`ExtendedRegistryStore::list`].
 #[derive(Debug, Clone)]
@@ -103,6 +107,65 @@ pub trait ExtendedRegistryStore: RegistryStore + Send + Sync {
         Ok(ctx
             .and_then(|c| c.registry_state.lifecycle_events)
             .unwrap_or_default())
+    }
+
+    // ── Transparency log reads (ACDP 0.3, RFC-ACDP-0012) ──────────────
+    //
+    // Leaves are APPENDED only inside `RegistryStore::commit_publish`
+    // (same transaction as the context row + receipt, §7.1 — there is
+    // deliberately no standalone append API). These are the read
+    // projections the `/log/*` endpoints need. Defaults return
+    // `NotImplemented` so backends without a `log_leaves` table stay
+    // compatible; a deployment MUST NOT enable `[log]` against such a
+    // backend (startup validation enforces this for the memory backend).
+
+    /// Current tree size — the number of appended leaves (§5.2).
+    async fn log_tree_size(&self) -> Result<u64, AcdpError> {
+        Err(AcdpError::NotImplemented(
+            "this backend does not implement the transparency log (RFC-ACDP-0012)".into(),
+        ))
+    }
+
+    /// The first `up_to` §5.1 leaf hashes as raw 32-byte digests, in
+    /// leaf-index order — the sole input to every root / inclusion-path /
+    /// consistency-path computation (§5.2, §8.3). Errors if the stored
+    /// log is not dense over `[0, up_to)`.
+    async fn log_leaf_hashes(&self, up_to: u64) -> Result<Vec<[u8; 32]>, AcdpError> {
+        let _ = up_to;
+        Err(AcdpError::NotImplemented(
+            "this backend does not implement the transparency log (RFC-ACDP-0012)".into(),
+        ))
+    }
+
+    /// The leaf for `ctx_id`, if logged (§8.2 inclusion mode — the
+    /// consumer surface). Callers apply retrieval visibility (§8.2 /
+    /// RFC-ACDP-0008 §4.5) BEFORE disclosing anything about the result.
+    async fn log_leaf_by_ctx(&self, ctx_id: &str) -> Result<Option<LogEntryRecord>, AcdpError> {
+        let _ = ctx_id;
+        Err(AcdpError::NotImplemented(
+            "this backend does not implement the transparency log (RFC-ACDP-0012)".into(),
+        ))
+    }
+
+    /// The leaf at `leaf_index`, if present (§8.2 inclusion mode — the
+    /// auditor surface; hash-only data needs no visibility gate, but the
+    /// `leaf` echo does).
+    async fn log_leaf_by_index(
+        &self,
+        leaf_index: u64,
+    ) -> Result<Option<LogEntryRecord>, AcdpError> {
+        let _ = leaf_index;
+        Err(AcdpError::NotImplemented(
+            "this backend does not implement the transparency log (RFC-ACDP-0012)".into(),
+        ))
+    }
+
+    /// Leaves `[start, end)` in leaf-index order (§8.3).
+    async fn log_entries(&self, start: u64, end: u64) -> Result<Vec<LogEntryRecord>, AcdpError> {
+        let _ = (start, end);
+        Err(AcdpError::NotImplemented(
+            "this backend does not implement the transparency log (RFC-ACDP-0012)".into(),
+        ))
     }
 
     /// Batch tenant lookup. Returns a map of `ctx_id → tenant_id`.

@@ -106,6 +106,7 @@ fn config() -> RegistryConfig {
         },
         receipt: Default::default(),
         lifecycle: Default::default(),
+        log: Default::default(),
     }
 }
 

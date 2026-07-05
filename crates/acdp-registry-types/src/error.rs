@@ -164,6 +164,15 @@ fn acdp_wire_code(err: &AcdpError) -> &'static str {
         // retract / spurious republish).
         AcdpError::ImmutableField(_) => "immutable_field",
         AcdpError::InvalidLifecycleTransition(_) => "invalid_lifecycle_transition",
+        // RFC-ACDP-0012 §11 — a transparency-log proof / checkpoint failed
+        // the §9 verification procedures. On the wire this is emitted by a
+        // federated resolver (or any registry validating an UPSTREAM's
+        // proofs on a caller's behalf) — hence 502, the upstream is at
+        // fault. The registry's own /log/* handlers never emit it: their
+        // failure modes are schema_violation (malformed queries),
+        // not_found (unlogged / invisible ctx_id), and not_implemented
+        // (profile not advertised). There is no log_unavailable (§7.1).
+        AcdpError::InvalidLogProof(_) => "invalid_log_proof",
         AcdpError::NotImplemented(_) => "not_implemented",
         AcdpError::DuplicatePublish(_) => "duplicate_publish",
         AcdpError::SupersededTarget { .. } => "superseded_target",
@@ -212,6 +221,9 @@ fn http_status_for_acdp(err: &AcdpError) -> u16 {
         // "upstream returned garbage" — the registry itself is healthy,
         // the gateway hop failed. Matches `KeyResolutionUnreachable`.
         AcdpError::KeyResolutionUnreachable(_) | AcdpError::CrossRegistryResolutionFailed(_) => 502,
+        // RFC-ACDP-0012 §11: `invalid_log_proof` is HTTP 502 — the upstream
+        // whose proof failed verification is at fault, not this registry.
+        AcdpError::InvalidLogProof(_) => 502,
         AcdpError::NotImplemented(_) => 501,
         _ => 500,
     }
@@ -380,6 +392,17 @@ mod tests {
         let embedded = acdp(AcdpError::EmbeddedTooLarge("128 KiB".into()));
         assert_eq!(embedded.wire_code(), "embedded_too_large");
         assert_eq!(embedded.http_status(), 413);
+    }
+
+    /// RFC-ACDP-0012 §11 — `invalid_log_proof` is a registered 0.3.0 wire
+    /// code, HTTP 502 (the upstream whose proof failed is at fault). The
+    /// registry's own /log/* handlers never emit it; the mapping exists
+    /// for federation paths that verify an upstream's proofs.
+    #[test]
+    fn invalid_log_proof_is_502_with_registered_code() {
+        let e = acdp(AcdpError::InvalidLogProof("path does not fold".into()));
+        assert_eq!(e.wire_code(), "invalid_log_proof");
+        assert_eq!(e.http_status(), 502);
     }
 
     /// A failed gateway hop (federation / unreachable key resolution) is 502 —

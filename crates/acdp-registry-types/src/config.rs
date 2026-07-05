@@ -25,6 +25,8 @@ pub struct RegistryConfig {
     pub receipt: ReceiptConfig,
     #[serde(default)]
     pub lifecycle: LifecycleConfig,
+    #[serde(default)]
+    pub log: LogConfig,
 }
 
 impl RegistryConfig {
@@ -95,6 +97,7 @@ impl RegistryConfig {
             playground: PlaygroundConfig::default(),
             receipt: ReceiptConfig::default(),
             lifecycle: LifecycleConfig::default(),
+            log: LogConfig::default(),
         }
     }
 }
@@ -723,6 +726,57 @@ impl Default for ReceiptConfig {
 pub struct LifecycleConfig {
     #[serde(default)]
     pub enabled: bool,
+}
+
+/// Registry transparency log (RFC-ACDP-0012, ACDP 0.3.0).
+///
+/// When `enabled`, the registry:
+///   * appends one §4 leaf per accepted publish, ATOMICALLY with the
+///     context row and its RFC-ACDP-0010 receipt (§7.1 — the body, the
+///     receipt, and the leaf commit together, or none does);
+///   * serves `GET /log/checkpoint`, `GET /log/proof`, and
+///     `GET /log/entries` (§8), signing checkpoints with the SAME
+///     receipt key (§6: the log introduces no new key role);
+///   * advertises the `acdp-registry-transparency-log` profile plus
+///     `acdp_version` ≥ 0.3.0.
+///
+/// Prerequisite: a configured `[receipt]` signing key — the profile's
+/// prerequisite is `acdp-registry-receipts` (§11: leaves bind receipt
+/// hashes and checkpoints sign with the receipt key). Startup validation
+/// enforces it. A durable storage backend (SQLite / Postgres) is also
+/// required; the ephemeral memory backend cannot honor the append-only
+/// history commitment (§7.4).
+///
+/// When disabled (the default), the three `/log/*` endpoints answer
+/// `not_implemented` (HTTP 501) and no leaf is ever appended. There is no
+/// `log_unavailable` degraded mode: an enabled log MUST log every
+/// accepted publish or fail the publish (§7.1).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// The `<instance>` component of the log identifier
+    /// `"<registry_did>/log/<instance>"` (§6; matches `[a-z0-9-]{1,32}`).
+    /// A registry operates exactly ONE live instantiation; change this
+    /// value ONLY on catastrophic tree loss (§7.4) — a new instance is an
+    /// explicit, detectable history reset, and the old tree's
+    /// consistency guarantees do not carry over.
+    #[serde(default = "default_log_instance")]
+    pub instance: String,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            instance: default_log_instance(),
+        }
+    }
+}
+
+fn default_log_instance() -> String {
+    "1".into()
 }
 
 fn default_receipt_key_fragment() -> String {

@@ -458,3 +458,316 @@ mod lifecycle {
         );
     }
 }
+
+// ─── ACDP 0.3.0: transparency log (RFC-ACDP-0012) ──────────────────────────
+
+mod transparency_log {
+    use super::*;
+    use acdp::types::body::Body;
+    use acdp::types::log::{decode_sha256_hex, encode_sha256_hex};
+    use acdp::types::receipt::ReceiptSigner;
+
+    const REGISTRY_DID: &str = "did:web:reg.test";
+
+    async fn log_store() -> (Arc<SqliteStore>, tempfile::NamedTempFile) {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = SqliteStore::connect(tmp.path(), 4)
+            .await
+            .unwrap()
+            .with_transparency_log();
+        store.migrate().await.unwrap();
+        (Arc::new(store), tmp)
+    }
+
+    fn signer() -> ReceiptSigner {
+        ReceiptSigner::new(
+            acdp::crypto::SigningKey::from_bytes(&[99u8; 32]),
+            REGISTRY_DID,
+            format!("{REGISTRY_DID}#receipt-key-1"),
+        )
+        .unwrap()
+    }
+
+    /// RFC-ACDP-0010 minter closure of the exact shape `RegistryServer`
+    /// threads through `PublishCommit::receipt_minter`.
+    fn mint_fn(
+        signer: ReceiptSigner,
+    ) -> impl Fn(&Body) -> Result<serde_json::Value, AcdpError> + Send + Sync {
+        move |body: &Body| {
+            let receipt = signer.mint(
+                &body.ctx_id,
+                &body.lineage_id,
+                &body.origin_registry,
+                body.created_at,
+                &body.content_hash,
+                &format!("sha256:{}", "c".repeat(64)),
+            )?;
+            serde_json::to_value(receipt).map_err(AcdpError::from)
+        }
+    }
+
+    async fn counts(store: &SqliteStore) -> (i64, i64) {
+        let (contexts,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM contexts")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        let (leaves,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM log_leaves")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        (contexts, leaves)
+    }
+
+    /// §7.1: the leaf commits with the publish; §5.3: dense acceptance-
+    /// order indexes; §4/§5.1: the stored bytes reproduce the stored
+    /// hash; leaf count always equals context count under the profile.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn leaf_commits_atomically_and_is_reproducible() {
+        let (store, _tmp) = log_store().await;
+        let mint = mint_fn(signer());
+        let mut ctx_ids = Vec::new();
+        for i in 0..3u8 {
+            let p = producer(140 + i);
+            let req = request(&p, &format!("log-{i}"));
+            let outcome = tokio::task::block_in_place(|| {
+                store.commit_publish(PublishCommit {
+                    req: &req,
+                    authority: AUTHORITY,
+                    idempotency: None,
+                    tenant: None,
+                    receipt_minter: Some(&mint),
+                })
+            })
+            .expect("logged publish succeeds");
+            ctx_ids.push(response(&outcome).ctx_id.as_str().to_string());
+        }
+
+        assert_eq!(store.log_tree_size().await.unwrap(), 3);
+        let (contexts, leaves) = counts(&store).await;
+        assert_eq!(contexts, 3);
+        assert_eq!(
+            leaves, 3,
+            "leaf count ≡ context count under the profile (§7.1)"
+        );
+
+        let entries = store.log_entries(0, 3).await.unwrap();
+        assert_eq!(entries.len(), 3);
+        for (i, e) in entries.iter().enumerate() {
+            assert_eq!(
+                e.leaf_index, i as u64,
+                "dense acceptance-order indexes (§5.3)"
+            );
+            assert_eq!(
+                e.ctx_id, ctx_ids[i],
+                "one leaf per ctx_id, in acceptance order"
+            );
+            // Reproducibility: rehash the exact stored bytes (§5.1).
+            let rehashed = acdp::crypto::merkle::leaf_hash(e.leaf_json.as_bytes());
+            assert_eq!(encode_sha256_hex(&rehashed), e.leaf_hash);
+            // The stored bytes parse through the closed §4 schema and
+            // hash identically through the typed path.
+            assert_eq!(e.leaf().unwrap().leaf_hash_hex().unwrap(), e.leaf_hash);
+            // Point lookups agree.
+            let by_ctx = store.log_leaf_by_ctx(&e.ctx_id).await.unwrap().unwrap();
+            assert_eq!(by_ctx.leaf_index, e.leaf_index);
+            assert_eq!(by_ctx.leaf_json, e.leaf_json);
+            let by_idx = store
+                .log_leaf_by_index(e.leaf_index)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(by_idx.ctx_id, e.ctx_id);
+        }
+        // The density-checked hash projection succeeds and matches.
+        let hashes = store.log_leaf_hashes(3).await.unwrap();
+        assert_eq!(hashes.len(), 3);
+        for (i, e) in entries.iter().enumerate() {
+            assert_eq!(hashes[i], decode_sha256_hex(&e.leaf_hash).unwrap());
+        }
+    }
+
+    /// §7.1/§11 no degraded mode: a log-enabled store REFUSES a publish
+    /// that arrives without a receipt minter — nothing is persisted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn publish_without_receipt_minter_is_refused_entirely() {
+        let (store, _tmp) = log_store().await;
+        let p = producer(150);
+        let req = request(&p, "no-receipt");
+        let err = tokio::task::block_in_place(|| {
+            store.commit_publish(PublishCommit {
+                req: &req,
+                authority: AUTHORITY,
+                idempotency: None,
+                tenant: None,
+                receipt_minter: None,
+            })
+        })
+        .expect_err("log-enabled publish without a receipt must fail");
+        assert!(matches!(err, AcdpError::RegistryInternal(_)), "{err:?}");
+        assert_eq!(counts(&store).await, (0, 0), "nothing persists (§7.1)");
+    }
+
+    /// §7.1 crash-consistency: a failing receipt minter aborts the whole
+    /// publish — no context row, no orphan leaf.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failing_minter_leaves_no_orphan_leaf() {
+        let (store, _tmp) = log_store().await;
+        let p = producer(151);
+        let req = request(&p, "minter-fails");
+        let failing = |_: &Body| -> Result<serde_json::Value, AcdpError> {
+            Err(AcdpError::RegistryInternal("kms outage".into()))
+        };
+        let err = tokio::task::block_in_place(|| {
+            store.commit_publish(PublishCommit {
+                req: &req,
+                authority: AUTHORITY,
+                idempotency: None,
+                tenant: None,
+                receipt_minter: Some(&failing),
+            })
+        })
+        .expect_err("failing minter must abort the publish");
+        assert!(matches!(err, AcdpError::RegistryInternal(_)), "{err:?}");
+        assert_eq!(
+            counts(&store).await,
+            (0, 0),
+            "no orphan leaf or context (§7.1)"
+        );
+    }
+
+    /// §5.3 under concurrency: racing logged publishes serialize on
+    /// BEGIN IMMEDIATE and still assign dense, unique leaf indexes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_logged_publishes_assign_dense_indexes() {
+        let (store, _tmp) = log_store().await;
+        let handles: Vec<_> = (0..8u8)
+            .map(|i| {
+                let store = Arc::clone(&store);
+                tokio::task::spawn_blocking(move || {
+                    let p = producer(160 + i);
+                    let req = request(&p, &format!("race-{i}"));
+                    let mint = mint_fn(signer());
+                    store.commit_publish(PublishCommit {
+                        req: &req,
+                        authority: AUTHORITY,
+                        idempotency: None,
+                        tenant: None,
+                        receipt_minter: Some(&mint),
+                    })
+                })
+            })
+            .collect();
+        for h in handles {
+            h.await.unwrap().expect("every racer commits");
+        }
+        assert_eq!(store.log_tree_size().await.unwrap(), 8);
+        // log_leaf_hashes enforces density over [0, 8).
+        assert_eq!(store.log_leaf_hashes(8).await.unwrap().len(), 8);
+        assert_eq!(counts(&store).await, (8, 8));
+    }
+
+    // ── log-001 golden fixture (spec schemas/conformance) ─────────────
+    //
+    // The fixture's ctx_ids live on registry.example.com, not this test
+    // authority, so its leaves cannot arrive through publish; per the
+    // fixture's own guidance the root reproduction is exercised at the
+    // store layer: the pinned JCS leaf encodings are inserted as stored
+    // rows and the store's hash projection must reproduce every pinned
+    // §5.1 leaf hash, the pinned tree-size-5 root, and the pinned
+    // inclusion path for leaf 0.
+
+    const LOG_001_LEAVES: [&str; 5] = [
+        r#"{"content_hash":"sha256:f170150ddbf59d99794e7797824591b374d459782084597b644ecc57a41031b5","created_at":"2026-04-16T10:30:15.123Z","ctx_id":"acdp://registry.example.com/12345678-1234-4321-8123-123456781234","key_fingerprint":"sha256:139e3940e64b5491722088d9a0d741628fc826e09475d341a780acde3c4b8070","leaf_version":"acdp-log-leaf/1","lineage_id":"lin:sha256:c7fef01c000f8edaa9cb46122ceb5d7bca38328f002fb0f40e362e3b289bbb2a","origin_registry":"registry.example.com","receipt_hash":"sha256:9deaa52778ad3b6be27a96d607c3017e9e11442905891a8972f34d8c2dbca9cf"}"#,
+        r#"{"content_hash":"sha256:5b8be477da9b3e1354ebf2868494acb702301aaa825c1c3af3f92c5536ba7bd1","created_at":"2026-07-01T01:00:00.000Z","ctx_id":"acdp://registry.example.com/00000000-0000-4000-8000-000000000001","key_fingerprint":"sha256:139e3940e64b5491722088d9a0d741628fc826e09475d341a780acde3c4b8070","leaf_version":"acdp-log-leaf/1","lineage_id":"lin:sha256:a65dce2bc7d3d2f52513c14c9d7262903c960490b17308b272981240a76c2d42","origin_registry":"registry.example.com","receipt_hash":"sha256:2b8fa37afe87358aa039e78802f4a9b9fb4bc5df2a814a3f7cf5200f7f64b3df"}"#,
+        r#"{"content_hash":"sha256:a0c8d76890ec38db8791e82d7a8e24194f84c13ae67bdaa167540b58cb95507b","created_at":"2026-07-02T02:00:00.000Z","ctx_id":"acdp://registry.example.com/00000000-0000-4000-8000-000000000002","key_fingerprint":"sha256:139e3940e64b5491722088d9a0d741628fc826e09475d341a780acde3c4b8070","leaf_version":"acdp-log-leaf/1","lineage_id":"lin:sha256:518c191ba24d2fea433a768e232cb1d0ff152a39b38f28ac7f91960c9f8f7aba","origin_registry":"registry.example.com","receipt_hash":"sha256:591fa4c29669546b777bd1a4583aa724e9586b083c096d4b62f68b630dd18834"}"#,
+        r#"{"content_hash":"sha256:acbd2ea0c5608db56e1bd38bb0145a6f8363b30d8610abb746014a11f1a53c55","created_at":"2026-07-03T03:00:00.000Z","ctx_id":"acdp://registry.example.com/00000000-0000-4000-8000-000000000003","key_fingerprint":"sha256:139e3940e64b5491722088d9a0d741628fc826e09475d341a780acde3c4b8070","leaf_version":"acdp-log-leaf/1","lineage_id":"lin:sha256:1d941fb2ecdad88db6f9f3ecd5993178ab94f72e1061e685441d11ef04d92c05","origin_registry":"registry.example.com","receipt_hash":"sha256:342e57dc6d174cc7fe974c99f16c19ba598dfa31f41e560112db3f5ef21c5d91"}"#,
+        r#"{"content_hash":"sha256:6f72132b15b294cea2e753efc9b7a105d6d7ebd1527adecd9f2bfc7a677a129b","created_at":"2026-07-04T04:00:00.000Z","ctx_id":"acdp://registry.example.com/00000000-0000-4000-8000-000000000004","key_fingerprint":"sha256:139e3940e64b5491722088d9a0d741628fc826e09475d341a780acde3c4b8070","leaf_version":"acdp-log-leaf/1","lineage_id":"lin:sha256:c1987e0ba3e82db332daaafd64547aa6cbb66f191d53d2023a0ff78dc6c07063","origin_registry":"registry.example.com","receipt_hash":"sha256:88ee7b664509a56dbd597ccd2f8e19c39e0aaf2c75133d0b73781ce14cf5169f"}"#,
+    ];
+
+    const LOG_001_LEAF_HASHES: [&str; 5] = [
+        "sha256:95d99654d4d3de54a4d7cc04e079de61135023c78bb8192bdb79a09253afb8c1",
+        "sha256:846b4d6c07ca099eea348c1e219345ddd426c0531cc30d3dd626d0fa34ec7704",
+        "sha256:db94dd74b5c68f6d362129703ea587c8756d65cad0cc9859829021746a114451",
+        "sha256:dc309b7856483acb5b2a92323dd9c1571a778bdb7b446587100022b49ee5fb3b",
+        "sha256:6f673f8532d24869047264d89e2ad65f6ff2fa3c2674bb2fb9fa02855e090b3a",
+    ];
+
+    const LOG_001_ROOT: &str =
+        "sha256:0b5978172c671ca050b44790a749b18fc29d58a7a17495fbb4e0f86eb885f731";
+
+    const LOG_001_INCLUSION_PATH_LEAF_0: [&str; 3] = [
+        "sha256:846b4d6c07ca099eea348c1e219345ddd426c0531cc30d3dd626d0fa34ec7704",
+        "sha256:54d7edc4ba9d151eedd7f4bb872884f0af5ff32b39f98866d67873b00687c605",
+        "sha256:6f673f8532d24869047264d89e2ad65f6ff2fa3c2674bb2fb9fa02855e090b3a",
+    ];
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn log_001_fixture_leaves_reproduce_pinned_root() {
+        let (store, _tmp) = log_store().await;
+
+        for (i, leaf_json) in LOG_001_LEAVES.iter().enumerate() {
+            let leaf: serde_json::Value = serde_json::from_str(leaf_json).unwrap();
+            let ctx_id = leaf["ctx_id"].as_str().unwrap();
+            // Stub context row to satisfy the log_leaves FK (the fixture
+            // leaves did not arrive through publish).
+            sqlx::query(
+                "INSERT INTO contexts (ctx_id, lineage_id, agent_id, origin_registry, \
+                 created_at, visibility, context_type, version, title, content_hash, body_json) \
+                 VALUES (?, ?, 'did:key:fixture', 'registry.example.com', ?, 'public', \
+                 'data_snapshot', 1, 'log-001 fixture', ?, '{}')",
+            )
+            .bind(ctx_id)
+            .bind(leaf["lineage_id"].as_str().unwrap())
+            .bind(leaf["created_at"].as_str().unwrap())
+            .bind(leaf["content_hash"].as_str().unwrap())
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+            // The store persists the exact canonical bytes + their hash —
+            // recomputed here exactly as commit_publish computes them.
+            let hash = acdp::crypto::merkle::leaf_hash(leaf_json.as_bytes());
+            let hash_hex = encode_sha256_hex(&hash);
+            assert_eq!(
+                hash_hex, LOG_001_LEAF_HASHES[i],
+                "leaf {i}: §5.1 hash over the pinned JCS bytes must match the fixture"
+            );
+            sqlx::query(
+                "INSERT INTO log_leaves (leaf_index, ctx_id, leaf_json, leaf_hash) \
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(i as i64)
+            .bind(ctx_id)
+            .bind(leaf_json)
+            .bind(&hash_hex)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        }
+
+        // Root reproduction through the store's read path.
+        assert_eq!(store.log_tree_size().await.unwrap(), 5);
+        let hashes = store.log_leaf_hashes(5).await.unwrap();
+        let root = acdp::crypto::merkle::merkle_tree_hash(&hashes);
+        assert_eq!(
+            encode_sha256_hex(&root),
+            LOG_001_ROOT,
+            "tree-size-5 root over the stored fixture leaves must match log-001"
+        );
+
+        // Pinned inclusion path for leaf 0 at size 5.
+        let path = acdp::crypto::merkle::inclusion_path(0, &hashes).unwrap();
+        let path_hex: Vec<String> = path.iter().map(encode_sha256_hex).collect();
+        assert_eq!(path_hex, LOG_001_INCLUSION_PATH_LEAF_0);
+
+        // The stored rows round-trip through the typed leaf and rehash
+        // identically (byte-exact reproducibility).
+        for e in store.log_entries(0, 5).await.unwrap() {
+            assert_eq!(
+                e.leaf().unwrap().leaf_hash_hex().unwrap(),
+                e.leaf_hash,
+                "stored leaf bytes reproduce the stored hash"
+            );
+        }
+    }
+}

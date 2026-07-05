@@ -48,6 +48,11 @@ pub struct AppStateInner<S: ExtendedRegistryStore> {
     /// endpoint then 404s). Static for the process lifetime: key rotation
     /// is a config change + restart.
     pub registry_did_document: Option<serde_json::Value>,
+    /// Transparency-log serving state (RFC-ACDP-0012): the checkpoint
+    /// signer (= the RFC-ACDP-0010 receipt signer, §6), the `log_id`,
+    /// and the head-root cache. `None` when `log.enabled` is false —
+    /// the `/log/*` endpoints then answer 501 `not_implemented`.
+    pub log: Option<Arc<crate::log::LogState>>,
 }
 
 impl<S: ExtendedRegistryStore> AppStateInner<S> {
@@ -88,6 +93,15 @@ impl<S: ExtendedRegistryStore> AppStateInner<S> {
         } else {
             None
         };
+        // Transparency log (RFC-ACDP-0012). Misconfigurations are caught
+        // at startup by the binary's validate_config; if construction
+        // still fails here, serve 501s rather than panic mid-construction
+        // (test harnesses build state without running validate_config).
+        let log = crate::log::LogState::from_config(&config)
+            .map_err(|e| tracing::error!(error = %e, "transparency log unavailable"))
+            .ok()
+            .flatten()
+            .map(Arc::new);
         Self {
             server,
             auth,
@@ -98,6 +112,7 @@ impl<S: ExtendedRegistryStore> AppStateInner<S> {
             rate_limiter,
             challenge_rate_limiter,
             registry_did_document,
+            log,
         }
     }
 }
