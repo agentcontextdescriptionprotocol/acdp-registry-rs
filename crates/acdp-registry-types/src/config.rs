@@ -27,6 +27,11 @@ pub struct RegistryConfig {
     pub lifecycle: LifecycleConfig,
     #[serde(default)]
     pub log: LogConfig,
+    /// Transparency-log witnesses this registry polls and whose verified
+    /// cosignatures it aggregates onto its checkpoint responses
+    /// (RFC-ACDP-0015 §6.1). Empty (the default) disables aggregation.
+    #[serde(default)]
+    pub witnesses: Vec<WitnessConfig>,
 }
 
 impl RegistryConfig {
@@ -98,6 +103,7 @@ impl RegistryConfig {
             receipt: ReceiptConfig::default(),
             lifecycle: LifecycleConfig::default(),
             log: LogConfig::default(),
+            witnesses: Vec::new(),
         }
     }
 }
@@ -779,6 +785,50 @@ fn default_log_instance() -> String {
     "1".into()
 }
 
+/// One transparency-log **witness** (RFC-ACDP-0015 §6.1) this registry
+/// polls and whose verified cosignatures it aggregates onto its own
+/// checkpoint responses (the reserved `witness_signatures` member).
+///
+/// Wire format (TOML):
+///
+///   [[witnesses]]
+///   did          = "did:web:witness.example.org"
+///   url          = "https://witness.example.org/log/witness"
+///   poll_seconds = 60              # default 300
+///
+/// The background poller GETs `<url>?log_id=<this registry's log_id>`,
+/// VERIFIES every returned cosignature (RFC-ACDP-0015 §8: closed parse,
+/// witness-key signature under the witness DID's `assertionMethod`
+/// resolved via the SSRF-guarded `did:web` resolver, and — crucially —
+/// that `witnessed_checkpoint` matches THIS registry's own root at that
+/// `tree_size`), and stores only the ones that pass. A witness cosigning
+/// a different root (a fork, or a lie) is logged and dropped, never
+/// served. Aggregation is a convenience: the registry cannot forge a
+/// cosignature (it never holds a witness key), so serving them adds no
+/// trust — a consumer may always go direct to the witness (§6.2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WitnessConfig {
+    /// The witness's DID (`did:web` — the only method resolvable over the
+    /// network under the SSRF guard). Cosignatures whose `witness_id`
+    /// does not equal this value are ignored (a witness endpoint only
+    /// speaks for its own DID).
+    pub did: String,
+    /// Full HTTPS URL of the witness's `GET /log/witness` endpoint
+    /// (RFC-ACDP-0015 §6.2). SSRF-checked at startup and re-checked at
+    /// DNS time on every poll.
+    pub url: String,
+    /// Poll interval in seconds. Default 300 (aligned with the
+    /// revocation-feed poller and the RFC-ACDP-0012 §7.2 freshness
+    /// cadence).
+    #[serde(default = "default_witness_poll_seconds")]
+    pub poll_seconds: u64,
+}
+
+fn default_witness_poll_seconds() -> u64 {
+    300
+}
+
 fn default_receipt_key_fragment() -> String {
     "receipt-key-1".into()
 }
@@ -1130,6 +1180,45 @@ public_key_b64 = "AAAA"
     }
 
     // ── deserialization guards ──────────────────────────────────────
+
+    #[test]
+    fn witnesses_default_empty_and_round_trip() {
+        // Backward compat: a config without [[witnesses]] deserializes to
+        // an empty list (aggregation disabled).
+        let cfg = RegistryConfig::defaults();
+        assert!(cfg.witnesses.is_empty());
+
+        let toml = r#"
+[[witnesses]]
+did = "did:web:witness.example.org"
+url = "https://witness.example.org/log/witness"
+
+[[witnesses]]
+did = "did:web:witness-2.example.org"
+url = "https://witness-2.example.org/log/witness"
+poll_seconds = 60
+"#;
+        #[derive(serde::Deserialize)]
+        struct Wrap {
+            witnesses: Vec<WitnessConfig>,
+        }
+        let w: Wrap = toml::from_str(toml).unwrap();
+        assert_eq!(w.witnesses.len(), 2);
+        assert_eq!(w.witnesses[0].did, "did:web:witness.example.org");
+        assert_eq!(w.witnesses[0].poll_seconds, 300, "default poll interval");
+        assert_eq!(w.witnesses[1].poll_seconds, 60);
+    }
+
+    #[test]
+    fn witness_unknown_field_rejected() {
+        let toml = r#"
+did = "did:web:w.example"
+url = "https://w.example/log/witness"
+bogus = 1
+"#;
+        let err = toml::from_str::<WitnessConfig>(toml).unwrap_err();
+        assert!(err.to_string().contains("bogus"), "unexpected: {err}");
+    }
 
     #[test]
     fn storage_backend_parses_known_variants() {

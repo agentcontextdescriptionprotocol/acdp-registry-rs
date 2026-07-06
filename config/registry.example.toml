@@ -168,3 +168,24 @@ enabled = false
 # explicit, loudly detectable history reset — consistency proofs do not
 # span instances.
 # instance = "1"
+
+# ── Witness cosignature aggregation (RFC-ACDP-0015 §6.1, ACDP 0.4.0) ──
+#
+# Independent witnesses this registry polls; their VERIFIED cosignatures
+# are attached to checkpoint responses as the reserved top-level
+# `witness_signatures` member, so a consumer gets a checkpoint + its
+# witness quorum in one fetch and verifies N-witnessed locally.
+#
+# For each witness a background poller GETs <url>?log_id=<this log_id> over
+# the SSRF-guarded client, verifies every cosignature against THIS
+# registry's own checkpoint (dropping any cosigning a different root — a
+# fork or a lie), and stores only the verified ones. The registry never
+# holds a witness key, so aggregation adds convenience, not trust.
+#
+# Prerequisites (enforced at startup): [log] enabled, each `did` a did:web
+# DID, each `url` HTTPS + non-private (SSRF policy). Empty = disabled.
+#
+# [[witnesses]]
+# did          = "did:web:witness.example.org"
+# url          = "https://witness.example.org/log/witness"
+# poll_seconds = 300

@@ -326,6 +326,65 @@ impl ExtendedRegistryStore for SqliteStore {
         .map_err(|e| AcdpError::RegistryInternal(format!("log_entries: {e}")))?;
         rows.iter().map(log_row_to_record).collect()
     }
+
+    // ── Witness cosignature aggregation (RFC-ACDP-0015 §6.1) ───────────
+
+    async fn upsert_witness_cosignature(
+        &self,
+        log_id: &str,
+        tree_size: u64,
+        root_hash: &str,
+        witness_did: &str,
+        witnessed_at: &str,
+        cosignature_json: &str,
+    ) -> Result<(), AcdpError> {
+        sqlx::query(
+            "INSERT INTO log_witness_cosignatures \
+             (log_id, tree_size, root_hash, witness_did, witnessed_at, cosignature_json, stored_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             ON CONFLICT(log_id, tree_size, root_hash, witness_did) DO UPDATE SET \
+             witnessed_at = excluded.witnessed_at, \
+             cosignature_json = excluded.cosignature_json, \
+             stored_at = excluded.stored_at",
+        )
+        .bind(log_id)
+        .bind(i64::try_from(tree_size).unwrap_or(i64::MAX))
+        .bind(root_hash)
+        .bind(witness_did)
+        .bind(witnessed_at)
+        .bind(cosignature_json)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AcdpError::RegistryInternal(format!("upsert_witness_cosignature: {e}")))?;
+        Ok(())
+    }
+
+    async fn witness_cosignatures_for(
+        &self,
+        log_id: &str,
+        tree_size: u64,
+        root_hash: &str,
+    ) -> Result<Vec<serde_json::Value>, AcdpError> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT cosignature_json FROM log_witness_cosignatures \
+             WHERE log_id = ?1 AND tree_size = ?2 AND root_hash = ?3 \
+             ORDER BY witness_did ASC",
+        )
+        .bind(log_id)
+        .bind(i64::try_from(tree_size).unwrap_or(i64::MAX))
+        .bind(root_hash)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AcdpError::RegistryInternal(format!("witness_cosignatures_for: {e}")))?;
+        rows.iter()
+            .map(|(j,)| {
+                serde_json::from_str(j).map_err(|e| {
+                    AcdpError::RegistryInternal(format!("stored cosignature is not JSON: {e}"))
+                })
+            })
+            .collect()
+    }
 }
 
 /// Decode one `log_leaves` row.

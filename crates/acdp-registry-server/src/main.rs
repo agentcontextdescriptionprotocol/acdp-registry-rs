@@ -298,6 +298,32 @@ fn validate_config(cfg: &RegistryConfig) -> anyhow::Result<()> {
         );
     }
 
+    // ACDP 0.4.0 / RFC-ACDP-0015 §6.1: witness-cosignature aggregation.
+    // Each configured witness is polled over the SSRF-guarded client and
+    // its cosignatures verified against this registry's own checkpoints.
+    // Aggregation is meaningless without a log (there are no checkpoints to
+    // witness), so require `log.enabled`. Validate every witness DID/URL up
+    // front — a bad witness must fail startup, not silently never poll.
+    if !cfg.witnesses.is_empty() && !cfg.log.enabled {
+        anyhow::bail!(
+            "[[witnesses]] is configured but log.enabled is false. Witness-cosignature \
+             aggregation (RFC-ACDP-0015 §6.1) attaches cosignatures to this registry's \
+             transparency-log checkpoints — enable [log] or remove the witnesses."
+        );
+    }
+    for w in &cfg.witnesses {
+        if !w.did.starts_with("did:web:") || w.did.len() <= "did:web:".len() {
+            anyhow::bail!(
+                "witness did '{}' must be a did:web DID (the only method resolvable over the \
+                 network under the SSRF guard, RFC-ACDP-0015 §9)",
+                w.did
+            );
+        }
+        acdp::safe_http::SsrfPolicy::default()
+            .check_url(&w.url)
+            .map_err(|e| anyhow::anyhow!("witness url '{}' rejected by SSRF policy: {e}", w.url))?;
+    }
+
     // SEC: refuse an insecure default deployment — a non-loopback bind with
     // BOTH TLS and auth disabled exposes an unauthenticated, plaintext registry
     // on every interface. Require an explicit opt-in (the operator asserting a
@@ -653,6 +679,35 @@ async fn serve_with_store<S: ExtendedRegistryStore + 'static>(
     // the live-mutable cell backing `POST /admin/pinned-keys/reload`
     // (plan §2) — from `cfg.playground`.
     let state = AppStateInner::new(server, auth, webhook, cfg.clone(), cross_registry);
+
+    // RFC-ACDP-0015 §6.1 witness-cosignature aggregation: one background
+    // poller per configured witness fetches its cosignature feed over the
+    // SSRF-guarded client, verifies each cosignature against THIS
+    // registry's own checkpoint (rejecting any over a different root), and
+    // stores the verified ones for the checkpoint handler to serve. Gated
+    // on the log being enabled (aggregation is meaningless without a log)
+    // and validated at startup.
+    if !cfg.witnesses.is_empty() {
+        match state.log.clone() {
+            Some(log) => {
+                tracing::info!(
+                    count = cfg.witnesses.len(),
+                    "spawning witness cosignature pollers (RFC-ACDP-0015 §6.1)"
+                );
+                acdp_registry_core::witness::spawn_witness_pollers(
+                    cfg.witnesses.clone(),
+                    state.server.clone(),
+                    log,
+                    resolver.clone(),
+                );
+            }
+            None => tracing::warn!(
+                "[[witnesses]] configured but the transparency log is not enabled; \
+                 witness aggregation is disabled"
+            ),
+        }
+    }
+
     let router = build_router(state);
 
     // Bind. TLS is optional — production typically terminates upstream.
@@ -1060,6 +1115,49 @@ mod tests {
         }
         cfg.log.instance = "1".into();
         assert!(validate_config(&cfg).is_ok());
+    }
+
+    // RFC-ACDP-0015 §6.1 — witness aggregation startup validation.
+    #[test]
+    fn witnesses_require_log_and_valid_did_and_url() {
+        use acdp_registry_types::config::WitnessConfig;
+        let mut cfg = RegistryConfig::defaults();
+        cfg.receipt.signing_key_seed_b64 =
+            base64::engine::general_purpose::STANDARD.encode([5u8; 32]);
+        cfg.witnesses = vec![WitnessConfig {
+            did: "did:web:witness.example.org".into(),
+            url: "https://witness.example.org/log/witness".into(),
+            poll_seconds: 300,
+        }];
+        // Witnesses without a log are refused (nothing to witness).
+        let err = validate_config(&cfg).expect_err("witnesses require log.enabled");
+        assert!(err.to_string().contains("[[witnesses]]"), "{err}");
+
+        cfg.log.enabled = true;
+        assert!(
+            validate_config(&cfg).is_ok(),
+            "witnesses + log are conformant"
+        );
+
+        // A non-did:web witness DID is refused.
+        cfg.witnesses[0].did = "did:key:z6MkExample".into();
+        assert!(
+            validate_config(&cfg).is_err(),
+            "did:key witness must be refused"
+        );
+        cfg.witnesses[0].did = "did:web:witness.example.org".into();
+
+        // A plaintext / private witness URL is refused by the SSRF policy.
+        cfg.witnesses[0].url = "http://witness.example.org/log/witness".into();
+        assert!(
+            validate_config(&cfg).is_err(),
+            "plaintext witness url must be refused"
+        );
+        cfg.witnesses[0].url = "https://127.0.0.1/log/witness".into();
+        assert!(
+            validate_config(&cfg).is_err(),
+            "loopback witness url must be refused"
+        );
     }
 
     // #17 — multi-tenant config must enforce strict tenant scoping.

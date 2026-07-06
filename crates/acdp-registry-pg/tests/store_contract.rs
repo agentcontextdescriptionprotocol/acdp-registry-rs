@@ -714,4 +714,97 @@ mod transparency_log {
         indexes.dedup();
         assert_eq!(indexes.len(), ctx_ids.len(), "unique leaf indexes");
     }
+
+    // ── Witness cosignature aggregation (RFC-ACDP-0015 §6.1) ───────────
+
+    /// Upsert + read-back by exact tuple, distinct witnesses, tuple
+    /// isolation, and newest-wins re-observation — on the Postgres SQL
+    /// path. Run-unique keys avoid collisions against the shared database.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn witness_cosignatures_store_and_read_by_tuple() {
+        let Some(url) = pg_url_or_skip() else { return };
+        let store = log_store(&url).await;
+
+        let log_id = format!("did:web:reg.test/log/{}", uuid::Uuid::new_v4().simple());
+        let root = format!("sha256:{}", "0".repeat(64));
+        let wa = format!("did:web:wa-{}.example.org", uuid::Uuid::new_v4().simple());
+        let wb = format!("did:web:wb-{}.example.org", uuid::Uuid::new_v4().simple());
+        let cj = |w: &str, at: &str| format!(r#"{{"witness_id":"{w}","witnessed_at":"{at}"}}"#);
+
+        store
+            .upsert_witness_cosignature(
+                &log_id,
+                5,
+                &root,
+                &wa,
+                "2026-07-05T00:00:00.000Z",
+                &cj(&wa, "2026-07-05T00:00:00.000Z"),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_witness_cosignature(
+                &log_id,
+                5,
+                &root,
+                &wb,
+                "2026-07-05T00:00:01.000Z",
+                &cj(&wb, "2026-07-05T00:00:01.000Z"),
+            )
+            .await
+            .unwrap();
+        // Different tuple must not leak in.
+        let root6 = format!("sha256:{}", "a".repeat(64));
+        store
+            .upsert_witness_cosignature(
+                &log_id,
+                6,
+                &root6,
+                &wa,
+                "2026-07-05T00:00:02.000Z",
+                &cj(&wa, "2026-07-05T00:00:02.000Z"),
+            )
+            .await
+            .unwrap();
+
+        let got = store
+            .witness_cosignatures_for(&log_id, 5, &root)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 2, "both distinct witnesses over the tuple");
+        let ids: Vec<&str> = got
+            .iter()
+            .map(|v| v["witness_id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&wa.as_str()) && ids.contains(&wb.as_str()));
+
+        // Re-observation upserts (newest wins), still one row per witness.
+        store
+            .upsert_witness_cosignature(
+                &log_id,
+                5,
+                &root,
+                &wa,
+                "2026-07-05T02:00:00.000Z",
+                &cj(&wa, "2026-07-05T02:00:00.000Z"),
+            )
+            .await
+            .unwrap();
+        let got = store
+            .witness_cosignatures_for(&log_id, 5, &root)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 2, "re-observation does not add a row");
+
+        let got6 = store
+            .witness_cosignatures_for(&log_id, 6, &root6)
+            .await
+            .unwrap();
+        assert_eq!(got6.len(), 1);
+        assert!(store
+            .witness_cosignatures_for(&log_id, 99, &root)
+            .await
+            .unwrap()
+            .is_empty());
+    }
 }

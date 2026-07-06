@@ -168,6 +168,68 @@ pub trait ExtendedRegistryStore: RegistryStore + Send + Sync {
         ))
     }
 
+    // ── Witness cosignature aggregation (ACDP 0.4, RFC-ACDP-0015 §6.1) ─
+    //
+    // The registry MAY collect witness cosignatures of its checkpoints and
+    // serve them alongside the checkpoint as the reserved
+    // `witness_signatures` member. Only VERIFIED cosignatures are ever
+    // stored: the aggregator (`acdp-registry-core::witness`) resolves the
+    // witness DID and checks each cosignature's signature AND that its
+    // `witnessed_checkpoint` matches this registry's own root at that
+    // `tree_size` before calling `upsert_witness_cosignature`. The table
+    // is keyed by `(log_id, tree_size, root_hash, witness_did)` so at most
+    // one (freshest) cosignature per witness per exact checkpoint tuple is
+    // retained; the checkpoint handler reads back by the exact tuple it is
+    // serving, so a cosignature can never be mis-attached to a different
+    // root.
+
+    /// Insert (or refresh) one VERIFIED witness cosignature for the
+    /// checkpoint tuple `(log_id, tree_size, root_hash)`. `cosignature_json`
+    /// is the exact wire bytes of the §4 cosignature object (served back
+    /// verbatim); `witnessed_at` is its canonical RFC 3339 UTC timestamp,
+    /// stored for freshness/newest-wins on re-observation. Upserts on the
+    /// `(log_id, tree_size, root_hash, witness_did)` key.
+    ///
+    /// The default errors: witness aggregation requires a durable backend
+    /// with the `log_witness_cosignatures` table (SQLite / Postgres).
+    async fn upsert_witness_cosignature(
+        &self,
+        log_id: &str,
+        tree_size: u64,
+        root_hash: &str,
+        witness_did: &str,
+        witnessed_at: &str,
+        cosignature_json: &str,
+    ) -> Result<(), AcdpError> {
+        let _ = (
+            log_id,
+            tree_size,
+            root_hash,
+            witness_did,
+            witnessed_at,
+            cosignature_json,
+        );
+        Err(AcdpError::NotImplemented(
+            "this backend does not implement witness cosignature aggregation (RFC-ACDP-0015)"
+                .into(),
+        ))
+    }
+
+    /// The verified cosignatures stored for the exact checkpoint tuple
+    /// `(log_id, tree_size, root_hash)`, as raw §4 wire values, ordered by
+    /// `witness_did` for a stable response. Empty when none — the default
+    /// returns empty so a backend without the table simply serves a bare
+    /// checkpoint (aggregation is optional; RFC-ACDP-0015 §6.1, §11).
+    async fn witness_cosignatures_for(
+        &self,
+        log_id: &str,
+        tree_size: u64,
+        root_hash: &str,
+    ) -> Result<Vec<serde_json::Value>, AcdpError> {
+        let _ = (log_id, tree_size, root_hash);
+        Ok(Vec::new())
+    }
+
     /// Batch tenant lookup. Returns a map of `ctx_id → tenant_id`.
     /// Used by handlers that filter result sets (search / lineage /
     /// list) — one round-trip beats N. Default impl falls back to N

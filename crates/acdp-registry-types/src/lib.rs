@@ -12,7 +12,7 @@ pub use auth::{AuthChallenge, BearerClaims, TokenRequest, TokenResponse};
 pub use config::{
     AuthConfig, CorsConfig, LifecycleConfig, LimitsConfig, LogConfig, PlaygroundConfig,
     ReceiptConfig, RegistryConfig, RegistrySection, RetiredReceiptKey, StorageBackend,
-    StorageConfig, TenantAgentBinding, WebhookConfig,
+    StorageConfig, TenantAgentBinding, WebhookConfig, WitnessConfig,
 };
 pub use error::RegistryError;
 pub use event::WebhookEvent;
