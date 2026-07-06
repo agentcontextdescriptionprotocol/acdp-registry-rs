@@ -65,6 +65,16 @@ impl LogState {
         }))
     }
 
+    /// Construct a `LogState` directly from a signer + `log_id`, bypassing
+    /// config. For tests and internal wiring that already hold both.
+    pub fn for_test(signer: ReceiptSigner, log_id: String) -> Self {
+        Self {
+            signer,
+            log_id,
+            root_cache: Mutex::new(None),
+        }
+    }
+
     /// Cached root for `tree_size`, if the head cache holds it.
     pub fn cached_root(&self, tree_size: u64) -> Option<String> {
         let guard = self.root_cache.lock().expect("root cache poisoned");

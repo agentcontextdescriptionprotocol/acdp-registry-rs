@@ -55,6 +55,10 @@ The binary validates config before serving and refuses to boot on a misconfig
   `acdp-registry-head-receipts`, `acdp-registry-lifecycle`, or
   `acdp-registry-transparency-log` in `registry.profiles` without enabling
   the matching feature is refused as a false capability advertisement.
+- **Witnesses (0.4.0)** — `[[witnesses]]` requires `log.enabled = true`
+  (RFC-ACDP-0015 §6.1: there are no checkpoints to witness without a log);
+  each `did` must be a `did:web` DID and each `url` must pass the SSRF
+  policy (HTTPS, non-private host).
 
 ## Reference
 
@@ -269,3 +273,57 @@ per §7.3 their history would be time-unanchored anyway.
 |-----|------|---------|-------|
 | `enabled` | bool | `false` | Opt into the RFC-ACDP-0012 log: atomic leaf appends + the three `/log/*` endpoints. |
 | `instance` | string | `"1"` | The `<instance>` component of `log_id = did:web:<authority>/log/<instance>` (matches `[a-z0-9-]{1,32}`). **Change only on catastrophic tree loss** (§7.4) — a new instance is an explicit, loudly detectable history reset. |
+
+### `[[witnesses]]` *(ACDP 0.4.0)*
+
+Transparency-log **witness cosignature aggregation** (RFC-ACDP-0015 §6.1).
+An array of independent witnesses this registry polls and whose **verified**
+cosignatures it attaches to its checkpoint responses (the reserved
+top-level `witness_signatures` member — see
+[HTTP-API.md](HTTP-API.md#get-logcheckpoint-get-logproof-get-logentries-acdp-030)).
+A consumer then gets a checkpoint **and** its witness quorum in one fetch
+and verifies *N-witnessed* locally.
+
+For each configured witness a background poller GETs
+`<url>?log_id=<this registry's log_id>` over the SSRF-guarded outbound
+client (HTTPS-only, DNS-rebinding-guarded, no redirects — RFC-ACDP-0008
+§4.8), and for every returned cosignature runs the RFC-ACDP-0015 §8
+verification procedure **against this registry's own checkpoint** at that
+`tree_size`: closed parse, the witness signature under the witness DID's
+`assertionMethod` key (resolved via the `did:web` resolver), and — the
+load-bearing check — that the cosignature's `witnessed_checkpoint` matches
+this registry's **own root** at that size. A witness cosigning a *different*
+root (a fork, or a lie) is logged and **dropped** — it is never stored and
+never served. Only verified cosignatures are persisted (table
+`log_witness_cosignatures`, keyed by
+`(log_id, tree_size, root_hash, witness_did)`; a fresh re-observation
+upserts, newest wins), so serving is a single indexed read with no blocking
+network call in the request path.
+
+Aggregation is a pure convenience: the registry never holds a witness key,
+so it can neither forge a cosignature nor make itself a trust dependency —
+a consumer MAY always fetch direct from a witness (§6.2). There is **no new
+capability flag or profile**: a registry that aggregates does so under its
+existing `acdp-registry-transparency-log` profile (§10).
+
+Prerequisites (enforced at startup): `log.enabled = true` (there are no
+checkpoints to witness without a log), each `did` a `did:web` DID, and each
+`url` accepted by the SSRF policy (HTTPS, non-private host). Empty (the
+default) disables aggregation entirely.
+
+```toml
+[[witnesses]]
+did          = "did:web:witness.example.org"
+url          = "https://witness.example.org/log/witness"
+poll_seconds = 60                              # default 300
+
+[[witnesses]]
+did = "did:web:witness-2.example.org"
+url = "https://witness-2.example.org/log/witness"
+```
+
+| Key | Type | Default | Notes |
+|-----|------|---------|-------|
+| `did` | string | *(required)* | The witness's `did:web` DID. Cosignatures whose `witness_id` ≠ this value are ignored (a witness endpoint only speaks for its own DID). |
+| `url` | string | *(required)* | HTTPS URL of the witness's `GET /log/witness` endpoint (RFC-ACDP-0015 §6.2). SSRF-checked at startup and at DNS time on every poll. |
+| `poll_seconds` | integer | `300` | Poll interval. |

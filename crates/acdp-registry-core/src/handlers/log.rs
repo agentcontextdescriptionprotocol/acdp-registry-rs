@@ -161,7 +161,41 @@ pub async fn log_checkpoint<S: ExtendedRegistryStore + 'static>(
         }
     };
     let checkpoint = mint_checkpoint(log, tree_size, &root)?;
-    Ok(Json(serde_json::to_value(checkpoint)?))
+
+    // RFC-ACDP-0015 §6.1 aggregation: if this registry has collected any
+    // VERIFIED witness cosignatures over this exact checkpoint tuple,
+    // return the envelope `{ log_checkpoint, witness_signatures }` — the
+    // closed checkpoint object IS the bare body, so the array cannot ride
+    // inside it; it is a top-level SIBLING, outside the signed object.
+    // With none, serve the bare checkpoint unchanged (backward compatible;
+    // pre-0.4.0 consumers see exactly what they always did).
+    let cosigs = witness_signatures_for(&state, log, &checkpoint).await?;
+    if cosigs.is_empty() {
+        Ok(Json(serde_json::to_value(checkpoint)?))
+    } else {
+        Ok(Json(json!({
+            "log_checkpoint": checkpoint,
+            "witness_signatures": cosigs,
+        })))
+    }
+}
+
+/// The VERIFIED witness cosignatures stored for a checkpoint's exact
+/// `(log_id, tree_size, root_hash)` tuple (RFC-ACDP-0015 §6.1). Only
+/// cosignatures the aggregator verified against this registry's own root
+/// are ever stored, so reading by the exact served tuple can never surface
+/// a cosignature for a different root. Empty when aggregation collected
+/// none — never fabricated.
+async fn witness_signatures_for<S: ExtendedRegistryStore + 'static>(
+    state: &Arc<AppState<S>>,
+    log: &LogState,
+    checkpoint: &LogCheckpoint,
+) -> Result<Vec<serde_json::Value>, RegistryError> {
+    Ok(state
+        .server
+        .store()
+        .witness_cosignatures_for(&log.log_id, checkpoint.tree_size, &checkpoint.root_hash)
+        .await?)
 }
 
 /// Query surface of `GET /log/proof` (§8.2): two mutually exclusive
@@ -324,7 +358,29 @@ async fn inclusion_proof_response<S: ExtendedRegistryStore + 'static>(
         // (§9.1 step 1 reconstructs the leaf from verified material).
         inclusion.leaf = Some(record.leaf().map_err(RegistryError::Acdp)?);
     }
-    Ok(Json(serde_json::to_value(inclusion)?))
+    // RFC-ACDP-0015 §6.1: attach witness cosignatures of the EMBEDDED
+    // checkpoint (`log_inclusion.log_checkpoint`) as a top-level sibling —
+    // outside the closed inclusion object and the signed checkpoint alike.
+    let cosigs = witness_signatures_for(state, log, &inclusion.log_checkpoint).await?;
+    let mut out = serde_json::to_value(inclusion)?;
+    attach_witness_signatures(&mut out, cosigs);
+    Ok(Json(out))
+}
+
+/// Insert a top-level `witness_signatures` sibling into an already-built
+/// response envelope, but only when non-empty (RFC-ACDP-0015 §6.1: absent,
+/// never `[]`, when the registry has collected none). Never touches the
+/// signed object it rides alongside.
+fn attach_witness_signatures(value: &mut serde_json::Value, cosigs: Vec<serde_json::Value>) {
+    if cosigs.is_empty() {
+        return;
+    }
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "witness_signatures".into(),
+            serde_json::Value::Array(cosigs),
+        );
+    }
 }
 
 /// §8.2 consistency mode — REQUIRED: detecting root rewrites is why the
@@ -364,7 +420,12 @@ async fn consistency_proof_response<S: ExtendedRegistryStore + 'static>(
         consistency_path: path.iter().map(encode_sha256_hex).collect(),
         log_checkpoint: checkpoint,
     };
-    Ok(Json(serde_json::to_value(proof)?))
+    // RFC-ACDP-0015 §6.1: attach witness cosignatures of the embedded
+    // (`second`-size) checkpoint as a top-level sibling.
+    let cosigs = witness_signatures_for(state, log, &proof.log_checkpoint).await?;
+    let mut out = serde_json::to_value(proof)?;
+    attach_witness_signatures(&mut out, cosigs);
+    Ok(Json(out))
 }
 
 /// Query surface of `GET /log/entries` (§8.3).

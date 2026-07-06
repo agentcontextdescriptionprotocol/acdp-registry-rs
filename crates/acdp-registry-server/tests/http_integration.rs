@@ -106,6 +106,7 @@ fn config(playground: bool) -> RegistryConfig {
         receipt: Default::default(),
         lifecycle: Default::default(),
         log: Default::default(),
+        witnesses: Vec::new(),
     }
 }
 
@@ -4209,4 +4210,207 @@ async fn log_failed_publish_appends_no_leaf() {
         cp.tree_size, 2,
         "failed publishes must leave no leaf (§7.1)"
     );
+}
+
+// ─── ACDP 0.4.0: witness cosignature AGGREGATION (RFC-ACDP-0015 §6.1) ───
+//
+// The registry collects VERIFIED witness cosignatures of its checkpoints
+// (the poller's job — verified against this registry's own root, wrong-root
+// cosignatures dropped; see the `acdp-registry-core::witness` unit tests)
+// and serves them alongside the checkpoint as the reserved top-level
+// `witness_signatures` member. These tests seed the store's verified-
+// cosignature table directly (the poller's fetch path is network-bound) and
+// exercise the SERVING + end-to-end CONSUMER-QUORUM path.
+
+/// A distinct witness test key (RFC-ACDP-0015 golden seed 0x33) and its DID.
+const WITNESS_SEED: [u8; 32] = [0x33u8; 32];
+const WITNESS_DID: &str = "did:web:witness.example.org";
+
+fn witness_signer() -> acdp::types::cosignature::WitnessSigner {
+    acdp::types::cosignature::WitnessSigner::new(
+        SigningKey::from_bytes(&WITNESS_SEED),
+        WITNESS_DID,
+        format!("{WITNESS_DID}#witness-key-1"),
+    )
+    .unwrap()
+}
+
+/// A minimal witness DID document (key in both verification+assertion
+/// method) so the consumer can resolve+verify the served cosignatures.
+fn witness_did_doc() -> Value {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let pk = SigningKey::from_bytes(&WITNESS_SEED).verifying_key_bytes();
+    let vm_id = format!("{WITNESS_DID}#witness-key-1");
+    json!({
+        "id": WITNESS_DID,
+        "verificationMethod": [{
+            "id": vm_id,
+            "type": "Ed25519VerificationKey2020",
+            "controller": WITNESS_DID,
+            "publicKeyJwk": { "kty": "OKP", "crv": "Ed25519", "x": URL_SAFE_NO_PAD.encode(pk) }
+        }],
+        "assertionMethod": [vm_id],
+    })
+}
+
+/// Open a second store handle to the harness DB and seed one verified
+/// cosignature over `checkpoint` (as the aggregator's poller would after
+/// verifying it).
+async fn seed_cosignature(h: &Harness, checkpoint: &acdp::types::log::LogCheckpoint) {
+    let cosig = witness_signer()
+        .mint(checkpoint, chrono::Utc::now())
+        .unwrap();
+    let wire = serde_json::to_value(&cosig).unwrap();
+    let store = SqliteStore::connect(h.db_path(), 1)
+        .await
+        .unwrap()
+        .with_transparency_log();
+    store
+        .upsert_witness_cosignature(
+            &checkpoint.log_id,
+            checkpoint.tree_size,
+            &checkpoint.root_hash,
+            WITNESS_DID,
+            wire["witnessed_at"].as_str().unwrap(),
+            &serde_json::to_string(&wire).unwrap(),
+        )
+        .await
+        .unwrap();
+}
+
+/// §6.1: with no cosignatures collected, `GET /log/checkpoint` returns the
+/// BARE checkpoint (unchanged, backward compatible) — never a fabricated or
+/// empty `witness_signatures`.
+#[tokio::test]
+async fn checkpoint_is_bare_when_no_cosignatures() {
+    use acdp::types::log::LogCheckpoint;
+    let h = log_harness().await;
+    for i in 0..3u8 {
+        log_publish(&h, 70 + i, &format!("wit-none-{i}"), Visibility::Public).await;
+    }
+    let (status, v) = get_json(&h.router, "/log/checkpoint").await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    // The bare checkpoint parses through the closed schema directly.
+    LogCheckpoint::from_value(&v).expect("bare checkpoint when un-witnessed");
+    assert!(
+        v.get("witness_signatures").is_none() && v.get("log_checkpoint").is_none(),
+        "no envelope and no witness_signatures when none collected: {v}"
+    );
+}
+
+/// §6.1 end-to-end: a verified cosignature over the current checkpoint is
+/// served as the top-level `witness_signatures` envelope member, the
+/// embedded `log_checkpoint` stays byte-for-byte the signed object, and a
+/// consumer running `evaluate_witness_quorum` over the served array gets
+/// the expected 1-witnessed verdict.
+#[tokio::test]
+async fn checkpoint_serves_verified_cosignatures_and_consumer_counts_them() {
+    use acdp::client::{evaluate_witness_quorum, WitnessPolicy};
+    use acdp::types::log::LogCheckpoint;
+    use std::collections::{HashMap, HashSet};
+
+    let h = log_harness().await;
+    for i in 0..4u8 {
+        log_publish(&h, 80 + i, &format!("wit-agg-{i}"), Visibility::Public).await;
+    }
+
+    // The real current checkpoint the witness would have observed.
+    let (status, bare) = get_json(&h.router, "/log/checkpoint").await;
+    assert_eq!(status, StatusCode::OK, "{bare}");
+    let checkpoint = LogCheckpoint::from_value(&bare).expect("bare checkpoint");
+    assert!(checkpoint.tree_size >= 4);
+
+    // The aggregator has verified + stored a cosignature over it.
+    seed_cosignature(&h, &checkpoint).await;
+
+    // Now the endpoint returns the envelope with the cosignature attached.
+    let (status, env) = get_json(&h.router, "/log/checkpoint").await;
+    assert_eq!(status, StatusCode::OK, "{env}");
+    let embedded = &env["log_checkpoint"];
+    assert!(
+        embedded.is_object(),
+        "envelope carries log_checkpoint: {env}"
+    );
+    // The signed checkpoint object is unchanged in identity: same
+    // `(log_id, tree_size, root_hash)` as the bare object (the per-request
+    // `timestamp`/`signature` re-mint with a fresh clock reading, as for
+    // every checkpoint response — that is not a mutation of the aggregated
+    // material, RFC-ACDP-0012 §6). Crucially, `witness_signatures` is a
+    // SIBLING, never inside the signed object (§6.1).
+    let embedded_cp = LogCheckpoint::from_value(embedded).expect("embedded checkpoint closed");
+    assert_eq!(embedded_cp.tree_size, checkpoint.tree_size);
+    assert_eq!(embedded_cp.root_hash, checkpoint.root_hash);
+    assert_eq!(embedded_cp.log_id, checkpoint.log_id);
+    assert!(
+        embedded.get("witness_signatures").is_none(),
+        "witness_signatures MUST NOT be inside the signed checkpoint (§6.1)"
+    );
+
+    let sigs = env["witness_signatures"].as_array().expect("array present");
+    assert_eq!(sigs.len(), 1, "one verified cosignature served");
+
+    // End-to-end consumer verification: N-witnessed over the served array.
+    let mut docs = HashMap::new();
+    docs.insert(WITNESS_DID.to_string(), witness_did_doc());
+    let trusted: HashSet<String> = [WITNESS_DID.to_string()].into_iter().collect();
+    let report = evaluate_witness_quorum(
+        sigs,
+        &docs,
+        &trusted,
+        &embedded_cp,
+        &WitnessPolicy::default(),
+        None,
+    );
+    assert_eq!(
+        report.witnessed_count, 1,
+        "consumer counts 1 distinct witness"
+    );
+    assert!(report.meets_quorum, "default quorum (>=1) is met");
+    assert_eq!(report.witnesses, vec![WITNESS_DID.to_string()]);
+    assert!(
+        report.failures.is_empty(),
+        "no verification failures: {:?}",
+        report.failures
+    );
+}
+
+/// §6.1: a cosignature stored for a DIFFERENT tuple (an earlier tree size)
+/// is NOT attached to the current checkpoint — the handler reads by the
+/// exact `(log_id, tree_size, root_hash)` it is serving, so a cosignature
+/// can never be mis-attached to a root it does not cover.
+#[tokio::test]
+async fn cosignature_for_other_tuple_is_not_served_on_current_checkpoint() {
+    use acdp::types::log::LogCheckpoint;
+    let h = log_harness().await;
+
+    // Checkpoint at size 2, cosign it, then grow the tree to size 4.
+    log_publish(&h, 90, "wit-old-0", Visibility::Public).await;
+    log_publish(&h, 91, "wit-old-1", Visibility::Public).await;
+    let (_s, cp2v) = get_json(&h.router, "/log/checkpoint").await;
+    let cp2 = LogCheckpoint::from_value(&cp2v).unwrap();
+    assert_eq!(cp2.tree_size, 2);
+    seed_cosignature(&h, &cp2).await;
+
+    log_publish(&h, 92, "wit-old-2", Visibility::Public).await;
+    log_publish(&h, 93, "wit-old-3", Visibility::Public).await;
+
+    // The current head is size 4 with a different root — the size-2
+    // cosignature does not cover it, so the checkpoint stays bare.
+    let (status, cur) = get_json(&h.router, "/log/checkpoint").await;
+    assert_eq!(status, StatusCode::OK, "{cur}");
+    let cur_cp = LogCheckpoint::from_value(&cur).expect("bare (mismatched tuple)");
+    assert_eq!(cur_cp.tree_size, 4);
+    assert!(
+        cur.get("witness_signatures").is_none() && cur.get("log_checkpoint").is_none(),
+        "a cosignature over a different tuple must not ride the current checkpoint: {cur}"
+    );
+
+    // But a size-2 inclusion proof (embedded checkpoint at size 2) DOES
+    // carry it, as a top-level sibling of the proof.
+    let (status, proof) = get_json(&h.router, "/log/proof?leaf_index=0&tree_size=2").await;
+    assert_eq!(status, StatusCode::OK, "{proof}");
+    let sigs = proof["witness_signatures"]
+        .as_array()
+        .expect("size-2 embedded checkpoint carries its cosignature");
+    assert_eq!(sigs.len(), 1);
 }

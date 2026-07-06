@@ -666,6 +666,127 @@ mod transparency_log {
         assert_eq!(counts(&store).await, (8, 8));
     }
 
+    // ── Witness cosignature aggregation (RFC-ACDP-0015 §6.1) ───────────
+
+    const LOG_ID: &str = "did:web:reg.test/log/1";
+    const ROOT_5: &str = "sha256:0b00000000000000000000000000000000000000000000000000000000000000";
+    const WITNESS_A: &str = "did:web:witness-a.example.org";
+    const WITNESS_B: &str = "did:web:witness-b.example.org";
+
+    fn cosig_json(witness: &str, at: &str) -> String {
+        // A stand-in wire object; the store treats it as opaque bytes and
+        // serves it back verbatim (verification happens in the aggregator).
+        format!(r#"{{"witness_id":"{witness}","witnessed_at":"{at}"}}"#)
+    }
+
+    /// Upsert + read-back by the exact tuple, distinct witnesses counted
+    /// once each, and tuple isolation (a cosignature for another
+    /// tree_size/root is never returned for this one).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn witness_cosignatures_store_and_read_by_tuple() {
+        let (store, _tmp) = log_store().await;
+
+        // Two witnesses over the same (log_id, 5, ROOT_5) tuple.
+        store
+            .upsert_witness_cosignature(
+                LOG_ID,
+                5,
+                ROOT_5,
+                WITNESS_A,
+                "2026-07-05T00:00:00.000Z",
+                &cosig_json(WITNESS_A, "2026-07-05T00:00:00.000Z"),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_witness_cosignature(
+                LOG_ID,
+                5,
+                ROOT_5,
+                WITNESS_B,
+                "2026-07-05T00:00:01.000Z",
+                &cosig_json(WITNESS_B, "2026-07-05T00:00:01.000Z"),
+            )
+            .await
+            .unwrap();
+        // A cosignature over a DIFFERENT tuple (size 6) must not leak in.
+        let root_6 = format!("sha256:{}", "a".repeat(64));
+        store
+            .upsert_witness_cosignature(
+                LOG_ID,
+                6,
+                &root_6,
+                WITNESS_A,
+                "2026-07-05T00:00:02.000Z",
+                &cosig_json(WITNESS_A, "2026-07-05T00:00:02.000Z"),
+            )
+            .await
+            .unwrap();
+
+        let got = store
+            .witness_cosignatures_for(LOG_ID, 5, ROOT_5)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 2, "both distinct witnesses over the tuple");
+        // Ordered by witness_did — A before B.
+        assert_eq!(got[0]["witness_id"], WITNESS_A);
+        assert_eq!(got[1]["witness_id"], WITNESS_B);
+
+        // The size-6 tuple returns only its own cosignature.
+        let got6 = store
+            .witness_cosignatures_for(LOG_ID, 6, &root_6)
+            .await
+            .unwrap();
+        assert_eq!(got6.len(), 1);
+        assert_eq!(got6[0]["witness_id"], WITNESS_A);
+
+        // A tuple with no cosignatures is empty, never an error.
+        assert!(store
+            .witness_cosignatures_for(LOG_ID, 99, ROOT_5)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A fresh re-observation from the same witness at the same tuple
+    /// UPSERTs (newest witnessed_at wins) — one row per witness per tuple,
+    /// cosignatures being ephemeral per-observation evidence (§4).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn witness_cosignature_reobservation_upserts() {
+        let (store, _tmp) = log_store().await;
+        store
+            .upsert_witness_cosignature(
+                LOG_ID,
+                5,
+                ROOT_5,
+                WITNESS_A,
+                "2026-07-05T00:00:00.000Z",
+                &cosig_json(WITNESS_A, "2026-07-05T00:00:00.000Z"),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_witness_cosignature(
+                LOG_ID,
+                5,
+                ROOT_5,
+                WITNESS_A,
+                "2026-07-05T01:00:00.000Z",
+                &cosig_json(WITNESS_A, "2026-07-05T01:00:00.000Z"),
+            )
+            .await
+            .unwrap();
+        let got = store
+            .witness_cosignatures_for(LOG_ID, 5, ROOT_5)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 1, "one row per (tuple, witness)");
+        assert_eq!(
+            got[0]["witnessed_at"], "2026-07-05T01:00:00.000Z",
+            "newest wins"
+        );
+    }
+
     // ── log-001 golden fixture (spec schemas/conformance) ─────────────
     //
     // The fixture's ctx_ids live on registry.example.com, not this test

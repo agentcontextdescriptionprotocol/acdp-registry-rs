@@ -10,6 +10,7 @@ pub mod playground;
 pub mod rate_limit;
 pub mod receipt;
 pub mod state;
+pub mod witness;
 
 pub use state::{AppState, AppStateInner};
 

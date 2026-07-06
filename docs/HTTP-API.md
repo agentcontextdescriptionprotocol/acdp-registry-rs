@@ -288,6 +288,52 @@ Signed with the RFC-ACDP-0010 **receipt key** (§6 — no new key role);
 `timestamp` is fresh per evaluation. Publicly readable wherever
 capabilities are.
 
+**Witness cosignatures (`witness_signatures`)** *(ACDP 0.4.0, RFC-ACDP-0015 §6.1).*
+When the registry is configured with `[[witnesses]]` and has collected one
+or more **verified** witness cosignatures over the exact
+`(log_id, tree_size, root_hash)` it is serving, `GET /log/checkpoint`
+returns an **envelope** that wraps the bare checkpoint under `log_checkpoint`
+and adds a top-level `witness_signatures` array as a **sibling**:
+
+```json
+{
+  "log_checkpoint": {
+    "checkpoint_version": "acdp-log/1",
+    "log_id": "did:web:registry.example.com/log/1",
+    "tree_size": 5,
+    "root_hash": "sha256:…",
+    "timestamp": "2026-07-04T12:00:00.000Z",
+    "signature": { "algorithm": "ed25519", "key_id": "…#receipt-key-1", "value": "…" }
+  },
+  "witness_signatures": [
+    {
+      "cosignature_version": "acdp-cosig/1",
+      "witness_id": "did:web:witness.example.org",
+      "witnessed_checkpoint": { "log_id": "…/log/1", "tree_size": 5, "root_hash": "sha256:…", "timestamp": "…" },
+      "witnessed_at": "2026-07-04T12:00:03.000Z",
+      "signature": { "algorithm": "ed25519", "key_id": "did:web:witness.example.org#witness-key-1", "value": "…" }
+    }
+  ]
+}
+```
+
+`witness_signatures` is **OUTSIDE** the signed checkpoint object — it is
+never inside it, never part of any `content_hash`, receipt, checkpoint, or
+leaf preimage (§6.1). The embedded `log_checkpoint` is the same closed,
+signed object as the bare form. When the registry has collected **no**
+cosignatures for the served tuple, the response is the **bare** checkpoint
+above (no envelope, no `witness_signatures`) — the array is never
+fabricated or served empty, and pre-0.4.0 consumers see exactly what they
+always did. The same top-level `witness_signatures` sibling is attached to
+the embedded checkpoint carried by `GET /log/proof` (inclusion and
+consistency modes) when cosignatures exist for that embedded checkpoint's
+tuple. A consumer verifies each cosignature under the witness DID's
+`assertionMethod` key and counts distinct trusted witnesses (the §8
+*N-witnessed* verdict); the registry never holds a witness key, so it can
+neither forge a cosignature nor make aggregation a trust dependency — a
+consumer MAY always fetch direct from a witness (§6.2). See
+[CONFIGURATION.md](CONFIGURATION.md#witnesses-acdp-040) for `[[witnesses]]`.
+
 **`GET /log/proof`** — one path, two mutually exclusive parameter sets:
 
 - *Inclusion mode:* exactly one of `?ctx_id=<ctx_id>` (the consumer
