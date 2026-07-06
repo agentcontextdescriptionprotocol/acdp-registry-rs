@@ -88,3 +88,13 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# ACDP 0.4.0 (RFC-ACDP-0015 witness cosigning) is not yet on crates.io. The
+# published `acdp` 0.5.0 pulls `acdp-types` 0.3.0, which predates
+# `acdp::types::cosignature` and the `acdp::client` witness verification the
+# registry needs to aggregate cosignatures (RFC-ACDP-0015 §6.1). Redirect the
+# umbrella crate to the sibling checkout, which carries the witness surface;
+# its path-based subcrate deps cascade automatically. Drop this once an
+# `acdp` release with the cosignature types is published.
+[patch.crates-io]
+acdp = { path = "../acdp-rs" }

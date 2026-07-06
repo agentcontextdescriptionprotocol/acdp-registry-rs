@@ -583,7 +583,7 @@ pub async fn retrieve<S: ExtendedRegistryStore + 'static>(
             // receipt's `registry_did` binds to the ORIGIN authority, which
             // matches the ctx_id authority the caller asked for, so
             // consumers re-verify it against the origin, not this proxy.
-            registry_receipt: verified.inner.registry_receipt.clone(),
+            registry_receipt: verified.receipt().cloned(),
             lineage_head_receipt: None,
             log_inclusion: None,
             extensions: Default::default(),
