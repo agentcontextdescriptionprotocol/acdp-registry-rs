@@ -22,8 +22,9 @@ readme        = "README.md"
 
 [workspace.dependencies]
 # Protocol library — reuse types, crypto, validation, DID resolution.
-# ACDP 0.3.0 (pagination helpers, `Body::from_publish_request`), consumed
-# from the sibling checkout until 0.3.0 is published to crates.io.
+# Published `acdp` 0.5.3 from crates.io: carries acdp-types 0.3.2
+# (`acdp::types::cosignature`) + acdp-client 0.4.1 (witness verification),
+# the RFC-ACDP-0015 §6.1 aggregation surface the registry needs.
 acdp = { version = "0.5.3", features = ["server", "client"] }
 
 # HTTP
@@ -89,10 +90,3 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 
-# ACDP 0.4.0 (RFC-ACDP-0015 witness cosigning) is not yet on crates.io. The
-# published `acdp` 0.5.0 pulls `acdp-types` 0.3.0, which predates
-# `acdp::types::cosignature` and the `acdp::client` witness verification the
-# registry needs to aggregate cosignatures (RFC-ACDP-0015 §6.1). Redirect the
-# umbrella crate to the sibling checkout, which carries the witness surface;
-# its path-based subcrate deps cascade automatically. Drop this once an
-# `acdp` release with the cosignature types is published.
