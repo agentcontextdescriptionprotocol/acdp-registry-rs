@@ -232,6 +232,14 @@ nor the `retracted` status is ever emitted.
 |-----|------|---------|-------|
 | `enabled` | bool | `false` | Opt into the RFC-ACDP-0013 endpoint surface and status semantics. |
 
+`enabled` also unlocks the **registry-attested** takedown path
+(`POST /admin/contexts/{ctx_id}/{retract,republish}`, RFC-ACDP-0013 §6
+registry-initiated events — see [HTTP-API.md](HTTP-API.md#post-admincontextsctx_idretract-post-admincontextsctx_idrepublish-acdp-030)).
+That path adds **no new knob**: it is gated by the existing `auth.admin_tokens`
+bearer, and its signing is driven by whether a `[receipt]` key is configured —
+with a receipt key the registry MUST sign the event under it; without one the
+event is recorded unsigned but still attributed to the registry DID.
+
 ### `[log]` *(ACDP 0.3.0)*
 
 Registry transparency log (RFC-ACDP-0012): a per-registry, append-only

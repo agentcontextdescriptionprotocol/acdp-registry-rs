@@ -13,4 +13,4 @@ pub use meta::{capabilities, health, jwks, registry_did_document};
 mod admin;
 #[cfg(feature = "playground")]
 pub use admin::{admin_list, reload_pinned_keys};
-pub use admin::{admin_status, lineage_audit};
+pub use admin::{admin_republish, admin_retract, admin_status, lineage_audit};

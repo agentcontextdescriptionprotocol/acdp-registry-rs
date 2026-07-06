@@ -28,6 +28,8 @@ The complete inbound surface of `acdp-registry`. Routes are assembled in
 | POST | `/auth/token/revoke`             | bearer      | `auth.enabled` |
 | GET  | `/admin/status`                  | admin bearer | always |
 | GET  | `/admin/lineages/{lineage_id}/audit` | admin bearer | always |
+| POST | `/admin/contexts/{ctx_id}/retract`   | admin bearer | always (501 unless `lifecycle.enabled`) |
+| POST | `/admin/contexts/{ctx_id}/republish` | admin bearer | always (501 unless `lifecycle.enabled`) |
 | GET  | `/admin/contexts`                | admin bearer | `playground` feature |
 | POST | `/admin/pinned-keys/reload`      | admin bearer | `playground` feature |
 
@@ -433,6 +435,62 @@ derivation from v1's `ctx_id`, producer continuity, and the
 single-non-superseded-tip invariant. `receiptless_contexts` counts rows
 without a stored receipt (informational — pre-receipts history is
 legitimate; see [RECEIPTS.md](RECEIPTS.md)). `404` for an unknown lineage.
+
+### `POST /admin/contexts/{ctx_id}/retract`, `POST /admin/contexts/{ctx_id}/republish` *(ACDP 0.3.0)*
+
+Registry-**attested** lifecycle events (RFC-ACDP-0013 §6, "registry-initiated
+events") — the policy/legal takedown path, distinct from the producer-signed
+`POST /contexts/{ctx_id}/{retract,republish}`. Use when a context must be
+formally withdrawn (or a withdrawal reversed) and the producer is unavailable:
+the registry mints the event itself and attributes it to its **own DID**
+(`capabilities.registry_did = did:web:<authority>`), not the producer.
+
+Auth is the standard admin gate (`auth.admin_tokens` bearer). Requires
+`[lifecycle] enabled` — a registry not advertising `acdp-registry-lifecycle`
+answers `501 not_implemented` (after the admin gate). Always mounted.
+
+Request body — a closed object with one optional member (the operator supplies
+only the reason; the registry mints the `event_id`, `occurred_at`, `actor`, and
+signature):
+
+```json
+{ "reason": "removed by policy: court order 2026-… (producer unavailable)" }
+```
+
+An empty body is accepted (`reason` is optional). Any other member →
+`400 schema_violation`.
+
+**Signing (mirrors the SDK's `record_registry_lifecycle_event` contract exactly):**
+
+- **`[receipt]` key configured** → the event **MUST** be signed under the
+  receipt key (RFC-ACDP-0013 §5; the receipts-profile MUST). `signature.key_id`
+  is `did:web:<authority>#<receipt.key_id_fragment>`, verifiable against the
+  registry DID document at [`/.well-known/did.json`](#-well-known-didjson-acdp-020).
+- **No `[receipt]` key** → the event is recorded **unsigned but attributed**:
+  `actor` still names the registry DID, and `signature` is omitted. Consumers
+  weight an unsigned registry event only as far as the response transport (§5).
+  This is not a refusal — it is exactly what the SDK helper permits when no
+  receipt signer is present.
+
+Downstream semantics are identical to the producer path: atomic
+`commit_lifecycle_event`, the `retracted > superseded > expired > active` status
+projection, the strict-alternation transition check
+(`409 invalid_lifecycle_transition` on a double-retract or a republish of a
+non-retracted context), byte-identical-`event_id` idempotency, and the
+`context.retracted` / `context.republished` webhook (with `actor` = the registry
+DID). On success returns `200` with the full-retrieval envelope (`body` +
+`registry_state`), the minted event appended to
+`registry_state.lifecycle_events` so its registry attribution is visible to
+consumers.
+
+**Cross-actor alternation is allowed.** RFC-ACDP-0013 §7.1 derives retraction
+state from event-type *order* alone (never the actor), and §6 authorizes the
+producer (`actor == agent_id`) and the registry (`actor == registry_did`)
+independently. So a producer may `/republish` a context the registry retracted,
+and vice versa; both events remain in the append-only history, attributed to
+their distinct actors. (The RFC is silent on actor symmetry for the reversal;
+allowing it is the natural reading of an actor-agnostic §7.1 and the intended
+"registry retracts by policy, producer later resolves and republishes" flow.)
 
 ### `GET /admin/contexts` *(playground feature)*
 
