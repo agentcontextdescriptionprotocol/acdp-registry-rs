@@ -24,7 +24,7 @@ readme        = "README.md"
 # Protocol library — reuse types, crypto, validation, DID resolution.
 # ACDP 0.3.0 (pagination helpers, `Body::from_publish_request`), consumed
 # from the sibling checkout until 0.3.0 is published to crates.io.
-acdp = { version = "0.5.0", features = ["server", "client"] }
+acdp = { version = "0.5.3", features = ["server", "client"] }
 
 # HTTP
 axum       = { version = "0.7", features = ["macros"] }
@@ -96,5 +96,3 @@ all = { level = "warn", priority = -1 }
 # umbrella crate to the sibling checkout, which carries the witness surface;
 # its path-based subcrate deps cascade automatically. Drop this once an
 # `acdp` release with the cosignature types is published.
-[patch.crates-io]
-acdp = { path = "../acdp-rs" }
