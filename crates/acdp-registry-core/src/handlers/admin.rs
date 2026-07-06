@@ -7,19 +7,20 @@
 use std::sync::Arc;
 
 use acdp_registry_store::ExtendedRegistryStore;
-use acdp_registry_types::RegistryConfig;
-use axum::extract::State;
+use acdp_registry_types::event::WebhookEvent;
+use acdp_registry_types::{RegistryConfig, RegistryError};
+use axum::body::Bytes;
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
-use serde::Serialize;
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
 
 use crate::state::AppState;
 
 #[cfg(feature = "playground")]
 use crate::handlers::context::{caller_from_headers, tenant_for_request};
-#[cfg(feature = "playground")]
-use acdp_registry_types::RegistryError;
 #[cfg(feature = "playground")]
 use axum::extract::Query;
 
@@ -378,6 +379,215 @@ fn audit_lineage(
     }
 }
 
+/// Request body for the admin lifecycle endpoints. The registry mints
+/// and (where a receipt key is configured) signs the event itself — the
+/// operator supplies only an optional human-readable `reason`. The shape
+/// is closed (`deny_unknown_fields`) so an operator attempting to smuggle
+/// body content or a full event object through this surface gets a clear
+/// `schema_violation` rather than having stray members silently ignored.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminLifecycleBody {
+    /// RFC-ACDP-0013 §4 `reason` (max 1024 chars, enforced downstream by
+    /// `LifecycleEvent::validate`). Informational only.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// `POST /admin/contexts/{ctx_id}/retract` — registry-attested retraction
+/// (RFC-ACDP-0013 §6 "Registry-initiated events").
+///
+/// The producer-signed path (`POST /contexts/{ctx_id}/retract`) is for the
+/// producer withdrawing their own context. THIS path is the policy/legal
+/// takedown lever: an operator (authenticated by an `auth.admin_tokens`
+/// bearer, the same gate as every other `/admin/*` route) directs the
+/// registry to mint a lifecycle event **attributed to the registry's own
+/// DID** (`capabilities.registry_did`) — used when the producer is
+/// unavailable and a context must be marked "removed by policy" without a
+/// silent 404 (RFC-ACDP-0013 §6, docs/data-protection.md §5).
+///
+/// Signing follows the SDK helper `record_registry_lifecycle_event`
+/// contract verbatim: when a `[receipt]` key is configured the event MUST
+/// be signed under it (RFC-ACDP-0013 §5, the receipts-profile MUST); when
+/// no receipt key is configured the event is recorded **unsigned but
+/// attributed** — the registry DID still names the actor, and consumers
+/// weight an unsigned registry event only as far as the response transport
+/// (§5). This mirrors the helper, which permits an unsigned event exactly
+/// when its `receipt_signer` is absent.
+pub async fn admin_retract<S: ExtendedRegistryStore + 'static>(
+    State(state): State<Arc<AppState<S>>>,
+    headers: HeaderMap,
+    Path(ctx_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<acdp::types::body::FullContext>, AdminLifecycleError> {
+    admin_lifecycle_transition(
+        state,
+        headers,
+        ctx_id,
+        body,
+        acdp::types::lifecycle::LifecycleEventType::Retracted,
+    )
+    .await
+}
+
+/// `POST /admin/contexts/{ctx_id}/republish` — registry-attested
+/// reversal of a prior retraction (RFC-ACDP-0013 §6). Same auth, signing,
+/// and attribution rules as [`admin_retract`].
+pub async fn admin_republish<S: ExtendedRegistryStore + 'static>(
+    State(state): State<Arc<AppState<S>>>,
+    headers: HeaderMap,
+    Path(ctx_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<acdp::types::body::FullContext>, AdminLifecycleError> {
+    admin_lifecycle_transition(
+        state,
+        headers,
+        ctx_id,
+        body,
+        acdp::types::lifecycle::LifecycleEventType::Republished,
+    )
+    .await
+}
+
+/// Shared pipeline behind the two admin lifecycle endpoints.
+///
+/// Ordering:
+/// 1. Admin auth (`auth.admin_tokens` bearer) — the operator gate.
+/// 2. Profile gate (`[lifecycle] enabled`) → `not_implemented` (501).
+/// 3. Parse the closed `{reason?}` body.
+/// 4. Mint a lifecycle event with `actor = did:web:<authority>` (the
+///    registry DID) and a fresh RFC 9562 `event_id`.
+/// 5. Sign it under the `[receipt]` key when one is configured; leave it
+///    unsigned-but-attributed otherwise (the SDK helper's contract).
+/// 6. `record_registry_lifecycle_event` — the same atomic
+///    `commit_lifecycle_event`, status projection, transition/idempotency
+///    checks, and wire-error mapping as the producer path. The transition
+///    logic is actor-agnostic (RFC-ACDP-0013 §7.1 derives retraction state
+///    from event-type order alone), so a producer may later `/republish` a
+///    registry retraction and vice versa.
+/// 7. Emit the `context.retracted`/`context.republished` webhook with
+///    `actor` = the registry DID.
+async fn admin_lifecycle_transition<S: ExtendedRegistryStore + 'static>(
+    state: Arc<AppState<S>>,
+    headers: HeaderMap,
+    ctx_id: String,
+    body: Bytes,
+    event_type: acdp::types::lifecycle::LifecycleEventType,
+) -> Result<Json<acdp::types::body::FullContext>, AdminLifecycleError> {
+    use acdp::error::AcdpError;
+    use acdp::types::lifecycle::{LifecycleEvent, LifecycleEventType};
+    use acdp::types::primitives::{AgentDid, CtxId};
+
+    // 1. Admin gate — identical convention to /admin/status etc.
+    require_admin_bearer(&state.config, &headers)?;
+
+    // 2. Profile gate. A registry not advertising acdp-registry-lifecycle
+    //    answers 501 (RFC-ACDP-0013 §6), before we mint or sign anything.
+    //    `record_registry_lifecycle_event` re-checks this, but doing it
+    //    here keeps the message clear and avoids needless key loading.
+    if !state.config.lifecycle.enabled {
+        return Err(RegistryError::Acdp(AcdpError::NotImplemented(
+            "this registry does not advertise acdp-registry-lifecycle \
+             (RFC-ACDP-0013 §6: lifecycle endpoints are not implemented)"
+                .into(),
+        ))
+        .into());
+    }
+
+    // 3. Closed `{reason?}` body. An empty body is allowed (reason is
+    //    optional); a non-empty body must parse against the closed shape.
+    let parsed: AdminLifecycleBody = if body.is_empty() {
+        AdminLifecycleBody::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| RegistryError::Acdp(AcdpError::SchemaViolation(e.to_string())))?
+    };
+
+    let path_ctx = CtxId::parse(ctx_id).map_err(RegistryError::Acdp)?;
+
+    // 4. Mint the registry-attributed event. `actor` MUST equal the
+    //    registry DID (`record_registry_lifecycle_event` rejects otherwise
+    //    with not_authorized); we derive it the same way as the receipt
+    //    signer's `registry_did`, so the two always agree.
+    let registry_did = acdp::did::authority_to_did_web(&state.config.registry.authority);
+    let event = LifecycleEvent::new(
+        uuid::Uuid::new_v4().to_string(),
+        path_ctx.clone(),
+        event_type.clone(),
+        Utc::now(),
+        AgentDid::new(registry_did.clone()),
+        parsed.reason,
+    )
+    .map_err(RegistryError::Acdp)?;
+
+    // 5. Sign under the receipt key when configured (MUST — §5); otherwise
+    //    record unsigned-but-attributed (the helper permits this exactly
+    //    when no receipt signer is present).
+    let event = if state.config.receipt.is_configured() {
+        let key = crate::receipt::load_signing_key(&state.config.receipt)
+            .map_err(|e| RegistryError::Acdp(AcdpError::RegistryInternal(e)))?;
+        let fragment = state.config.receipt.key_id_fragment.trim();
+        let key_id = format!("{registry_did}#{fragment}");
+        event.sign_with(key, key_id).map_err(RegistryError::Acdp)?
+    } else {
+        event
+    };
+
+    // 6. Atomic commit through the SDK's registry-actor helper. Sync store
+    //    call → blocking pool, like every other store touch in this crate.
+    let server = state.server.clone();
+    let event_for_commit = event.clone();
+    let ctx = tokio::task::spawn_blocking(move || {
+        server.record_registry_lifecycle_event(&event_for_commit)
+    })
+    .await
+    .map_err(|e| RegistryError::Internal(format!("join: {e}")))?
+    .map_err(RegistryError::Acdp)?;
+
+    // 7. Webhook — same downstream notification as the producer path, with
+    //    `actor` = the registry DID so a control plane attributes the
+    //    policy action correctly.
+    if let Some(emitter) = &state.webhook {
+        let stored_tenant = state
+            .server
+            .store()
+            .tenant_of_ctx(path_ctx.as_str())
+            .await
+            .ok()
+            .flatten()
+            .filter(|t| t != "default");
+        let registry_authority = state.config.registry.authority.clone();
+        let ctx_id_s = ctx.body.ctx_id.as_str().to_string();
+        let lineage_id_s = ctx.body.lineage_id.as_str().to_string();
+        let actor = event.actor.as_str().to_string();
+        let event_id = event.event_id.clone();
+        let reason = event.reason.clone();
+        let evt = match event_type {
+            LifecycleEventType::Retracted => WebhookEvent::ContextRetracted {
+                registry_authority,
+                ctx_id: ctx_id_s,
+                lineage_id: lineage_id_s,
+                actor,
+                event_id,
+                reason,
+                at: Utc::now(),
+            },
+            _ => WebhookEvent::ContextRepublished {
+                registry_authority,
+                ctx_id: ctx_id_s,
+                lineage_id: lineage_id_s,
+                actor,
+                event_id,
+                reason,
+                at: Utc::now(),
+            },
+        };
+        emitter.emit_with_tenant(evt, stored_tenant);
+    }
+
+    Ok(Json(ctx))
+}
+
 /// Reject the request unless `Authorization: Bearer <token>` matches
 /// one of `auth.admin_tokens`. When `admin_tokens` is empty the
 /// endpoint is effectively disabled — operators must opt in.
@@ -458,6 +668,41 @@ impl IntoResponse for AdminAuthError {
                 Json(serde_json::json!({"error": format!("internal error: {msg}")})),
             )
                 .into_response(),
+        }
+    }
+}
+
+/// Error for the admin lifecycle endpoints, which straddle two failure
+/// domains: the admin gate ([`AdminAuthError`] — a policy 403 with the
+/// `{"error":"admin-only"}` shape the other `/admin/*` routes use) and
+/// the protocol pipeline ([`RegistryError`] — the RFC-ACDP-0013 wire
+/// codes: `not_implemented` 501, `invalid_lifecycle_transition` 409,
+/// `not_found` 404, `schema_violation` 400, …). Each arm delegates to the
+/// existing `IntoResponse`, so an admin failure and a producer-path
+/// lifecycle failure surface byte-identically.
+#[derive(Debug)]
+pub enum AdminLifecycleError {
+    Auth(AdminAuthError),
+    Protocol(RegistryError),
+}
+
+impl From<AdminAuthError> for AdminLifecycleError {
+    fn from(e: AdminAuthError) -> Self {
+        Self::Auth(e)
+    }
+}
+
+impl From<RegistryError> for AdminLifecycleError {
+    fn from(e: RegistryError) -> Self {
+        Self::Protocol(e)
+    }
+}
+
+impl IntoResponse for AdminLifecycleError {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            AdminLifecycleError::Auth(e) => e.into_response(),
+            AdminLifecycleError::Protocol(e) => e.into_response(),
         }
     }
 }

@@ -104,6 +104,20 @@ pub fn build_router<S: ExtendedRegistryStore + 'static>(state: AppState<S>) -> R
         .route(
             "/admin/lineages/:lineage_id/audit",
             get(handlers::lineage_audit::<S>),
+        )
+        // Registry-attested lifecycle (RFC-ACDP-0013 §6 registry-initiated
+        // events): admin-gated retract/republish attributed to the
+        // registry's own DID — the policy/legal takedown lever for when a
+        // producer is unavailable. Auth-gated by `auth.admin_tokens` like
+        // every other `/admin/*` route; requires `[lifecycle] enabled`
+        // (501 otherwise). Ships in every build.
+        .route(
+            "/admin/contexts/:ctx_id/retract",
+            post(handlers::admin_retract::<S>),
+        )
+        .route(
+            "/admin/contexts/:ctx_id/republish",
+            post(handlers::admin_republish::<S>),
         );
 
     acdp.merge(aux)

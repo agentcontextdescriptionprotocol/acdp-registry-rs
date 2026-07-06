@@ -3483,6 +3483,257 @@ async fn head_receipt_minted_on_current_and_verifies() {
     );
 }
 
+// ─── ACDP 0.3.0: registry-attested lifecycle (RFC-ACDP-0013 §6 registry-initiated) ───
+
+const ADMIN_TOKEN: &str = "secret-admin-lc";
+
+/// Registry DID this harness attests lifecycle events under
+/// (`capabilities.registry_did` = `did:web:<authority>`).
+fn registry_did() -> String {
+    format!("did:web:{AUTHORITY}")
+}
+
+/// Lifecycle harness with admin tokens configured and, optionally, a
+/// `[receipt]` signing key (so the registry MUST sign its own events).
+async fn admin_lifecycle_harness(receipts: bool) -> Harness {
+    let mut cfg = config(false);
+    cfg.auth.did_methods = vec!["did:web".into(), "did:key".into()];
+    cfg.lifecycle.enabled = true;
+    cfg.auth.admin_tokens = vec![ADMIN_TOKEN.into()];
+    if receipts {
+        cfg.receipt.signing_key_seed_b64 = B64.encode(RECEIPT_SEED);
+    }
+    build_harness_with_caps(cfg, caps_030(), None).await
+}
+
+/// POST an admin lifecycle request (`/admin/contexts/{ctx_id}/{endpoint}`),
+/// optionally with a Bearer admin token and a `{reason?}` body.
+async fn post_admin_lifecycle(
+    app: &axum::Router,
+    ctx_id: &str,
+    endpoint: &str,
+    token: Option<&str>,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder().method("POST").uri(format!(
+        "/admin/contexts/{}/{endpoint}",
+        pct_encode_path_segment(ctx_id)
+    ));
+    if let Some(t) = token {
+        builder = builder.header("authorization", format!("Bearer {t}"));
+    }
+    let bytes = match body {
+        Some(v) => serde_json::to_vec(&v).unwrap(),
+        None => Vec::new(),
+    };
+    let resp = app
+        .clone()
+        .oneshot(
+            builder
+                .header("content-type", "application/json")
+                .body(Body::from(bytes))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let v = body_to_json(resp).await;
+    (status, v)
+}
+
+/// Publish one did:key public context; returns its ctx_id.
+async fn publish_ctx(h: &Harness, seed: u8, title: &str) -> String {
+    let req = did_key_producer(seed)
+        .publish_request()
+        .title(title)
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (status, v) = publish(&h.router, &req, None).await;
+    assert_eq!(status, StatusCode::OK, "publish body = {v}");
+    v["ctx_id"].as_str().unwrap().to_string()
+}
+
+/// Admin retract on a live context: status flips to `retracted`, the event
+/// is attributed to the REGISTRY DID (not the producer), and — because a
+/// receipt key is configured — it is signed and verifies against the
+/// registry's own DID document / receipt key (RFC-ACDP-0013 §5).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_retract_attributes_to_registry_did_and_signs() {
+    use acdp::types::lifecycle::LifecycleEvent;
+
+    let h = admin_lifecycle_harness(true).await;
+    let ctx_id = publish_ctx(&h, 60, "admin retract e2e").await;
+
+    let (status, v) = post_admin_lifecycle(
+        &h.router,
+        &ctx_id,
+        "retract",
+        Some(ADMIN_TOKEN),
+        Some(json!({ "reason": "legal takedown; producer unavailable" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "admin retract body = {v}");
+    assert_eq!(v["registry_state"]["status"], "retracted");
+
+    let events = v["registry_state"]["lifecycle_events"].as_array().unwrap();
+    assert_eq!(events.len(), 1);
+    let ev = &events[0];
+    assert_eq!(ev["event_type"], "retracted");
+    // Attribution: actor is the registry DID, NOT the producer's did:key.
+    assert_eq!(ev["actor"], registry_did());
+    assert_eq!(ev["reason"], "legal takedown; producer unavailable");
+    // Signed under the registry receipt key (did:web:<authority>#receipt-key-1).
+    assert_eq!(
+        ev["signature"]["key_id"],
+        format!("{}#receipt-key-1", registry_did())
+    );
+
+    // The event verifies against the registry's known receipt public key —
+    // i.e. it would verify against the registry DID document served at
+    // /.well-known/did.json.
+    let parsed = LifecycleEvent::from_value(ev).expect("event parses");
+    parsed
+        .verify_signature_with_key(Some(&receipt_public_key()), None)
+        .expect("registry-attested event verifies against the registry receipt key");
+
+    // Body remains retrievable, byte-identical (mark-not-delete).
+    let (status, full) = get_json(
+        &h.router,
+        &format!("/contexts/{}", pct_encode_path_segment(&ctx_id)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(full["body"]["title"], "admin retract e2e");
+    assert_eq!(full["registry_state"]["status"], "retracted");
+}
+
+/// Unauthorized admin lifecycle requests are rejected with the admin
+/// convention's 403 (`{"error":"admin-only"}`) — missing credential, wrong
+/// token, and non-Bearer scheme all fail, and NO event is recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_retract_rejects_missing_or_bad_credential() {
+    let h = admin_lifecycle_harness(true).await;
+    let ctx_id = publish_ctx(&h, 61, "admin auth guard").await;
+
+    for token in [None, Some("wrong-token")] {
+        let (status, v) = post_admin_lifecycle(&h.router, &ctx_id, "retract", token, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "token={token:?} body={v}");
+        assert_eq!(v["error"], "admin-only");
+    }
+
+    // The context was never retracted by any of the rejected attempts.
+    let (_, full) = get_json(
+        &h.router,
+        &format!("/contexts/{}", pct_encode_path_segment(&ctx_id)),
+    )
+    .await;
+    assert_eq!(full["registry_state"]["status"], "active");
+    assert!(full["registry_state"].get("lifecycle_events").is_none());
+}
+
+/// When NO receipt key is configured, the registry records its lifecycle
+/// event **unsigned but attributed** — the SDK helper permits an unsigned
+/// event exactly when no receipt signer is present (RFC-ACDP-0013 §5). The
+/// actor is still the registry DID, so the withdrawal is attributable as
+/// far as the response transport.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_retract_is_unsigned_but_attributed_without_receipt_key() {
+    let h = admin_lifecycle_harness(false).await;
+    let ctx_id = publish_ctx(&h, 62, "unsigned registry event").await;
+
+    let (status, v) =
+        post_admin_lifecycle(&h.router, &ctx_id, "retract", Some(ADMIN_TOKEN), None).await;
+    assert_eq!(status, StatusCode::OK, "admin retract body = {v}");
+    assert_eq!(v["registry_state"]["status"], "retracted");
+
+    let events = v["registry_state"]["lifecycle_events"].as_array().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["actor"], registry_did());
+    // Attributed but unsigned: the field is absent (skip-serialized), per
+    // the absent-vs-null wire convention.
+    assert!(
+        events[0].get("signature").is_none(),
+        "no receipt key → unsigned event: {}",
+        events[0]
+    );
+}
+
+/// A second admin retract on an already-retracted context is the same
+/// state conflict as the producer path: 409 `invalid_lifecycle_transition`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_double_retract_conflicts() {
+    let h = admin_lifecycle_harness(true).await;
+    let ctx_id = publish_ctx(&h, 63, "admin double retract").await;
+
+    let (status, _) =
+        post_admin_lifecycle(&h.router, &ctx_id, "retract", Some(ADMIN_TOKEN), None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, v) =
+        post_admin_lifecycle(&h.router, &ctx_id, "retract", Some(ADMIN_TOKEN), None).await;
+    assert_eq!(status, StatusCode::CONFLICT, "body = {v}");
+    assert_eq!(v["error"]["code"], "invalid_lifecycle_transition");
+}
+
+/// Cross-actor alternation: a producer may `/republish` a context the
+/// REGISTRY retracted. RFC-ACDP-0013 §7.1 derives retraction state from
+/// event-type order alone (never actor), and §6 authorizes the producer
+/// (actor == agent_id) and registry (actor == registry_did) independently
+/// — nothing requires the reverser be the same actor. The append-only
+/// history retains both events, attributed to their distinct actors.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn producer_can_republish_after_admin_retract() {
+    let h = admin_lifecycle_harness(true).await;
+    let ctx_id = publish_ctx(&h, 64, "cross-actor alternation").await;
+
+    // Registry retracts (policy takedown).
+    let (status, v) = post_admin_lifecycle(
+        &h.router,
+        &ctx_id,
+        "retract",
+        Some(ADMIN_TOKEN),
+        Some(json!({ "reason": "policy" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "admin retract body = {v}");
+    assert_eq!(v["registry_state"]["status"], "retracted");
+
+    // Producer (the original did:key producer, actor == agent_id)
+    // republishes through the producer-signed endpoint.
+    let republish = signed_event_envelope(64, &ctx_id, "republished", Some("issue resolved"));
+    let (status, v) = post_lifecycle(&h.router, &ctx_id, "republish", &republish).await;
+    assert_eq!(status, StatusCode::OK, "producer republish body = {v}");
+    assert_eq!(v["registry_state"]["status"], "active");
+
+    let events = v["registry_state"]["lifecycle_events"].as_array().unwrap();
+    assert_eq!(events.len(), 2, "append-only history retains both events");
+    assert_eq!(events[0]["event_type"], "retracted");
+    assert_eq!(events[0]["actor"], registry_did());
+    assert_eq!(events[1]["event_type"], "republished");
+    // The republish is attributed to the producer, not the registry.
+    assert_ne!(events[1]["actor"], registry_did());
+}
+
+/// A registry that does not advertise the lifecycle profile answers 501 on
+/// the admin endpoints too (after the admin gate), never emitting a
+/// lifecycle event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_retract_501_when_lifecycle_disabled() {
+    let mut cfg = config(false);
+    cfg.auth.did_methods = vec!["did:web".into(), "did:key".into()];
+    cfg.auth.admin_tokens = vec![ADMIN_TOKEN.into()];
+    // lifecycle.enabled stays false (the default).
+    let h = build_harness_with_caps(cfg, caps_030(), None).await;
+    let ctx_id = publish_ctx(&h, 65, "lifecycle off").await;
+
+    let (status, v) =
+        post_admin_lifecycle(&h.router, &ctx_id, "retract", Some(ADMIN_TOKEN), None).await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "body = {v}");
+    assert_eq!(v["error"]["code"], "not_implemented");
+}
+
 // ─── ACDP 0.3.0: registry transparency log (RFC-ACDP-0012) ───
 
 /// The log_id this harness serves: `did:web:<authority>/log/<instance>`
