@@ -63,7 +63,7 @@ hex          = "0.4"
 # Config
 config  = { version = "0.14", default-features = false, features = ["toml"] }
 dotenvy = "0.15"
-toml    = "0.8"
+toml    = "1.1"
 
 # HTTP client (webhook + admin tooling)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
