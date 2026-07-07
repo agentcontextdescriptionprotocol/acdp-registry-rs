@@ -808,3 +808,261 @@ mod transparency_log {
             .is_empty());
     }
 }
+
+// ─── DESIGN-01: §4.5 visibility disclosure pushed into SQL ──────────────────
+//
+// Postgres twin of the SQLite equivalence proof. An INDEPENDENT re-statement
+// of RFC-ACDP-0008 §4.5 is the oracle; the SQL disclosure predicate MUST
+// disclose exactly it across the full matrix, and `total_estimate` MUST be
+// the honest §4.5-visible pre-page count (`COUNT(*) OVER ()`). Each run
+// isolates its rows on the shared database with a UUID `domain` (search) and
+// `tenant` (list).
+
+mod visibility_sql {
+    use super::*;
+    use acdp::types::search::SearchParams;
+    use std::collections::HashSet;
+
+    const OWNER: u8 = 70;
+    const READER: u8 = 71;
+    const OTHER: u8 = 72;
+
+    fn agent(seed: u8) -> AgentDid {
+        AgentDid::new(format!("did:web:agents.test:contract-{seed}"))
+    }
+
+    async fn publish(
+        store: &Arc<PgStore>,
+        title: &str,
+        vis: Visibility,
+        audience: &[AgentDid],
+        domain: &str,
+        tenant: &str,
+    ) -> String {
+        let p = producer(OWNER);
+        let mut b = p
+            .publish_request()
+            .title(title)
+            .context_type(ContextType::DataSnapshot)
+            .domain(domain)
+            .visibility(vis);
+        if !audience.is_empty() {
+            b = b.audience(audience.to_vec());
+        }
+        let req = b.build().expect("valid publish request");
+        let store = Arc::clone(store);
+        let tenant = tenant.to_string();
+        let outcome = tokio::task::spawn_blocking(move || {
+            store.commit_publish(PublishCommit {
+                req: &req,
+                authority: AUTHORITY,
+                idempotency: None,
+                tenant: Some(&tenant),
+                receipt_minter: None,
+            })
+        })
+        .await
+        .unwrap()
+        .expect("publish ok");
+        response(&outcome).ctx_id.as_str().to_string()
+    }
+
+    fn oracle_search(
+        vis: Visibility,
+        is_owner: bool,
+        is_audience: bool,
+        authed: bool,
+        anon_reads: bool,
+    ) -> bool {
+        match vis {
+            Visibility::Public => authed || anon_reads,
+            Visibility::Restricted => authed && (is_owner || is_audience),
+            Visibility::Private => authed && is_owner,
+        }
+    }
+
+    fn oracle_list(vis: Visibility, is_owner: bool, is_audience: bool, authed: bool) -> bool {
+        match vis {
+            Visibility::Public => true,
+            Visibility::Restricted | Visibility::Private => authed && (is_owner || is_audience),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sql_disclosure_matches_rfc_4_5_across_the_matrix() {
+        let Some(url) = pg_url_or_skip() else { return };
+        let store = store(&url).await;
+        let dom = format!("d01m-{}", uuid::Uuid::new_v4().simple());
+        let tenant = format!("d01mt-{}", uuid::Uuid::new_v4().simple());
+        let reader = agent(READER);
+
+        let contexts = [
+            (
+                Visibility::Public,
+                publish(&store, "pub", Visibility::Public, &[], &dom, &tenant).await,
+            ),
+            (
+                Visibility::Restricted,
+                publish(
+                    &store,
+                    "restr",
+                    Visibility::Restricted,
+                    std::slice::from_ref(&reader),
+                    &dom,
+                    &tenant,
+                )
+                .await,
+            ),
+            (
+                Visibility::Private,
+                publish(
+                    &store,
+                    "priv",
+                    Visibility::Private,
+                    std::slice::from_ref(&reader),
+                    &dom,
+                    &tenant,
+                )
+                .await,
+            ),
+        ];
+
+        let roles: [(&str, Option<AgentDid>); 4] = [
+            ("anonymous", None),
+            ("owner", Some(agent(OWNER))),
+            ("audience-reader", Some(agent(READER))),
+            ("unauthorized-other", Some(agent(OTHER))),
+        ];
+
+        for (role, requester) in &roles {
+            let authed = requester.is_some();
+            let is_owner = requester.as_ref() == Some(&agent(OWNER));
+            let is_reader = requester.as_ref() == Some(&agent(READER));
+
+            for anon_reads in [true, false] {
+                let params = SearchParams {
+                    domain: Some(dom.clone()),
+                    ..Default::default()
+                };
+                let resp = store
+                    .search(&params, requester.as_ref(), anon_reads)
+                    .expect("search ok");
+                let got: HashSet<&str> = resp.matches.iter().map(|m| m.ctx_id.as_str()).collect();
+
+                let mut want: HashSet<&str> = HashSet::new();
+                for (vis, id) in &contexts {
+                    let is_aud = is_reader && !matches!(vis, Visibility::Public);
+                    if oracle_search(vis.clone(), is_owner, is_aud, authed, anon_reads) {
+                        want.insert(id.as_str());
+                    }
+                }
+                assert_eq!(
+                    got, want,
+                    "SEARCH disclosure diverges from §4.5: role={role} anon_reads={anon_reads}"
+                );
+                assert_eq!(
+                    resp.total_estimate,
+                    Some(want.len() as u64),
+                    "total_estimate must equal the §4.5-visible count: role={role} anon_reads={anon_reads}"
+                );
+            }
+
+            let page = store
+                .list_contexts(50, None, requester.as_ref(), Some(&tenant))
+                .await
+                .expect("list ok");
+            let got: HashSet<&str> = page.items.iter().map(|c| c.body.ctx_id.as_str()).collect();
+            let mut want: HashSet<&str> = HashSet::new();
+            for (vis, id) in &contexts {
+                let is_aud = is_reader && !matches!(vis, Visibility::Public);
+                if oracle_list(vis.clone(), is_owner, is_aud, authed) {
+                    want.insert(id.as_str());
+                }
+            }
+            assert_eq!(got, want, "LIST disclosure diverges from §4.5: role={role}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pages_are_full_and_total_is_honest_under_mixed_visibility() {
+        let Some(url) = pg_url_or_skip() else { return };
+        let store = store(&url).await;
+        let dom = format!("d01f-{}", uuid::Uuid::new_v4().simple());
+        let tenant = format!("d01ft-{}", uuid::Uuid::new_v4().simple());
+
+        let mut public_ids: HashSet<String> = HashSet::new();
+        for i in 0..12 {
+            if i % 2 == 0 {
+                let id = publish(
+                    &store,
+                    &format!("pub-{i}"),
+                    Visibility::Public,
+                    &[],
+                    &dom,
+                    &tenant,
+                )
+                .await;
+                public_ids.insert(id);
+            } else {
+                publish(
+                    &store,
+                    &format!("priv-{i}"),
+                    Visibility::Private,
+                    &[],
+                    &dom,
+                    &tenant,
+                )
+                .await;
+            }
+        }
+
+        let params = SearchParams {
+            domain: Some(dom.clone()),
+            limit: Some(4),
+            ..Default::default()
+        };
+        let page1 = store.search(&params, None, true).expect("search ok");
+        assert_eq!(
+            page1.matches.len(),
+            4,
+            "page must fill to `limit` from the visible set, not be trimmed by a post-filter"
+        );
+        assert_eq!(
+            page1.total_estimate,
+            Some(6),
+            "total_estimate is the §4.5-visible count (6 public), independent of page size"
+        );
+        assert!(page1.next_cursor.is_some(), "more visible rows remain");
+
+        for m in &page1.matches {
+            assert!(
+                public_ids.contains(m.ctx_id.as_str()),
+                "a private row leaked into an anonymous search result"
+            );
+        }
+
+        let mut seen: HashSet<String> = page1
+            .matches
+            .iter()
+            .map(|m| m.ctx_id.as_str().to_string())
+            .collect();
+        let mut cursor = page1.next_cursor;
+        while let Some(c) = cursor {
+            let params = SearchParams {
+                domain: Some(dom.clone()),
+                limit: Some(4),
+                cursor: Some(c),
+                ..Default::default()
+            };
+            let page = store.search(&params, None, true).expect("search ok");
+            for m in &page.matches {
+                seen.insert(m.ctx_id.as_str().to_string());
+            }
+            cursor = page.next_cursor;
+        }
+        assert_eq!(
+            seen, public_ids,
+            "pagination drains exactly the visible public set"
+        );
+    }
+}

@@ -708,10 +708,13 @@ const SEARCH_REFILL_MAX_PAGES: usize = 6;
 /// [`SEARCH_REFILL_MAX_PAGES`] so a tenant with zero matches doesn't
 /// turn one HTTP request into an unbounded backend scan.
 ///
-/// SQL-level filtering for `search` would be cleaner but requires
-/// extending the upstream `RegistryStore::search` trait — out of
-/// scope for this PR. The `admin_list` endpoint took the SQL path
-/// (see `ExtendedRegistryStore::list_contexts(..., tenant)`).
+/// DESIGN-01: the RFC-ACDP-0008 §4.5 *visibility* disclosure predicate now
+/// runs in the store's search SQL (so restricted/private bodies are never
+/// read or decoded, pages fill to `limit` w.r.t. disclosure, and
+/// `resp.total_estimate` carries an honest §4.5-scoped pre-page count). The
+/// *tenant* narrowing below is the last remaining post-query filter — the
+/// upstream `RegistryStore::search` contract carries no tenant, so the
+/// bounded refill loop still compensates for it (SECURITY follow-up #14).
 pub async fn search<S: ExtendedRegistryStore + 'static>(
     State(state): State<Arc<AppState<S>>>,
     headers: HeaderMap,

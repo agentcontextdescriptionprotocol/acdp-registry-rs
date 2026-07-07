@@ -190,9 +190,16 @@ impl ExtendedRegistryStore for SqliteStore {
     ) -> Result<Page<FullContext>, AcdpError> {
         let limit = limit.clamp(1, 200) as i64;
         let anchor = cursor.map(decode_cursor).transpose()?.flatten();
+        let requester_s: Option<String> = requester.map(|r| r.as_str().to_string());
         let mut sql = String::from(
             "SELECT body_json, status, registry_receipt, retracted FROM contexts WHERE 1=1",
         );
+        // DESIGN-01: push the RFC-ACDP-0008 §4.5 retrieval-style disclosure
+        // predicate (`visible_to`) into SQL so restricted/private bodies the
+        // requester may not see are never read or decoded, and the page fills
+        // to `limit` instead of being trimmed by a post-query retain.
+        // Placeholders (in order): `?req` ×3.
+        sql.push_str(LIST_VISIBILITY_SQLITE);
         // Plan §7: push the tenant filter into SQL so a busy
         // mixed-tenant registry doesn't return short pages caused by a
         // post-query retain. The `idx_ctx_tenant_created` index lets
@@ -210,6 +217,9 @@ impl ExtendedRegistryStore for SqliteStore {
         sql.push_str(" ORDER BY created_at DESC, ctx_id ASC LIMIT ?");
 
         let mut q = sqlx::query(&sql);
+        // Disclosure binds first — same textual order as LIST_VISIBILITY_SQLITE.
+        let req = requester_s.as_deref();
+        q = q.bind(req).bind(req).bind(req);
         if let Some(t) = tenant {
             q = q.bind(t);
         }
@@ -234,7 +244,10 @@ impl ExtendedRegistryStore for SqliteStore {
             rows,
             limit as usize,
             |r| row_to_context(&r),
-            |ctx| visible_to(ctx, requester),
+            // DESIGN-01: §4.5 disclosure is enforced in SQL above, so the
+            // raw scanned rows are already the exact visible set; no
+            // post-query visibility retain is needed.
+            |_ctx| true,
             |ctx| {
                 encode_cursor(
                     ctx.body.created_at.timestamp_millis(),
@@ -400,22 +413,31 @@ fn log_row_to_record(r: &sqlx::sqlite::SqliteRow) -> Result<LogEntryRecord, Acdp
     })
 }
 
-fn visible_to(ctx: &FullContext, requester: Option<&AgentDid>) -> bool {
-    match ctx.body.visibility {
-        Visibility::Public => true,
-        Visibility::Restricted | Visibility::Private => match requester {
-            None => false,
-            Some(r) => {
-                r == &ctx.body.agent_id
-                    || ctx
-                        .body
-                        .audience
-                        .as_deref()
-                        .is_some_and(|a| a.iter().any(|d| d == r))
-            }
-        },
-    }
-}
+/// RFC-ACDP-0008 §4.5 retrieval-style disclosure used by the admin/debug
+/// listing (the former in-Rust `visible_to`): `public` is always listed;
+/// `restricted`/`private` require the requester to be the producer
+/// (`agent_id`) or a named `audience` member. Placeholders (in textual
+/// order): `?req` ×3, where `?req` is the requester DID or SQL NULL for an
+/// anonymous caller. `json_each(body_json,'$.audience')` yields zero rows
+/// when `audience` is absent, so the audience arm short-circuits.
+const LIST_VISIBILITY_SQLITE: &str = " AND (visibility = 'public' \
+    OR (? IS NOT NULL AND (agent_id = ? \
+        OR EXISTS (SELECT 1 FROM json_each(body_json, '$.audience') WHERE value = ?))))";
+
+/// RFC-ACDP-0008 §4.5 search/discovery disclosure (the former in-Rust
+/// `can_surface_in_search`), arm-for-arm with the visibility matrix:
+/// `public` surfaces for any authenticated caller or — when
+/// `anonymous_public_reads` — anonymously; `restricted` surfaces to the
+/// producer or a named `audience` member; `private` surfaces to the
+/// producer ONLY (audience members can retrieve a `ctx_id` they know but
+/// MUST NOT discover it via search). Placeholders (in textual order):
+/// `?req` (public), `?anon`, `?req`,`?req`,`?req` (restricted),
+/// `?req`,`?req` (private).
+const SEARCH_VISIBILITY_SQLITE: &str = " AND (\
+    (visibility = 'public' AND (? IS NOT NULL OR ?)) \
+    OR (visibility = 'restricted' AND ? IS NOT NULL AND (agent_id = ? \
+        OR EXISTS (SELECT 1 FROM json_each(body_json, '$.audience') WHERE value = ?))) \
+    OR (visibility = 'private' AND ? IS NOT NULL AND agent_id = ?))";
 
 // ── RegistryStore (sync, drives async sqlx via block_on) ─────────────────────
 
@@ -1138,8 +1160,17 @@ impl RegistryStore for SqliteStore {
             let dp_start_after = parse_opt_rfc3339(&params.data_period_start_after)?;
             let dp_end_before = parse_opt_rfc3339(&params.data_period_end_before)?;
 
-            let mut sql =
-                String::from("SELECT body_json, status, retracted FROM contexts WHERE 1=1");
+            // DESIGN-01: the §4.5 search disclosure predicate is pushed into
+            // SQL (below) so restricted/private bodies the requester may not
+            // see are never read or decoded, pages fill to `limit`, and
+            // `COUNT(*) OVER ()` yields an honest, §4.5-correct pre-page total
+            // that excludes contexts the requester is not entitled to count.
+            let requester_s: Option<String> = requester.map(|r| r.as_str().to_string());
+            let mut sql = String::from(
+                "SELECT body_json, status, retracted, COUNT(*) OVER () AS total_rows \
+                 FROM contexts WHERE 1=1",
+            );
+            sql.push_str(SEARCH_VISIBILITY_SQLITE);
             let mut binds: Vec<String> = Vec::new();
 
             if let Some(q) = &params.q {
@@ -1213,11 +1244,37 @@ impl RegistryStore for SqliteStore {
             sql.push_str(" ORDER BY created_at DESC, ctx_id ASC LIMIT ?");
 
             let mut q = sqlx::query(&sql);
+            // Disclosure binds first — same textual order as SEARCH_VISIBILITY_SQLITE.
+            let req = requester_s.as_deref();
+            q = q
+                .bind(req) // public:     ? IS NOT NULL
+                .bind(anonymous_public_reads) // public:     OR ?
+                .bind(req) // restricted: ? IS NOT NULL
+                .bind(req) // restricted: agent_id = ?
+                .bind(req) // restricted: audience value = ?
+                .bind(req) // private:    ? IS NOT NULL
+                .bind(req); // private:    agent_id = ?
             for b in &binds {
                 q = q.bind(b);
             }
             q = q.bind((limit as i64) + 1);
             let rows = q.fetch_all(&self.pool).await.map_err(map_sqlx_err)?;
+
+            // DESIGN-01: `COUNT(*) OVER ()` rides the same scan, so the total
+            // is the count of §4.5-visible rows matching the SQL filters
+            // (before the LIMIT). It is an ESTIMATE: the post-SQL status /
+            // tags / derived_from refinements below are not reflected, so it
+            // is an upper bound on the returned matches. Crucially, the §4.5
+            // visibility dimension IS in SQL, so the total never counts a
+            // restricted/private context the requester may not see.
+            let total_estimate = match rows.first() {
+                Some(r) => Some(
+                    r.try_get::<i64, _>("total_rows")
+                        .map_err(map_sqlx_err)?
+                        .max(0) as u64,
+                ),
+                None => Some(0),
+            };
 
             let now = Utc::now();
             let want_status = params.status.as_deref().unwrap_or("active");
@@ -1253,10 +1310,10 @@ impl RegistryStore for SqliteStore {
                     Ok(ctx)
                 },
                 |ctx| {
-                    // Search disclosure (RFC-ACDP-0008 §4.5) + status.
-                    if !can_surface_in_search(ctx, requester, anonymous_public_reads) {
-                        return false;
-                    }
+                    // DESIGN-01: §4.5 search disclosure is enforced in SQL
+                    // above; the raw scanned rows are already disclosure-
+                    // scoped. Remaining post-SQL refinements: status
+                    // projection, tags (stored as JSON), and derived_from.
                     if ctx.registry_state.status.as_str() != want_status {
                         return false;
                     }
@@ -1303,13 +1360,11 @@ impl RegistryStore for SqliteStore {
                 })
                 .collect();
 
-            // DESIGN-05: total_estimate was previously the matches count of
-            // the current page, which is always ≤ limit and misleads any
-            // client trying to render "showing N of M". Returning `None`
-            // is honest until a separate COUNT(*) query is added.
+            // DESIGN-01: total_estimate is now the pre-page count of
+            // §4.5-visible rows (from `COUNT(*) OVER ()`), not the page size.
             Ok(SearchResponse {
                 matches: projected,
-                total_estimate: None,
+                total_estimate,
                 next_cursor,
             })
         })
@@ -1594,28 +1649,6 @@ fn project_context(mut ctx: FullContext, now: DateTime<Utc>) -> FullContext {
     ctx.registry_state.status =
         project_status_inline(&ctx.registry_state.status, ctx.body.expires_at, now);
     ctx
-}
-
-fn can_surface_in_search(
-    ctx: &FullContext,
-    requester: Option<&AgentDid>,
-    anonymous_public_reads: bool,
-) -> bool {
-    match ctx.body.visibility {
-        Visibility::Public => anonymous_public_reads || requester.is_some(),
-        Visibility::Restricted => match requester {
-            None => false,
-            Some(r) => {
-                r == &ctx.body.agent_id
-                    || ctx
-                        .body
-                        .audience
-                        .as_deref()
-                        .is_some_and(|a| a.iter().any(|d| d == r))
-            }
-        },
-        Visibility::Private => requester == Some(&ctx.body.agent_id),
-    }
 }
 
 fn parse_opt_rfc3339(s: &Option<String>) -> Result<Option<DateTime<Utc>>, AcdpError> {

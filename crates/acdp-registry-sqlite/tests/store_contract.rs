@@ -892,3 +892,294 @@ mod transparency_log {
         }
     }
 }
+
+// ─── DESIGN-01: §4.5 visibility disclosure pushed into SQL ──────────────────
+//
+// The store now gates retrieval-style disclosure (`list_contexts`) and
+// search-style disclosure (`search`) in the SQL `WHERE`, not in a post-query
+// Rust `retain`. These tests are the SECURITY equivalence proof: an
+// INDEPENDENT re-statement of RFC-ACDP-0008 §4.5 (not the implementation's
+// former predicate) is the oracle, and the SQL result set MUST equal it
+// across the full matrix {public, restricted, private} × {anonymous, owner,
+// audience-reader, unauthorized-other} × anonymous_public_reads.
+
+mod visibility_sql {
+    use super::*;
+    use acdp::types::search::SearchParams;
+    use std::collections::HashSet;
+
+    const OWNER: u8 = 70;
+    const READER: u8 = 71;
+    const OTHER: u8 = 72;
+
+    fn agent(seed: u8) -> AgentDid {
+        AgentDid::new(format!("did:web:agents.test:contract-{seed}"))
+    }
+
+    /// Publish one context owned by `OWNER` with the given visibility and
+    /// audience, tagged with `domain`/`tenant` so the test can isolate its
+    /// own rows on a shared backend. Returns the assigned ctx_id.
+    async fn publish(
+        store: &Arc<SqliteStore>,
+        title: &str,
+        vis: Visibility,
+        audience: &[AgentDid],
+        domain: &str,
+        tenant: &str,
+    ) -> String {
+        let p = producer(OWNER);
+        let mut b = p
+            .publish_request()
+            .title(title)
+            .context_type(ContextType::DataSnapshot)
+            .domain(domain)
+            .visibility(vis);
+        if !audience.is_empty() {
+            b = b.audience(audience.to_vec());
+        }
+        let req = b.build().expect("valid publish request");
+        let store = Arc::clone(store);
+        let tenant = tenant.to_string();
+        let outcome = tokio::task::spawn_blocking(move || {
+            store.commit_publish(PublishCommit {
+                req: &req,
+                authority: AUTHORITY,
+                idempotency: None,
+                tenant: Some(&tenant),
+                receipt_minter: None,
+            })
+        })
+        .await
+        .unwrap()
+        .expect("publish ok");
+        response(&outcome).ctx_id.as_str().to_string()
+    }
+
+    // ── Independent RFC-ACDP-0008 §4.5 oracle ───────────────────────────
+
+    /// Search/discovery disclosure (§4.5): public surfaces to any
+    /// authenticated caller, or anonymously iff `anon_reads`; restricted to
+    /// producer or audience; private to the PRODUCER ONLY (audience is
+    /// retrieval-only, strictly narrower than retrieval for private).
+    fn oracle_search(
+        vis: Visibility,
+        is_owner: bool,
+        is_audience: bool,
+        authed: bool,
+        anon_reads: bool,
+    ) -> bool {
+        match vis {
+            Visibility::Public => authed || anon_reads,
+            Visibility::Restricted => authed && (is_owner || is_audience),
+            Visibility::Private => authed && is_owner,
+        }
+    }
+
+    /// Retrieval-style disclosure (§4.5) used by the admin/debug listing:
+    /// public is always listed; restricted/private require producer or
+    /// audience membership.
+    fn oracle_list(vis: Visibility, is_owner: bool, is_audience: bool, authed: bool) -> bool {
+        match vis {
+            Visibility::Public => true,
+            Visibility::Restricted | Visibility::Private => authed && (is_owner || is_audience),
+        }
+    }
+
+    /// Row-for-row equivalence of the SQL disclosure predicate to the §4.5
+    /// oracle across the full matrix, for BOTH `search` and `list_contexts`,
+    /// plus the honest `total_estimate`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sql_disclosure_matches_rfc_4_5_across_the_matrix() {
+        let (store, _tmp) = store().await;
+        let dom = "design01-matrix";
+        let tenant = "design01-matrix-tenant";
+        let reader = agent(READER);
+
+        // One context per visibility, owned by OWNER, audience = [READER]
+        // for the audience-bearing levels (restricted requires non-empty
+        // audience; private lists it too, but §4.5 makes it search-invisible).
+        let contexts = [
+            (
+                Visibility::Public,
+                publish(&store, "pub", Visibility::Public, &[], dom, tenant).await,
+            ),
+            (
+                Visibility::Restricted,
+                publish(
+                    &store,
+                    "restr",
+                    Visibility::Restricted,
+                    std::slice::from_ref(&reader),
+                    dom,
+                    tenant,
+                )
+                .await,
+            ),
+            (
+                Visibility::Private,
+                publish(
+                    &store,
+                    "priv",
+                    Visibility::Private,
+                    std::slice::from_ref(&reader),
+                    dom,
+                    tenant,
+                )
+                .await,
+            ),
+        ];
+
+        let roles: [(&str, Option<AgentDid>); 4] = [
+            ("anonymous", None),
+            ("owner", Some(agent(OWNER))),
+            ("audience-reader", Some(agent(READER))),
+            ("unauthorized-other", Some(agent(OTHER))),
+        ];
+
+        for (role, requester) in &roles {
+            let authed = requester.is_some();
+            let is_owner = requester.as_ref() == Some(&agent(OWNER));
+            let is_reader = requester.as_ref() == Some(&agent(READER));
+
+            // ── search × anonymous_public_reads ──
+            for anon_reads in [true, false] {
+                let params = SearchParams {
+                    domain: Some(dom.to_string()),
+                    ..Default::default()
+                };
+                let resp = store
+                    .search(&params, requester.as_ref(), anon_reads)
+                    .expect("search ok");
+                let got: HashSet<&str> = resp.matches.iter().map(|m| m.ctx_id.as_str()).collect();
+
+                let mut want: HashSet<&str> = HashSet::new();
+                for (vis, id) in &contexts {
+                    let is_aud = is_reader && !matches!(vis, Visibility::Public);
+                    if oracle_search(vis.clone(), is_owner, is_aud, authed, anon_reads) {
+                        want.insert(id.as_str());
+                    }
+                }
+                assert_eq!(
+                    got, want,
+                    "SEARCH disclosure diverges from §4.5: role={role} anon_reads={anon_reads}"
+                );
+                // All rows are active with no tag/derived_from refinement, so
+                // the §4.5-scoped pre-page total is exact here.
+                assert_eq!(
+                    resp.total_estimate,
+                    Some(want.len() as u64),
+                    "total_estimate must equal the §4.5-visible count: role={role} anon_reads={anon_reads}"
+                );
+            }
+
+            // ── list_contexts (retrieval-style; no anon_reads knob) ──
+            let page = store
+                .list_contexts(50, None, requester.as_ref(), Some(tenant))
+                .await
+                .expect("list ok");
+            let got: HashSet<&str> = page.items.iter().map(|c| c.body.ctx_id.as_str()).collect();
+            let mut want: HashSet<&str> = HashSet::new();
+            for (vis, id) in &contexts {
+                let is_aud = is_reader && !matches!(vis, Visibility::Public);
+                if oracle_list(vis.clone(), is_owner, is_aud, authed) {
+                    want.insert(id.as_str());
+                }
+            }
+            assert_eq!(got, want, "LIST disclosure diverges from §4.5: role={role}");
+        }
+    }
+
+    /// Pages fill to `limit` even when the ordered scan interleaves rows the
+    /// requester may not see, and `total_estimate` is the honest count of
+    /// visible rows — not the page size. Pre-DESIGN-01 the in-Rust filter
+    /// dropped the private rows AFTER the page was cut, yielding short pages
+    /// and a `None` total.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pages_are_full_and_total_is_honest_under_mixed_visibility() {
+        let (store, _tmp) = store().await;
+        let dom = "design01-fullpage";
+        let tenant = "design01-fullpage-tenant";
+
+        // 6 public interleaved with 6 private (owned by OWNER, no audience),
+        // published in alternating order so an unfiltered scan would hit the
+        // private rows between the public ones.
+        let mut public_ids: HashSet<String> = HashSet::new();
+        for i in 0..12 {
+            if i % 2 == 0 {
+                let id = publish(
+                    &store,
+                    &format!("pub-{i}"),
+                    Visibility::Public,
+                    &[],
+                    dom,
+                    tenant,
+                )
+                .await;
+                public_ids.insert(id);
+            } else {
+                publish(
+                    &store,
+                    &format!("priv-{i}"),
+                    Visibility::Private,
+                    &[],
+                    dom,
+                    tenant,
+                )
+                .await;
+            }
+        }
+
+        // Anonymous caller with anonymous_public_reads: only the 6 public
+        // rows are disclosable. Ask for a page of 4.
+        let params = SearchParams {
+            domain: Some(dom.to_string()),
+            limit: Some(4),
+            ..Default::default()
+        };
+        let page1 = store.search(&params, None, true).expect("search ok");
+        assert_eq!(
+            page1.matches.len(),
+            4,
+            "page must fill to `limit` from the visible set, not be trimmed by a post-filter"
+        );
+        assert_eq!(
+            page1.total_estimate,
+            Some(6),
+            "total_estimate is the §4.5-visible count (6 public), independent of page size"
+        );
+        assert!(page1.next_cursor.is_some(), "more visible rows remain");
+
+        // Every returned row is one of the public contexts (no private leak).
+        for m in &page1.matches {
+            assert!(
+                public_ids.contains(m.ctx_id.as_str()),
+                "a private row leaked into an anonymous search result"
+            );
+        }
+
+        // Drain the rest and confirm exactly the 6 public rows surface.
+        let mut seen: HashSet<String> = page1
+            .matches
+            .iter()
+            .map(|m| m.ctx_id.as_str().to_string())
+            .collect();
+        let mut cursor = page1.next_cursor;
+        while let Some(c) = cursor {
+            let params = SearchParams {
+                domain: Some(dom.to_string()),
+                limit: Some(4),
+                cursor: Some(c),
+                ..Default::default()
+            };
+            let page = store.search(&params, None, true).expect("search ok");
+            for m in &page.matches {
+                seen.insert(m.ctx_id.as_str().to_string());
+            }
+            cursor = page.next_cursor;
+        }
+        assert_eq!(
+            seen, public_ids,
+            "pagination drains exactly the visible public set"
+        );
+    }
+}

@@ -148,6 +148,7 @@ impl ExtendedRegistryStore for PgStore {
     ) -> Result<Page<FullContext>, AcdpError> {
         let limit = limit.clamp(1, 200) as i64;
         let anchor = cursor.map(decode_cursor).transpose()?.flatten();
+        let requester_s: Option<String> = requester.map(|r| r.as_str().to_string());
 
         // BUG-03: bind the LIMIT instead of concatenating it. The value
         // is range-clamped above so there is no injection risk today, but
@@ -156,7 +157,17 @@ impl ExtendedRegistryStore for PgStore {
         let mut q = String::from(
             "SELECT body_json, status, registry_receipt, retracted FROM contexts WHERE 1=1",
         );
-        let mut next_pos = 1usize;
+        // DESIGN-01: push the RFC-ACDP-0008 §4.5 retrieval-style disclosure
+        // predicate (`visible_to`) into SQL so restricted/private bodies the
+        // requester may not see are never read or decoded, and the page fills
+        // to `limit` instead of being trimmed by a post-query retain. $1 is
+        // the requester DID (SQL NULL for an anonymous caller); Postgres
+        // resolves the repeated $1 to one bound value.
+        q.push_str(
+            " AND (visibility = 'public' OR ($1::text IS NOT NULL AND (agent_id = $1::text \
+             OR (body_json -> 'audience') @> to_jsonb($1::text))))",
+        );
+        let mut next_pos = 2usize;
         // Plan §7: SQL-level tenant filter — see sqlite/list_contexts
         // and store/lib.rs for rationale. The composite
         // `idx_ctx_tenant_created` index from migration 006_tenant_id
@@ -179,6 +190,7 @@ impl ExtendedRegistryStore for PgStore {
         ));
 
         let mut query = sqlx::query(&q);
+        query = query.bind(requester_s); // $1 (disclosure)
         if let Some(t) = tenant {
             query = query.bind(t);
         }
@@ -197,7 +209,10 @@ impl ExtendedRegistryStore for PgStore {
             rows,
             limit as usize,
             |r| row_to_context(&r),
-            |ctx| visible_to(ctx, requester),
+            // DESIGN-01: §4.5 disclosure is enforced in SQL above, so the
+            // raw scanned rows are already the exact visible set; no
+            // post-query visibility retain is needed.
+            |_ctx| true,
             |ctx| {
                 encode_cursor(
                     ctx.body.created_at.timestamp_millis(),
@@ -361,23 +376,6 @@ fn log_row_to_record(r: &PgRow) -> Result<LogEntryRecord, AcdpError> {
         leaf_hash: r.try_get("leaf_hash").map_err(map_sqlx_err)?,
         leaf_json: r.try_get("leaf_json").map_err(map_sqlx_err)?,
     })
-}
-
-fn visible_to(ctx: &FullContext, requester: Option<&AgentDid>) -> bool {
-    match ctx.body.visibility {
-        Visibility::Public => true,
-        Visibility::Restricted | Visibility::Private => match requester {
-            None => false,
-            Some(r) => {
-                r == &ctx.body.agent_id
-                    || ctx
-                        .body
-                        .audience
-                        .as_deref()
-                        .is_some_and(|a| a.iter().any(|d| d == r))
-            }
-        },
-    }
 }
 
 // ── RegistryStore ────────────────────────────────────────────────────────────
@@ -1061,8 +1059,15 @@ impl RegistryStore for PgStore {
             let dp_end_before = parse_opt_rfc3339(&params.data_period_end_before)?;
 
             // Parameterized query: every value is bound with $N placeholders.
-            let mut sql =
-                String::from("SELECT body_json, status, retracted FROM contexts WHERE 1=1");
+            // DESIGN-01: the §4.5 search disclosure predicate is pushed into
+            // SQL (below) so restricted/private bodies the requester may not
+            // see are never read or decoded, pages fill to `limit`, and
+            // `COUNT(*) OVER ()` yields an honest, §4.5-correct pre-page total.
+            let requester_s: Option<String> = requester.map(|r| r.as_str().to_string());
+            let mut sql = String::from(
+                "SELECT body_json, status, retracted, COUNT(*) OVER () AS total_rows \
+                 FROM contexts WHERE 1=1",
+            );
             let mut idx = 1usize;
             let mut next = || {
                 let i = idx;
@@ -1087,10 +1092,32 @@ impl RegistryStore for PgStore {
             #[derive(Debug)]
             enum Bind {
                 Str(String),
+                OptStr(Option<String>),
+                Bool(bool),
                 Ts(DateTime<Utc>),
                 TextArray(Vec<String>),
             }
             let mut binds: Vec<Bind> = Vec::new();
+
+            // DESIGN-01: §4.5 search disclosure, arm-for-arm with the
+            // visibility matrix. $req = requester DID (nullable), $anon =
+            // anonymous_public_reads. Both are bound FIRST (so they are $1/$2)
+            // and $req is referenced multiple times; Postgres resolves a
+            // repeated $N to the one bound value.
+            let req_ph = next();
+            let anon_ph = next();
+            binds.push(Bind::OptStr(requester_s));
+            binds.push(Bind::Bool(anonymous_public_reads));
+            sql.push_str(&format!(
+                " AND ((visibility = 'public' AND (${r}::text IS NOT NULL OR ${a}::bool)) \
+                 OR (visibility = 'restricted' AND ${r}::text IS NOT NULL \
+                     AND (agent_id = ${r}::text \
+                          OR (body_json -> 'audience') @> to_jsonb(${r}::text))) \
+                 OR (visibility = 'private' AND ${r}::text IS NOT NULL \
+                     AND agent_id = ${r}::text))",
+                r = req_ph,
+                a = anon_ph,
+            ));
 
             if let Some(q) = &params.q {
                 sql.push_str(&format!(
@@ -1186,12 +1213,30 @@ impl RegistryStore for PgStore {
             for b in &binds {
                 query = match b {
                     Bind::Str(s) => query.bind(s),
+                    Bind::OptStr(s) => query.bind(s),
+                    Bind::Bool(v) => query.bind(*v),
                     Bind::Ts(t) => query.bind(*t),
                     Bind::TextArray(v) => query.bind(v),
                 };
             }
             query = query.bind((limit as i64) + 1);
             let rows = query.fetch_all(&self.pool).await.map_err(map_sqlx_err)?;
+
+            // DESIGN-01: `COUNT(*) OVER ()` rides the same scan, so the total
+            // is the count of §4.5-visible rows matching the SQL filters
+            // (before the LIMIT). It is an ESTIMATE: the post-SQL status /
+            // tags / derived_from refinements below are not reflected, so it
+            // is an upper bound on the returned matches. Crucially, the §4.5
+            // visibility dimension IS in SQL, so the total never counts a
+            // restricted/private context the requester may not see.
+            let total_estimate = match rows.first() {
+                Some(r) => Some(
+                    r.try_get::<i64, _>("total_rows")
+                        .map_err(map_sqlx_err)?
+                        .max(0) as u64,
+                ),
+                None => Some(0),
+            };
 
             let now = Utc::now();
             let want_status = params.status.as_deref().unwrap_or("active");
@@ -1226,8 +1271,11 @@ impl RegistryStore for PgStore {
                     Ok(ctx)
                 },
                 |ctx| {
-                    can_surface_in_search(ctx, requester, anonymous_public_reads)
-                        && ctx.registry_state.status.as_str() == want_status
+                    // DESIGN-01: §4.5 search disclosure is enforced in SQL
+                    // above; the raw scanned rows are already disclosure-
+                    // scoped. Remaining post-SQL refinements: status and
+                    // derived_from (tags are already an SQL `@>` filter).
+                    ctx.registry_state.status.as_str() == want_status
                         && params
                             .derived_from
                             .as_ref()
@@ -1258,11 +1306,11 @@ impl RegistryStore for PgStore {
                 })
                 .collect();
 
-            // DESIGN-05: dropped the page-local count masquerading as a
-            // registry-wide total. See SqliteStore::search for context.
+            // DESIGN-01: total_estimate is now the pre-page count of
+            // §4.5-visible rows (from `COUNT(*) OVER ()`), not the page size.
             Ok(SearchResponse {
                 matches: projected,
-                total_estimate: None,
+                total_estimate,
                 next_cursor,
             })
         })
@@ -1536,28 +1584,6 @@ fn project_context(mut ctx: FullContext, now: DateTime<Utc>) -> FullContext {
     ctx.registry_state.status =
         project_status_inline(&ctx.registry_state.status, ctx.body.expires_at, now);
     ctx
-}
-
-fn can_surface_in_search(
-    ctx: &FullContext,
-    requester: Option<&AgentDid>,
-    anonymous_public_reads: bool,
-) -> bool {
-    match ctx.body.visibility {
-        Visibility::Public => anonymous_public_reads || requester.is_some(),
-        Visibility::Restricted => match requester {
-            None => false,
-            Some(r) => {
-                r == &ctx.body.agent_id
-                    || ctx
-                        .body
-                        .audience
-                        .as_deref()
-                        .is_some_and(|a| a.iter().any(|d| d == r))
-            }
-        },
-        Visibility::Private => requester == Some(&ctx.body.agent_id),
-    }
 }
 
 fn parse_opt_rfc3339(s: &Option<String>) -> Result<Option<DateTime<Utc>>, AcdpError> {
