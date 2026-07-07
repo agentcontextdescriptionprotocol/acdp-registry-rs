@@ -289,6 +289,22 @@ pub(crate) fn reconcile_tenant_sources(
 /// `content_hash`, so this endpoint does NOT require a bearer token.
 /// `Idempotency-Key` is honored when the registry advertises support.
 pub async fn publish<S: ExtendedRegistryStore + 'static>(
+    state: State<Arc<AppState<S>>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<PublishResponse>, RegistryError> {
+    // FEAT-10: record the failure outcome centrally so every `?` early return
+    // is captured by its wire code. Success outcomes (`inserted` /
+    // `idempotent_replay`) plus the receipt / log-leaf counters are recorded
+    // inline on the accept path inside `publish_inner`.
+    let result = publish_inner(state, headers, body).await;
+    if let Err(e) = &result {
+        crate::metrics::record_publish(e.wire_code());
+    }
+    result
+}
+
+async fn publish_inner<S: ExtendedRegistryStore + 'static>(
     State(state): State<Arc<AppState<S>>>,
     headers: HeaderMap,
     body: Bytes,
@@ -325,6 +341,7 @@ pub async fn publish<S: ExtendedRegistryStore + 'static>(
     // `agent_id`, so one noisy producer can't starve others.
     if let Some(limiter) = &state.rate_limiter {
         if let Err(retry_after_seconds) = limiter.check(req.agent_id.as_str()) {
+            crate::metrics::record_rate_limit_rejection("publish_per_agent");
             return Err(RegistryError::RateLimited {
                 retry_after_seconds,
             });
@@ -382,6 +399,7 @@ pub async fn publish<S: ExtendedRegistryStore + 'static>(
             if let Some(rec) = prior {
                 if rec.expires_at > Utc::now() {
                     if rec.content_hash.0 == req.content_hash.0 {
+                        crate::metrics::record_publish("idempotent_replay");
                         return Ok(Json(rec.response));
                     } else {
                         return Err(RegistryError::Acdp(
@@ -513,6 +531,21 @@ pub async fn publish<S: ExtendedRegistryStore + 'static>(
             },
             publish_tenant.clone(),
         );
+    }
+
+    // FEAT-10: accepted publish. `record_publish("inserted")` labels the
+    // outcome; a minted receipt (RFC-ACDP-0010) and an appended transparency
+    // -log leaf (RFC-ACDP-0012, one per accepted publish when the log is
+    // enabled) get their own counters. Note: a production-path idempotent
+    // replay also lands here and is counted as `inserted` — the store dedupes
+    // internally and does not surface the replay flag to the handler; only the
+    // playground path (above) distinguishes replays.
+    crate::metrics::record_publish("inserted");
+    if response.registry_receipt.is_some() {
+        crate::metrics::record_receipt_minted();
+    }
+    if state.log.is_some() {
+        crate::metrics::record_log_leaf();
     }
 
     Ok(Json(response))
@@ -925,14 +958,29 @@ pub async fn retract<S: ExtendedRegistryStore + 'static>(
     Path(ctx_id): Path<String>,
     body: Bytes,
 ) -> Result<Json<acdp::types::body::FullContext>, RegistryError> {
-    lifecycle_transition(
+    let r = lifecycle_transition(
         state,
         headers,
         ctx_id,
         body,
         acdp::types::lifecycle::LifecycleEventType::Retracted,
     )
-    .await
+    .await;
+    crate::metrics::record_lifecycle_event(
+        "retract",
+        if r.is_ok() {
+            "accepted"
+        } else {
+            r.as_ref().err().map(lifecycle_outcome).unwrap_or("error")
+        },
+    );
+    r
+}
+
+/// Outcome label for a lifecycle event metric — the wire code so a rejected
+/// transition (e.g. `invalid_lifecycle_transition`) is distinguishable.
+fn lifecycle_outcome(e: &RegistryError) -> &'static str {
+    e.wire_code()
 }
 
 /// `POST /contexts/{ctx_id}/republish` (RFC-ACDP-0013 §6).
@@ -942,14 +990,23 @@ pub async fn republish<S: ExtendedRegistryStore + 'static>(
     Path(ctx_id): Path<String>,
     body: Bytes,
 ) -> Result<Json<acdp::types::body::FullContext>, RegistryError> {
-    lifecycle_transition(
+    let r = lifecycle_transition(
         state,
         headers,
         ctx_id,
         body,
         acdp::types::lifecycle::LifecycleEventType::Republished,
     )
-    .await
+    .await;
+    crate::metrics::record_lifecycle_event(
+        "republish",
+        if r.is_ok() {
+            "accepted"
+        } else {
+            r.as_ref().err().map(lifecycle_outcome).unwrap_or("error")
+        },
+    );
+    r
 }
 
 /// Shared RFC-ACDP-0013 §6 pipeline behind both lifecycle endpoints.
@@ -1017,6 +1074,7 @@ async fn lifecycle_transition<S: ExtendedRegistryStore + 'static>(
     // 4. Per-agent write rate limit, keyed by the event actor.
     if let Some(limiter) = &state.rate_limiter {
         if let Err(retry_after_seconds) = limiter.check(event.actor.as_str()) {
+            crate::metrics::record_rate_limit_rejection("lifecycle_per_agent");
             return Err(RegistryError::RateLimited {
                 retry_after_seconds,
             });

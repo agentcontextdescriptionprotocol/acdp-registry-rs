@@ -38,5 +38,19 @@ max_payload_bytes           = 1048576
 max_embedded_bytes          = 65536
 idempotency_key_ttl_seconds = 86400
 
+# FEAT-06: per-IP + process-global rate limiting on /auth/*. On by default.
+# Behind a reverse proxy, set trusted_proxies to the proxy CIDR so the client
+# IP is read from X-Forwarded-For (never trusted otherwise). See CONFIGURATION.md.
+[rate_limit]
+enabled           = true
+per_ip_per_minute = 60
+global_per_minute = 6000
+trusted_proxies   = []
+
+# FEAT-10: Prometheus /metrics. Off by default; enable to expose request +
+# domain metrics for scraping. Optionally gate with a bearer_token.
+[metrics]
+enabled = false
+
 [playground]
 enabled = false

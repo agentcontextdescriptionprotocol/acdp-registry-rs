@@ -9,7 +9,9 @@ use acdp_registry_store::ExtendedRegistryStore;
 use acdp_registry_types::{PlaygroundConfig, RegistryConfig};
 use acdp_registry_webhook::WebhookEmitter;
 
-use crate::rate_limit::AgentRateLimiter;
+use metrics_exporter_prometheus::PrometheusHandle;
+
+use crate::rate_limit::{AgentRateLimiter, TrustedProxies};
 
 /// Public alias — the value axum actually carries is `Arc<AppState<S>>`.
 pub type AppState<S> = AppStateInner<S>;
@@ -41,6 +43,20 @@ pub struct AppStateInner<S: ExtendedRegistryStore> {
     /// writes and grow the nonce store. `None` when
     /// `limits.challenge_rate_per_minute == 0` (disabled).
     pub challenge_rate_limiter: Option<Arc<AgentRateLimiter>>,
+    /// FEAT-06: per-IP + process-global limiter applied as middleware over the
+    /// whole `/auth/*` subrouter, keyed by the resolved client IP. Complements
+    /// the per-agent `challenge_rate_limiter` — an unauthenticated attacker
+    /// controls `agent_id` and can rotate it, but not their source IP (short
+    /// of a botnet, which the global ceiling then bounds). `None` when
+    /// `[rate_limit] enabled = false` or both budgets are `0`.
+    pub auth_ip_limiter: Option<Arc<AgentRateLimiter>>,
+    /// FEAT-06: parsed `[rate_limit] trusted_proxies` CIDRs. Empty (the
+    /// default) means `X-Forwarded-For` is never trusted and the TCP socket
+    /// peer is always used as the client IP.
+    pub trusted_proxies: TrustedProxies,
+    /// FEAT-10: process-global Prometheus recorder handle. `Some` only when
+    /// `[metrics] enabled` — the `/metrics` route is mounted iff this is set.
+    pub metrics: Option<PrometheusHandle>,
     /// The registry's own `did:web` DID document, served at
     /// `GET /.well-known/did.json` so consumers can resolve the receipt
     /// verification key (RFC-ACDP-0010). Precomputed at startup from
@@ -102,6 +118,35 @@ impl<S: ExtendedRegistryStore> AppStateInner<S> {
             .ok()
             .flatten()
             .map(Arc::new);
+        // FEAT-06: per-IP + global `/auth/*` limiter. Reuses the fixed-window
+        // `AgentRateLimiter`, keyed by client IP. A `0` global budget maps to
+        // the `u32::MAX` "disabled" sentinel; the per-IP check is skipped by
+        // the middleware when `per_ip_per_minute == 0`.
+        let rl = &config.rate_limit;
+        let auth_ip_limiter =
+            if rl.enabled && (rl.per_ip_per_minute > 0 || rl.global_per_minute > 0) {
+                let global = if rl.global_per_minute == 0 {
+                    u32::MAX
+                } else {
+                    rl.global_per_minute
+                };
+                Some(Arc::new(AgentRateLimiter::with_global_ceiling(
+                    rl.per_ip_per_minute,
+                    global,
+                )))
+            } else {
+                None
+            };
+        let trusted_proxies = TrustedProxies::parse_lossy(&rl.trusted_proxies);
+        // FEAT-10: install the process-global recorder when metrics are
+        // enabled. Idempotent — many in-process test harnesses share one.
+        let metrics = if config.metrics.enabled {
+            Some(crate::metrics::install_recorder(
+                &config.metrics.duration_buckets,
+            ))
+        } else {
+            None
+        };
         Self {
             server,
             auth,
@@ -111,6 +156,9 @@ impl<S: ExtendedRegistryStore> AppStateInner<S> {
             playground,
             rate_limiter,
             challenge_rate_limiter,
+            auth_ip_limiter,
+            trusted_proxies,
+            metrics,
             registry_did_document,
             log,
         }

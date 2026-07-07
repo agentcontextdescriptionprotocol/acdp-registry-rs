@@ -59,6 +59,13 @@ The binary validates config before serving and refuses to boot on a misconfig
   (RFC-ACDP-0015 §6.1: there are no checkpoints to witness without a log);
   each `did` must be a `did:web` DID and each `url` must pass the SSRF
   policy (HTTPS, non-private host).
+- **Rate limiting (FEAT-06)** — every `rate_limit.trusted_proxies` entry must
+  be a valid CIDR (or bare IP), so a typo fails the boot rather than silently
+  disabling XFF trust. A non-empty `trusted_proxies` with `rate_limit.enabled
+  = false` is refused (XFF would be parsed for nothing).
+- **Metrics (FEAT-10)** — when `metrics.enabled`, `duration_buckets` must be
+  non-empty, positive, finite, and strictly increasing (Prometheus histogram
+  bounds).
 
 ## Reference
 
@@ -168,6 +175,55 @@ See [WEBHOOKS.md](WEBHOOKS.md).
 > These are per-process in-memory token buckets — see
 > [OPERATIONS.md · Rate limiting](OPERATIONS.md#rate-limiting) for the
 > multi-replica caveat.
+
+### `[rate_limit]` *(FEAT-06)*
+
+Per-IP and process-global rate limiting on the `/auth/*` endpoints (token
+issuance / refresh / revoke), applied as middleware over the whole `/auth/*`
+subrouter — on top of the per-agent `[limits]` budgets. The `[limits]` buckets
+key on the caller-supplied `agent_id`, which an unauthenticated attacker
+controls and can rotate to defeat the per-key limit; these two bounds are
+attacker-independent.
+
+| Key | Type | Default | Notes |
+|-----|------|---------|-------|
+| `enabled` | bool | `true` | Master switch. On by default — `/auth/*` is the most attacker-controllable surface. |
+| `per_ip_per_minute` | u32 | `60` | Per-resolved-client-IP cap on `/auth/*`; `0` disables the per-IP bound. |
+| `global_per_minute` | u32 | `6000` | Whole-process ceiling across all IPs; `0` disables it. Bounds a source-IP-rotating flood. |
+| `trusted_proxies` | list\<CIDR\> | `[]` | Reverse-proxy CIDRs whose `X-Forwarded-For` is trusted. Empty = never trust XFF. |
+
+**Client-IP resolution & the trusted-proxy decision (security).** The client
+IP defaults to the TCP socket peer. `X-Forwarded-For` is caller-supplied and
+is **never** trusted unless the socket peer is itself in one of the
+`trusted_proxies` ranges — otherwise any client could spoof its source IP to
+evade the per-IP budget or frame another address. When the peer *is* a trusted
+proxy, the real client is taken from the rightmost `X-Forwarded-For` entry that
+is not itself a trusted proxy (walking a chain of trusted hops from the right).
+List **only** proxies you operate; a wrong entry is a spoofing hole. CIDRs are
+validated at startup — a malformed entry fails the boot rather than silently
+disabling XFF trust.
+
+> Same per-process, in-memory caveat as `[limits]`. Behind a load balancer with
+> `trusted_proxies` set, each replica limits per real client IP; the
+> `global_per_minute` ceiling is per replica. Requests are admitted or rejected
+> *before* any DID resolution, so the SSRF/DNS path never runs for a throttled
+> request.
+
+### `[metrics]` *(FEAT-10)*
+
+Prometheus `/metrics` endpoint (text exposition, `version=0.0.4`). Off by
+default. When enabled, `GET /metrics` is mounted **outside** the ACDP auth
+pipeline and the rate limiter so a scraper reaches it unimpeded, and a
+process-global recorder captures HTTP request metrics plus domain counters.
+
+| Key | Type | Default | Notes |
+|-----|------|---------|-------|
+| `enabled` | bool | `false` | Mount `/metrics` and start recording. |
+| `bearer_token` | string | `""` | When set, `/metrics` requires `Authorization: Bearer <token>`. Empty = open. |
+| `duration_buckets` | list\<f64\> | web-latency ladder | Buckets (seconds) for the request-latency histogram; must be positive and strictly increasing. |
+
+See [HTTP-API.md · `GET /metrics`](HTTP-API.md#get-metrics-feat-10) for the
+exposed metric names.
 
 ### `[playground]`
 

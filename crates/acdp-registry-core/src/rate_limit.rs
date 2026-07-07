@@ -8,6 +8,7 @@
 //! minimization principle.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -108,6 +109,164 @@ impl AgentRateLimiter {
         bucket.count += 1;
         Ok(())
     }
+}
+
+/// A single CIDR block, used to recognise trusted reverse proxies (FEAT-06).
+///
+/// Stored as the network base address plus a prefix length so matching is a
+/// masked bitwise compare — no allocation, no external `ipnet` dependency
+/// (matching the workspace's dep-minimization principle).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Cidr {
+    base: IpAddr,
+    prefix_len: u8,
+}
+
+impl Cidr {
+    /// Parse `"10.0.0.0/8"` / `"fc00::/7"`. A bare IP (`"1.2.3.4"`) is treated
+    /// as a `/32` (v4) or `/128` (v6) host route.
+    fn parse(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        let (addr_part, prefix_part) = match s.split_once('/') {
+            Some((a, p)) => (a, Some(p)),
+            None => (s, None),
+        };
+        let base: IpAddr = addr_part
+            .parse()
+            .map_err(|_| format!("invalid IP in CIDR '{s}'"))?;
+        let max = if base.is_ipv4() { 32 } else { 128 };
+        let prefix_len = match prefix_part {
+            Some(p) => p
+                .parse::<u8>()
+                .map_err(|_| format!("invalid prefix in CIDR '{s}'"))?,
+            None => max,
+        };
+        if prefix_len > max {
+            return Err(format!("prefix /{prefix_len} out of range for CIDR '{s}'"));
+        }
+        Ok(Self { base, prefix_len })
+    }
+
+    /// Does `ip` fall within this block? IPv4-mapped IPv6 peers are compared
+    /// after canonicalisation (done by the caller), so a v4 CIDR matches a
+    /// `::ffff:a.b.c.d` peer.
+    fn contains(&self, ip: IpAddr) -> bool {
+        match (self.base, ip) {
+            (IpAddr::V4(b), IpAddr::V4(o)) => masked_eq(&b.octets(), &o.octets(), self.prefix_len),
+            (IpAddr::V6(b), IpAddr::V6(o)) => masked_eq(&b.octets(), &o.octets(), self.prefix_len),
+            _ => false,
+        }
+    }
+}
+
+/// Compare the top `prefix_len` bits of two equal-length octet arrays.
+fn masked_eq(a: &[u8], b: &[u8], prefix_len: u8) -> bool {
+    let mut bits = prefix_len as usize;
+    for (x, y) in a.iter().zip(b.iter()) {
+        if bits == 0 {
+            break;
+        }
+        let take = bits.min(8);
+        let mask = if take == 8 {
+            0xFFu8
+        } else {
+            // top `take` bits set
+            !(0xFFu8 >> take)
+        };
+        if (x & mask) != (y & mask) {
+            return false;
+        }
+        bits -= take;
+    }
+    true
+}
+
+/// Operator-configured set of reverse-proxy CIDRs whose `X-Forwarded-For`
+/// header this registry is willing to trust (FEAT-06). Empty = trust none.
+#[derive(Debug, Clone, Default)]
+pub struct TrustedProxies {
+    cidrs: Vec<Cidr>,
+}
+
+impl TrustedProxies {
+    /// Parse a list of CIDR strings, collecting every parse error so the
+    /// caller (startup validation) can reject a misconfiguration up front.
+    pub fn parse(entries: &[String]) -> Result<Self, String> {
+        let mut cidrs = Vec::with_capacity(entries.len());
+        for e in entries {
+            cidrs.push(Cidr::parse(e)?);
+        }
+        Ok(Self { cidrs })
+    }
+
+    /// Parse, silently dropping (and logging) invalid entries. Used on the
+    /// hot construction path where startup validation has already run.
+    pub fn parse_lossy(entries: &[String]) -> Self {
+        let cidrs = entries
+            .iter()
+            .filter_map(|e| match Cidr::parse(e) {
+                Ok(c) => Some(c),
+                Err(err) => {
+                    tracing::warn!(entry = %e, error = %err, "ignoring invalid trusted_proxy CIDR");
+                    None
+                }
+            })
+            .collect();
+        Self { cidrs }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cidrs.is_empty()
+    }
+
+    fn contains(&self, ip: IpAddr) -> bool {
+        self.cidrs.iter().any(|c| c.contains(ip))
+    }
+}
+
+/// Resolve the effective client IP for rate-limiting (FEAT-06).
+///
+/// `peer` is the TCP socket peer address (already IPv4-canonicalised by the
+/// caller). `xff` is the raw `X-Forwarded-For` header value, if present.
+///
+/// SECURITY: `X-Forwarded-For` is caller-controlled and is honoured ONLY when
+/// `peer` is itself a trusted proxy. In that case the real client is the
+/// rightmost XFF entry that is not itself a trusted proxy — i.e. we walk the
+/// forwarded chain from the right (nearest hop first), skipping trusted
+/// proxies, and take the first address a trusted proxy actually received the
+/// request from. If every XFF entry is a trusted proxy (or XFF is
+/// absent/garbage), we fall back to `peer`. When `trusted` is empty, XFF is
+/// never consulted.
+pub fn client_ip(peer: IpAddr, xff: Option<&str>, trusted: &TrustedProxies) -> IpAddr {
+    if trusted.is_empty() || !trusted.contains(peer) {
+        return peer;
+    }
+    let Some(xff) = xff else {
+        return peer;
+    };
+    // Right-to-left: the last entry is the address the trusted peer saw.
+    for hop in xff.rsplit(',') {
+        let hop = hop.trim();
+        // XFF entries may carry a port (rare) — strip anything after the IP.
+        let candidate = hop.parse::<IpAddr>().ok().map(canonical_ip).or_else(|| {
+            hop.parse::<std::net::SocketAddr>()
+                .ok()
+                .map(|s| canonical_ip(s.ip()))
+        });
+        match candidate {
+            Some(ip) if trusted.contains(ip) => continue, // another trusted hop
+            Some(ip) => return ip,                        // first untrusted → the client
+            None => return peer,                          // garbage → don't trust the chain
+        }
+    }
+    peer
+}
+
+/// Canonicalise an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) to its IPv4
+/// form so CIDR matching and bucket keys are stable regardless of the
+/// listener's dual-stack representation.
+pub fn canonical_ip(ip: IpAddr) -> IpAddr {
+    ip.to_canonical()
 }
 
 #[cfg(test)]
@@ -226,6 +385,101 @@ mod tests {
         assert!(rl.check_at("newcomer", later).is_ok());
         let len = rl.buckets.lock().unwrap().len();
         assert_eq!(len, 1, "stale buckets must be pruned, got {len} entries");
+    }
+
+    // ── CIDR + client-IP resolution (FEAT-06) ───────────────────────
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn cidr_matches_v4_and_v6_ranges() {
+        let c = Cidr::parse("10.0.0.0/8").unwrap();
+        assert!(c.contains(ip("10.1.2.3")));
+        assert!(c.contains(ip("10.255.255.255")));
+        assert!(!c.contains(ip("11.0.0.1")));
+        assert!(!c.contains(ip("192.168.1.1")));
+
+        let c = Cidr::parse("192.168.1.0/24").unwrap();
+        assert!(c.contains(ip("192.168.1.42")));
+        assert!(!c.contains(ip("192.168.2.42")));
+
+        let c = Cidr::parse("fc00::/7").unwrap();
+        assert!(c.contains(ip("fd00::1")));
+        assert!(!c.contains(ip("fe80::1")));
+
+        // bare host route
+        let c = Cidr::parse("203.0.113.7").unwrap();
+        assert!(c.contains(ip("203.0.113.7")));
+        assert!(!c.contains(ip("203.0.113.8")));
+    }
+
+    #[test]
+    fn cidr_rejects_garbage_and_out_of_range() {
+        assert!(Cidr::parse("not-an-ip/8").is_err());
+        assert!(Cidr::parse("10.0.0.0/33").is_err());
+        assert!(Cidr::parse("::/129").is_err());
+        assert!(Cidr::parse("10.0.0.0/x").is_err());
+    }
+
+    #[test]
+    fn client_ip_ignores_xff_when_no_trusted_proxies() {
+        // Empty trust set: XFF is never consulted, socket peer wins.
+        let trusted = TrustedProxies::default();
+        let got = client_ip(ip("203.0.113.9"), Some("1.1.1.1"), &trusted);
+        assert_eq!(got, ip("203.0.113.9"));
+    }
+
+    #[test]
+    fn client_ip_ignores_xff_from_untrusted_peer() {
+        // Peer is NOT a trusted proxy, so its XFF is a spoof attempt — ignore.
+        let trusted = TrustedProxies::parse(&["10.0.0.0/8".into()]).unwrap();
+        let got = client_ip(ip("203.0.113.9"), Some("1.1.1.1"), &trusted);
+        assert_eq!(got, ip("203.0.113.9"));
+    }
+
+    #[test]
+    fn client_ip_honors_xff_from_trusted_peer() {
+        let trusted = TrustedProxies::parse(&["10.0.0.0/8".into()]).unwrap();
+        // Trusted proxy at 10.0.0.5 forwarded a request from the real client.
+        let got = client_ip(ip("10.0.0.5"), Some("198.51.100.7"), &trusted);
+        assert_eq!(got, ip("198.51.100.7"));
+    }
+
+    #[test]
+    fn client_ip_walks_chain_of_trusted_proxies() {
+        // client → proxy(10.0.0.9) → proxy(10.0.0.5=peer). XFF lists the
+        // client then the first proxy; we skip the trusted hop and return
+        // the client.
+        let trusted = TrustedProxies::parse(&["10.0.0.0/8".into()]).unwrap();
+        let got = client_ip(ip("10.0.0.5"), Some("198.51.100.7, 10.0.0.9"), &trusted);
+        assert_eq!(got, ip("198.51.100.7"));
+    }
+
+    #[test]
+    fn client_ip_falls_back_when_all_hops_trusted() {
+        let trusted = TrustedProxies::parse(&["10.0.0.0/8".into()]).unwrap();
+        let got = client_ip(ip("10.0.0.5"), Some("10.0.0.9, 10.0.0.8"), &trusted);
+        assert_eq!(got, ip("10.0.0.5"));
+    }
+
+    #[test]
+    fn client_ip_falls_back_on_garbage_xff() {
+        let trusted = TrustedProxies::parse(&["10.0.0.0/8".into()]).unwrap();
+        let got = client_ip(ip("10.0.0.5"), Some("garbage"), &trusted);
+        assert_eq!(got, ip("10.0.0.5"));
+    }
+
+    #[test]
+    fn client_ip_canonicalises_v4_mapped_peer_against_v4_cidr() {
+        // A dual-stack listener may report the peer as ::ffff:10.0.0.5; the
+        // caller canonicalises before calling, so simulate that here.
+        let trusted = TrustedProxies::parse(&["10.0.0.0/8".into()]).unwrap();
+        let peer = canonical_ip(ip("::ffff:10.0.0.5"));
+        assert_eq!(peer, ip("10.0.0.5"));
+        let got = client_ip(peer, Some("198.51.100.7"), &trusted);
+        assert_eq!(got, ip("198.51.100.7"));
     }
 
     #[test]

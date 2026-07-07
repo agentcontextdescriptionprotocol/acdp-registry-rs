@@ -6,6 +6,7 @@
 
 pub mod handlers;
 pub mod log;
+pub mod metrics;
 pub mod playground;
 pub mod rate_limit;
 pub mod receipt;
@@ -14,11 +15,16 @@ pub mod witness;
 
 pub use state::{AppState, AppStateInner};
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use acdp_registry_store::ExtendedRegistryStore;
+use acdp_registry_types::RegistryError;
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderName, HeaderValue, Method};
+use axum::middleware::{from_fn, from_fn_with_state, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -36,8 +42,13 @@ use tower_http::trace::TraceLayer;
 /// registry running without auth doesn't advertise a token-mint endpoint
 /// it can't enforce.
 pub fn build_router<S: ExtendedRegistryStore + 'static>(state: AppState<S>) -> Router {
+    // FEAT-06/FEAT-10: `from_fn_with_state` middleware (the `/auth/*` limiter)
+    // and the `/metrics` route both need the shared state up front, so build
+    // the `Arc` here rather than only at `.with_state` time.
+    let state = Arc::new(state);
     let admin = admin_router::<S>();
     let auth_enabled = state.config.auth.enabled;
+    let metrics_enabled = state.metrics.is_some();
     let body_limit = state.config.limits.max_payload_bytes;
     let cors = build_cors_layer(&state.config.registry.cors.allowed_origins);
 
@@ -74,10 +85,19 @@ pub fn build_router<S: ExtendedRegistryStore + 'static>(state: AppState<S>) -> R
         .route("/log/entries", get(handlers::log_entries::<S>));
 
     if auth_enabled {
-        acdp = acdp
+        // FEAT-06: the `/auth/*` endpoints are the most attacker-controllable
+        // surface (token issuance / refresh / revoke: unauthenticated writes,
+        // RNG, DID-document fetches, Ed25519 verifies). Group them in their
+        // own subrouter carrying the per-IP + process-global limiter as a
+        // `route_layer` — it fires only on these matched routes, not on 404s
+        // or any other endpoint. The per-agent `[limits]` budgets still apply
+        // inside the handlers on top of this.
+        let auth = Router::new()
             .route("/auth/challenge", post(handlers::issue_challenge::<S>))
             .route("/auth/token", post(handlers::issue_token::<S>))
-            .route("/auth/token/revoke", post(handlers::revoke_token::<S>));
+            .route("/auth/token/revoke", post(handlers::revoke_token::<S>))
+            .route_layer(from_fn_with_state(state.clone(), auth_rate_limit::<S>));
+        acdp = acdp.merge(auth);
     }
 
     let acdp = acdp.layer(SetResponseHeaderLayer::overriding(
@@ -87,7 +107,7 @@ pub fn build_router<S: ExtendedRegistryStore + 'static>(state: AppState<S>) -> R
 
     // Non-ACDP endpoints: JWKS sets `application/jwk-set+json` itself, health
     // and admin/status are operational JSON — none get the acdp+json override.
-    let aux = Router::new()
+    let mut aux = Router::new()
         .route("/.well-known/jwks.json", get(handlers::jwks::<S>))
         // The registry's own did:web document (receipt verification keys,
         // RFC-ACDP-0010). Conventional application/json — DID resolvers
@@ -121,12 +141,31 @@ pub fn build_router<S: ExtendedRegistryStore + 'static>(state: AppState<S>) -> R
             post(handlers::admin_republish::<S>),
         );
 
-    acdp.merge(aux)
+    // FEAT-10: mount `GET /metrics` only when a recorder is installed
+    // ([metrics] enabled). Deliberately in the un-authed, un-rate-limited
+    // `aux` group so a Prometheus scraper reaches it unimpeded; the handler
+    // applies its own optional `metrics.bearer_token` gate.
+    if metrics_enabled {
+        aux = aux.route("/metrics", get(metrics::metrics_endpoint::<S>));
+    }
+
+    let mut app = acdp
+        .merge(aux)
         .merge(admin)
-        .with_state(Arc::new(state))
+        .with_state(state)
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
-        .layer(PropagateRequestIdLayer::x_request_id())
-        .layer(TraceLayer::new_for_http())
+        .layer(PropagateRequestIdLayer::x_request_id());
+
+    // FEAT-10: request-level metrics near the top of the stack, so the
+    // observed latency includes the middleware below it. Added only when
+    // metrics are enabled — the `counter!`/`histogram!` macros would no-op
+    // without a recorder, but skipping the layer avoids the per-request
+    // `MatchedPath` clone entirely on the common (metrics-off) path.
+    if metrics_enabled {
+        app = app.layer(from_fn(metrics::track_metrics));
+    }
+
+    app.layer(TraceLayer::new_for_http())
         .layer(TimeoutLayer::new(Duration::from_secs(30)))
         // SEC-06: cap every request body uniformly. The publish handler
         // used to perform this check inline; the layer applies it to
@@ -147,6 +186,59 @@ pub fn build_router<S: ExtendedRegistryStore + 'static>(state: AppState<S>) -> R
             axum::http::header::CONTENT_TYPE,
             HeaderValue::from_static("application/acdp+json"),
         ))
+}
+
+/// FEAT-06: per-IP + process-global rate limiting middleware for `/auth/*`.
+///
+/// Runs before the auth handlers (which apply their own per-agent budgets).
+/// The client IP is resolved from `ConnectInfo<SocketAddr>` (the TCP socket
+/// peer) plus the trusted-proxy `X-Forwarded-For` policy — see
+/// [`rate_limit::client_ip`] for the security rationale. When no
+/// `ConnectInfo` is present (e.g. an in-process `oneshot` test that did not
+/// inject one) the peer defaults to `0.0.0.0` so every such request shares a
+/// single bucket rather than panicking.
+async fn auth_rate_limit<S: ExtendedRegistryStore + 'static>(
+    State(state): State<Arc<AppState<S>>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let Some(limiter) = &state.auth_ip_limiter else {
+        return next.run(req).await;
+    };
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| rate_limit::canonical_ip(ci.0.ip()))
+        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    let xff = req
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok());
+    let ip = rate_limit::client_ip(peer, xff, &state.trusted_proxies);
+    let rl = &state.config.rate_limit;
+
+    // Process-global ceiling first (bounds a source-IP-rotating flood), then
+    // the per-IP budget. Mirrors the challenge handler's global-then-key
+    // ordering.
+    if rl.global_per_minute > 0 {
+        if let Err(retry_after_seconds) = limiter.check_global() {
+            metrics::record_rate_limit_rejection("auth_global");
+            return RegistryError::RateLimited {
+                retry_after_seconds,
+            }
+            .into_response();
+        }
+    }
+    if rl.per_ip_per_minute > 0 {
+        if let Err(retry_after_seconds) = limiter.check(&ip.to_string()) {
+            metrics::record_rate_limit_rejection("auth_per_ip");
+            return RegistryError::RateLimited {
+                retry_after_seconds,
+            }
+            .into_response();
+        }
+    }
+    next.run(req).await
 }
 
 /// SEC-02: build a CORS layer driven by `[registry.cors] allowed_origins`.

@@ -12,6 +12,7 @@ The complete inbound surface of `acdp-registry`. Routes are assembled in
 | GET  | `/.well-known/jwks.json`         | none        | always |
 | GET  | `/.well-known/did.json`          | none        | always (404 unless `[receipt]` configured) |
 | GET  | `/healthz`                       | none        | always |
+| GET  | `/metrics`                       | optional scrape bearer | `metrics.enabled` |
 | POST | `/contexts`                      | producer signature | always |
 | GET  | `/contexts/{ctx_id}`             | optional bearer | always |
 | GET  | `/contexts/{ctx_id}/body`        | optional bearer | always |
@@ -49,7 +50,13 @@ All requests pass through, outermost first: request-id assignment
 `TraceLayer`, a 30 s `TimeoutLayer`, a `RequestBodyLimitLayer` capped at
 `limits.max_payload_bytes` (so even unauthenticated `/auth/*` calls can't push
 oversized JSON), and the CORS layer (off unless `registry.cors.allowed_origins`
-is populated).
+is populated). When `metrics.enabled`, a request-metrics layer near the top of
+the stack records count/latency/status by matched route.
+
+The `/auth/*` subrouter additionally carries the FEAT-06 per-IP + process-global
+rate limiter (`[rate_limit]`): it admits or rejects a request with `429` +
+`Retry-After` **before** any DID resolution, keyed by the resolved client IP
+(TCP peer, or the trusted-proxy `X-Forwarded-For` policy).
 
 ---
 
@@ -110,6 +117,29 @@ receipt key is configured. See [RECEIPTS.md](RECEIPTS.md).
 
 Storage liveness. `200` with `{"status":"ok","storage":true}` when the backend
 responds, `503` with `{"status":"degraded","storage":false}` otherwise.
+
+### `GET /metrics` *(FEAT-10)*
+
+Prometheus text exposition (`Content-Type: text/plain; version=0.0.4`). Mounted
+only when `metrics.enabled = true` (`404` otherwise). Deliberately outside the
+ACDP auth pipeline and the `/auth/*` rate limiter so a scraper reaches it
+unimpeded; when `metrics.bearer_token` is set the endpoint requires
+`Authorization: Bearer <token>` and answers `401` otherwise. Exposed series:
+
+| Metric | Type | Labels | Meaning |
+|--------|------|--------|---------|
+| `acdp_registry_request_total` | counter | `route`, `method`, `status_class` | HTTP requests by **matched** route pattern (never the resolved `ctx_id`). |
+| `acdp_registry_request_duration_seconds` | histogram | `route`, `method` | Request latency. |
+| `acdp_registry_publish_total` | counter | `outcome` | Publishes: `inserted`, `idempotent_replay` (playground path), or a wire code (`schema_violation`, `payload_too_large`, …). |
+| `acdp_registry_receipts_minted_total` | counter | — | RFC-ACDP-0010 receipts minted on accepted publishes. |
+| `acdp_registry_log_leaves_total` | counter | — | RFC-ACDP-0012 transparency-log leaves appended. |
+| `acdp_registry_lifecycle_event_total` | counter | `event`, `outcome` | Retract / republish outcomes. |
+| `acdp_registry_witness_cosignatures_total` | counter | `outcome` | Witness cosignatures `aggregated` / `rejected` / `store_error`. |
+| `acdp_registry_rate_limit_rejections_total` | counter | `scope` | 429s by scope (`auth_per_ip`, `auth_global`, `publish_per_agent`, `challenge_per_agent`, `lifecycle_per_agent`). |
+
+Adding a handler needs no metrics-middleware change: request metrics are
+automatic (from `MatchedPath`); domain counters are explicit `metrics::counter!`
+calls in the handlers.
 
 ---
 

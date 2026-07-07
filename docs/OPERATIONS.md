@@ -121,12 +121,38 @@ the key to `false` to return `404` for foreign ids instead.
 
 ## Rate limiting
 
-Two per-agent, per-process, in-memory token buckets ship today:
+Per-agent, per-process, in-memory token buckets:
 `limits.publish_rate_per_minute` on `POST /contexts` and
 `limits.challenge_rate_per_minute` on `POST /auth/challenge` (both default 60,
-`0` disables; `429` + `Retry-After` when drained). Because they're per-process,
-front a multi-replica deployment with a shared limiter (or proxy-level limits)
-for a global bound.
+`0` disables; `429` + `Retry-After` when drained).
+
+On top of these, the FEAT-06 `[rate_limit]` section adds **per-IP** and
+**process-global** buckets over the whole `/auth/*` subrouter (token issuance /
+refresh / revoke) — the most attacker-controllable surface. Unlike the
+per-agent buckets, these key on the resolved client IP, which an unauthenticated
+attacker can't rotate as freely as `agent_id`. The client IP is the TCP socket
+peer unless `rate_limit.trusted_proxies` marks the peer as a trusted reverse
+proxy, in which case it comes from `X-Forwarded-For` (see
+[CONFIGURATION.md · `[rate_limit]`](CONFIGURATION.md#rate_limit-feat-06) for the
+trust model — XFF is never honoured from an untrusted peer). The server is bound
+with `into_make_service_with_connect_info`, so the peer IP is available behind
+`axum_server`.
+
+All of these are per-process. Behind a load balancer set `trusted_proxies` so
+per-IP limits track real clients; the `global_per_minute` ceiling is per replica.
+For a cluster-wide bound, still front the deployment with a shared limiter (or
+proxy-level limits).
+
+## Metrics
+
+Set `metrics.enabled = true` to mount `GET /metrics` (Prometheus text
+exposition). It sits outside the auth pipeline and the rate limiter so a scraper
+reaches it unimpeded; gate it with `metrics.bearer_token` (or network policy)
+when the endpoint is reachable from untrusted networks. Beyond HTTP
+request-rate/latency/status by route, the registry exports domain counters
+(publishes by outcome, receipts minted, log leaves appended, lifecycle events,
+witness cosignatures, rate-limit rejections). Full metric list:
+[HTTP-API.md · `GET /metrics`](HTTP-API.md#get-metrics-feat-10).
 
 ## Webhooks
 
