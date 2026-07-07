@@ -99,6 +99,8 @@ fn config(playground: bool) -> RegistryConfig {
         auth,
         webhook: WebhookConfig::default(),
         limits: LimitsConfig::default(),
+        rate_limit: Default::default(),
+        metrics: Default::default(),
         playground: PlaygroundConfig {
             enabled: playground,
             ..Default::default()
@@ -948,6 +950,228 @@ async fn challenge_endpoint_is_rate_limited() {
         limited.headers().get("retry-after").is_some(),
         "429 must carry a Retry-After header"
     );
+}
+
+// ── FEAT-06: per-IP / global / proxy-aware /auth/* rate limiting ─────────
+
+/// Build a `POST /auth/challenge` request from a given TCP peer, optionally
+/// carrying an `X-Forwarded-For` header. The `ConnectInfo` extension mirrors
+/// what `into_make_service_with_connect_info` inserts in production so the
+/// per-IP middleware sees a real peer even under `oneshot`.
+fn challenge_from(peer: &str, xff: Option<&str>) -> Request<Body> {
+    use axum::extract::ConnectInfo;
+    use std::net::SocketAddr;
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/auth/challenge")
+        .header("content-type", "application/json");
+    if let Some(xff) = xff {
+        builder = builder.header("x-forwarded-for", xff);
+    }
+    let mut req = builder
+        .body(Body::from(
+            json!({"agent_id": "did:web:agents.test:flooder"}).to_string(),
+        ))
+        .unwrap();
+    let addr: SocketAddr = format!("{peer}:40000").parse().unwrap();
+    req.extensions_mut().insert(ConnectInfo(addr));
+    req
+}
+
+/// Base config for the per-IP limiter tests: auth on, the per-AGENT challenge
+/// budget disabled so only the new per-IP/global middleware is exercised.
+fn rate_limit_cfg() -> RegistryConfig {
+    let mut cfg = config(false);
+    cfg.auth.enabled = true;
+    cfg.limits.challenge_rate_per_minute = 0; // isolate the per-IP limiter
+    cfg
+}
+
+#[tokio::test]
+async fn auth_per_ip_limit_trips_at_threshold() {
+    let mut cfg = rate_limit_cfg();
+    cfg.rate_limit.per_ip_per_minute = 2;
+    cfg.rate_limit.global_per_minute = 0; // isolate per-IP
+    let h = harness_from_config(cfg).await;
+
+    // Two requests from 203.0.113.10 pass, the third is throttled.
+    assert_eq!(
+        h.router
+            .clone()
+            .oneshot(challenge_from("203.0.113.10", None))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        h.router
+            .clone()
+            .oneshot(challenge_from("203.0.113.10", None))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let limited = h
+        .router
+        .clone()
+        .oneshot(challenge_from("203.0.113.10", None))
+        .await
+        .unwrap();
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        limited.headers().get("retry-after").is_some(),
+        "per-IP 429 must carry Retry-After"
+    );
+
+    // A different IP has its own budget and is unaffected.
+    assert_eq!(
+        h.router
+            .clone()
+            .oneshot(challenge_from("198.51.100.20", None))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn auth_xff_ignored_without_trusted_proxy() {
+    // No trusted_proxies configured: X-Forwarded-For is a spoof vector and
+    // MUST be ignored. All three requests share the socket-peer bucket even
+    // though they claim distinct client IPs — so the third trips.
+    let mut cfg = rate_limit_cfg();
+    cfg.rate_limit.per_ip_per_minute = 2;
+    cfg.rate_limit.global_per_minute = 0;
+    cfg.rate_limit.trusted_proxies = vec![]; // untrusted
+    let h = harness_from_config(cfg).await;
+
+    for xff in ["1.1.1.1", "2.2.2.2"] {
+        assert_eq!(
+            h.router
+                .clone()
+                .oneshot(challenge_from("203.0.113.30", Some(xff)))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+    }
+    // Third request from the same peer, different spoofed XFF → still 429,
+    // proving XFF was ignored and the peer bucket was used.
+    assert_eq!(
+        h.router
+            .clone()
+            .oneshot(challenge_from("203.0.113.30", Some("3.3.3.3")))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+}
+
+#[tokio::test]
+async fn auth_xff_honored_only_from_trusted_proxy() {
+    // Peer 10.0.0.5 is a trusted proxy: the client IP comes from XFF, so two
+    // distinct clients each get their own budget even behind one proxy.
+    let mut cfg = rate_limit_cfg();
+    cfg.rate_limit.per_ip_per_minute = 2;
+    cfg.rate_limit.global_per_minute = 0;
+    cfg.rate_limit.trusted_proxies = vec!["10.0.0.0/8".into()];
+    let h = harness_from_config(cfg).await;
+
+    // Drain client 1.1.1.1's budget (2 ok, 3rd throttled).
+    for _ in 0..2 {
+        assert_eq!(
+            h.router
+                .clone()
+                .oneshot(challenge_from("10.0.0.5", Some("1.1.1.1")))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        h.router
+            .clone()
+            .oneshot(challenge_from("10.0.0.5", Some("1.1.1.1")))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    // A different client behind the SAME trusted proxy still has budget.
+    assert_eq!(
+        h.router
+            .clone()
+            .oneshot(challenge_from("10.0.0.5", Some("2.2.2.2")))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn auth_global_ceiling_caps_across_ips() {
+    // Per-IP budget is generous but the process-global ceiling is 2, so the
+    // third request trips regardless of source IP.
+    let mut cfg = rate_limit_cfg();
+    cfg.rate_limit.per_ip_per_minute = 1000;
+    cfg.rate_limit.global_per_minute = 2;
+    let h = harness_from_config(cfg).await;
+
+    assert_eq!(
+        h.router
+            .clone()
+            .oneshot(challenge_from("203.0.113.1", None))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        h.router
+            .clone()
+            .oneshot(challenge_from("203.0.113.2", None))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    // Third request from yet another IP → 429 from the global ceiling.
+    assert_eq!(
+        h.router
+            .clone()
+            .oneshot(challenge_from("203.0.113.3", None))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+}
+
+#[tokio::test]
+async fn auth_limiter_disabled_lets_flood_through() {
+    // With [rate_limit] disabled the middleware is a pass-through: many
+    // requests from one IP all succeed (the per-agent budget is also off).
+    let mut cfg = rate_limit_cfg();
+    cfg.rate_limit.enabled = false;
+    let h = harness_from_config(cfg).await;
+    for _ in 0..10 {
+        assert_eq!(
+            h.router
+                .clone()
+                .oneshot(challenge_from("203.0.113.99", None))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+    }
 }
 
 #[tokio::test]

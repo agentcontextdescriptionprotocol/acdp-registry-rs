@@ -81,6 +81,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Async traits
 async-trait = "0.1"
 
+# Metrics (FEAT-10): the `metrics` facade + Prometheus recorder. Facade is
+# tiny; the exporter is pulled with default-features off so we get only the
+# recorder + text renderer, not its bundled HTTP listener / push gateway
+# (we serve /metrics through the existing axum stack).
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
+
 # Misc
 url = "2"
 

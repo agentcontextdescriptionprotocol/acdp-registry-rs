@@ -38,6 +38,7 @@ pub async fn issue_challenge<S: ExtendedRegistryStore + 'static>(
             .check_global()
             .and_then(|()| limiter.check(req.agent_id.as_str()))
         {
+            crate::metrics::record_rate_limit_rejection("challenge_per_agent");
             return Err(RegistryError::RateLimited {
                 retry_after_seconds,
             });

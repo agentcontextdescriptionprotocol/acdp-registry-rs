@@ -341,6 +341,34 @@ fn validate_config(cfg: &RegistryConfig) -> anyhow::Result<()> {
             cfg.registry.bind
         );
     }
+    // FEAT-06: validate the trusted-proxy CIDRs up front — a typo like
+    // "10.0.0/8" must fail startup, not silently disable XFF trust (which
+    // would make the registry key rate limits on the proxy IP for everyone).
+    acdp_registry_core::rate_limit::TrustedProxies::parse(&cfg.rate_limit.trusted_proxies)
+        .map_err(|e| anyhow::anyhow!("rate_limit.trusted_proxies: {e}"))?;
+    // FEAT-06: a non-empty trusted_proxies list only makes sense with the
+    // limiter enabled — otherwise XFF is parsed for nothing.
+    if !cfg.rate_limit.enabled && !cfg.rate_limit.trusted_proxies.is_empty() {
+        anyhow::bail!(
+            "rate_limit.trusted_proxies is configured but rate_limit.enabled=false; \
+             enable the limiter or drop the trusted_proxies list"
+        );
+    }
+    // FEAT-10: reject a non-monotonic / negative histogram bucket ladder up
+    // front — Prometheus requires strictly increasing positive bounds.
+    if cfg.metrics.enabled {
+        let b = &cfg.metrics.duration_buckets;
+        if b.is_empty() {
+            anyhow::bail!("metrics.duration_buckets must not be empty when metrics are enabled");
+        }
+        if b.iter().any(|x| !x.is_finite() || *x <= 0.0) {
+            anyhow::bail!("metrics.duration_buckets must be positive, finite seconds");
+        }
+        if b.windows(2).any(|w| w[0] >= w[1]) {
+            anyhow::bail!("metrics.duration_buckets must be strictly increasing");
+        }
+    }
+
     if cfg.registry.tls.enabled {
         let cert = cfg
             .registry
@@ -733,12 +761,12 @@ async fn serve_with_store<S: ExtendedRegistryStore + 'static>(
         let cfg_tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key).await?;
         axum_server::bind_rustls(addr, cfg_tls)
             .handle(handle)
-            .serve(router.into_make_service())
+            .serve(router.into_make_service_with_connect_info::<SocketAddr>())
             .await?;
     } else {
         axum_server::bind(addr)
             .handle(handle)
-            .serve(router.into_make_service())
+            .serve(router.into_make_service_with_connect_info::<SocketAddr>())
             .await?;
     }
     Ok(())

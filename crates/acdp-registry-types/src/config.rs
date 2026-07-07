@@ -19,6 +19,13 @@ pub struct RegistryConfig {
     pub webhook: WebhookConfig,
     #[serde(default)]
     pub limits: LimitsConfig,
+    /// FEAT-06: per-IP and process-global rate limiting on the `/auth/*`
+    /// endpoints, on top of the per-agent `[limits]` budgets.
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
+    /// FEAT-10: Prometheus `/metrics` endpoint. Off by default.
+    #[serde(default)]
+    pub metrics: MetricsConfig,
     #[serde(default)]
     pub playground: PlaygroundConfig,
     #[serde(default)]
@@ -99,6 +106,8 @@ impl RegistryConfig {
             auth: AuthConfig::default(),
             webhook: WebhookConfig::default(),
             limits: LimitsConfig::default(),
+            rate_limit: RateLimitConfig::default(),
+            metrics: MetricsConfig::default(),
             playground: PlaygroundConfig::default(),
             receipt: ReceiptConfig::default(),
             lifecycle: LifecycleConfig::default(),
@@ -497,6 +506,114 @@ impl Default for LimitsConfig {
             idempotency_key_ttl_seconds: default_idempotency_ttl(),
             publish_rate_per_minute: default_publish_rate_per_minute(),
             challenge_rate_per_minute: default_challenge_rate_per_minute(),
+        }
+    }
+}
+
+/// FEAT-06: per-IP and process-global rate limiting on the `/auth/*`
+/// endpoints (challenge / token / revoke).
+///
+/// The per-agent `[limits]` budgets key on the request-supplied `agent_id`,
+/// which an unauthenticated attacker controls and can rotate to defeat the
+/// per-key limit. This section adds two attacker-independent bounds applied
+/// as middleware over the whole `/auth/*` subrouter:
+///
+///   * a **per-client-IP** fixed-window budget, and
+///   * a **process-global** ceiling across all IPs.
+///
+/// Both share the existing 60-second fixed-window limiter, so limits are
+/// expressed per minute for symmetry with `[limits]`.
+///
+/// ## Client-IP resolution & the trusted-proxy decision (SECURITY)
+///
+/// The client IP is the TCP socket peer by default. `X-Forwarded-For` is a
+/// caller-supplied header and is **NEVER** trusted unless the socket peer is
+/// itself in one of the operator-configured `trusted_proxies` CIDR ranges —
+/// otherwise any client could spoof its IP and evade the per-IP budget (or
+/// frame another IP). When the peer IS a trusted proxy, the real client is
+/// taken from the rightmost `X-Forwarded-For` entry that is not itself a
+/// trusted proxy (walking right-to-left across a chain of trusted hops).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitConfig {
+    /// Master switch for the per-IP / global `/auth/*` limiter. Default
+    /// `true`: the endpoints are the most attacker-controllable surface, so
+    /// the bound is protective out of the box. Set `false` to fall back to
+    /// the per-agent `[limits]` budgets only.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Max `/auth/*` requests per minute per resolved client IP. `0` disables
+    /// the per-IP bound (the global ceiling, if set, still applies).
+    #[serde(default = "default_per_ip_per_minute")]
+    pub per_ip_per_minute: u32,
+    /// Whole-process ceiling: max `/auth/*` requests per minute across ALL
+    /// client IPs. `0` disables the global ceiling. Defends a single replica
+    /// against a distributed flood that rotates source IPs.
+    #[serde(default = "default_global_per_minute")]
+    pub global_per_minute: u32,
+    /// CIDR ranges of reverse proxies whose `X-Forwarded-For` header this
+    /// registry trusts. Empty (the default) means XFF is ignored and the TCP
+    /// socket peer IP is always used — the safe default. List ONLY the
+    /// addresses of proxies you operate (e.g. `["10.0.0.0/8"]`); listing an
+    /// untrusted range lets clients on it spoof their source IP.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
+}
+
+fn default_per_ip_per_minute() -> u32 {
+    60
+}
+fn default_global_per_minute() -> u32 {
+    6_000
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            per_ip_per_minute: default_per_ip_per_minute(),
+            global_per_minute: default_global_per_minute(),
+            trusted_proxies: Vec::new(),
+        }
+    }
+}
+
+/// FEAT-10: Prometheus `/metrics` endpoint (text exposition format).
+///
+/// Off by default — enabling it mounts `GET /metrics` and installs a
+/// process-global recorder. The endpoint is intentionally NOT rate-limited
+/// and NOT behind the ACDP auth pipeline (scrapers use bearer gating below,
+/// not ACDP tokens) so a Prometheus server can scrape it unimpeded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsConfig {
+    /// Mount `GET /metrics` and record request + domain metrics. Default
+    /// `false`: metrics are pure ops ergonomics, opt-in per deployment.
+    #[serde(default)]
+    pub enabled: bool,
+    /// When non-empty, `/metrics` requires `Authorization: Bearer <token>`
+    /// matching this value. Empty (the default) leaves the endpoint open —
+    /// appropriate when it is reachable only from a trusted scrape network.
+    #[serde(default)]
+    pub bearer_token: String,
+    /// Histogram buckets (seconds) for `acdp_registry_request_duration_seconds`.
+    /// Defaults to a web-latency-oriented ladder.
+    #[serde(default = "default_duration_buckets")]
+    pub duration_buckets: Vec<f64>,
+}
+
+fn default_duration_buckets() -> Vec<f64> {
+    vec![
+        0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+    ]
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bearer_token: String::new(),
+            duration_buckets: default_duration_buckets(),
         }
     }
 }
@@ -1217,6 +1334,55 @@ url = "https://w.example/log/witness"
 bogus = 1
 "#;
         let err = toml::from_str::<WitnessConfig>(toml).unwrap_err();
+        assert!(err.to_string().contains("bogus"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn rate_limit_defaults_are_protective() {
+        // Absent [rate_limit], the limiter is on with sane bounds.
+        let cfg = RegistryConfig::defaults();
+        assert!(cfg.rate_limit.enabled);
+        assert_eq!(cfg.rate_limit.per_ip_per_minute, 60);
+        assert_eq!(cfg.rate_limit.global_per_minute, 6_000);
+        assert!(cfg.rate_limit.trusted_proxies.is_empty());
+    }
+
+    #[test]
+    fn rate_limit_round_trips_and_rejects_unknown() {
+        let toml = r#"
+enabled = false
+per_ip_per_minute = 10
+global_per_minute = 500
+trusted_proxies = ["10.0.0.0/8", "192.168.0.0/16"]
+"#;
+        let cfg: RateLimitConfig = toml::from_str(toml).unwrap();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.per_ip_per_minute, 10);
+        assert_eq!(cfg.global_per_minute, 500);
+        assert_eq!(cfg.trusted_proxies.len(), 2);
+
+        let err = toml::from_str::<RateLimitConfig>("bogus = 1").unwrap_err();
+        assert!(err.to_string().contains("bogus"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn metrics_defaults_off_and_round_trip() {
+        let cfg = RegistryConfig::defaults();
+        assert!(!cfg.metrics.enabled);
+        assert!(cfg.metrics.bearer_token.is_empty());
+        assert!(!cfg.metrics.duration_buckets.is_empty());
+
+        let toml = r#"
+enabled = true
+bearer_token = "scrape-secret"
+duration_buckets = [0.1, 0.5, 1.0]
+"#;
+        let cfg: MetricsConfig = toml::from_str(toml).unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.bearer_token, "scrape-secret");
+        assert_eq!(cfg.duration_buckets, vec![0.1, 0.5, 1.0]);
+
+        let err = toml::from_str::<MetricsConfig>("bogus = 1").unwrap_err();
         assert!(err.to_string().contains("bogus"), "unexpected: {err}");
     }
 

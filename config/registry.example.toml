@@ -99,6 +99,44 @@ publish_rate_per_minute = 60
 # nonce-store writes. 0 disables. Same in-memory + per-process caveat.
 challenge_rate_per_minute = 60
 
+[rate_limit]
+# FEAT-06: per-IP and process-global rate limiting on the /auth/* endpoints
+# (token issuance / refresh / revoke). These bounds are attacker-independent,
+# unlike the per-agent [limits] budgets above (agent_id is caller-controlled
+# and an attacker can rotate it).
+#
+# Master switch. Default true — /auth/* is the most attacker-controllable
+# surface, so the bound is protective out of the box. Set false to fall back
+# to the per-agent [limits] budgets only.
+enabled = true
+# Max /auth/* requests per minute per resolved client IP. 0 disables the
+# per-IP bound (the global ceiling still applies).
+per_ip_per_minute = 60
+# Whole-process ceiling across ALL client IPs per minute. Defends a single
+# replica against a source-IP-rotating flood. 0 disables it.
+global_per_minute = 6000
+# SECURITY — reverse-proxy trust. X-Forwarded-For is caller-supplied and is
+# IGNORED unless the TCP socket peer is in one of these CIDRs; then the client
+# IP is taken from the rightmost XFF entry that is not itself a trusted proxy.
+# Empty (default) = never trust XFF, always use the socket peer. List ONLY the
+# addresses of proxies you operate — a wrong entry lets clients spoof their IP.
+#   trusted_proxies = ["10.0.0.0/8"]
+trusted_proxies = []
+
+[metrics]
+# FEAT-10: Prometheus /metrics endpoint (text exposition, version 0.0.4).
+# Off by default. When enabled, GET /metrics is mounted (outside the ACDP auth
+# pipeline and the rate limiter, so a scraper reaches it unimpeded) and the
+# registry records HTTP request metrics + domain counters (publishes, receipts
+# minted, lifecycle events, log leaves, witness cosignatures, rate-limit
+# rejections).
+enabled = false
+# When set, /metrics requires `Authorization: Bearer <token>`. Empty leaves it
+# open — appropriate only when reachable from a trusted scrape network.
+# bearer_token = ""
+# Histogram buckets (seconds) for acdp_registry_request_duration_seconds.
+# duration_buckets = [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
+
 [playground]
 # When true, the publish handler skips DID-signature verification. NEVER
 # enable in production — the registry will accept any forged signature.

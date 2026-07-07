@@ -164,6 +164,7 @@ async fn verify_and_store<S: ExtendedRegistryStore>(
                     error = %e,
                     "rejected witness cosignature (not stored)"
                 );
+                crate::metrics::record_witness_cosignature("rejected");
                 return false;
             }
         };
@@ -192,8 +193,10 @@ async fn verify_and_store<S: ExtendedRegistryStore>(
         .await
     {
         tracing::warn!(witness = %witness_did, error = %e, "failed to store witness cosignature");
+        crate::metrics::record_witness_cosignature("store_error");
         return false;
     }
+    crate::metrics::record_witness_cosignature("aggregated");
     true
 }
 

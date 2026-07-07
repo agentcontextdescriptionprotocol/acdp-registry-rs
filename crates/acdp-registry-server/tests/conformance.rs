@@ -97,6 +97,8 @@ fn config() -> RegistryConfig {
         auth,
         webhook: WebhookConfig::default(),
         limits: LimitsConfig::default(),
+        rate_limit: Default::default(),
+        metrics: Default::default(),
         // The playground bypasses DID verification, which lets the
         // harness replay synthetic fixtures without standing up a TLS
         // mock for `did:web` resolution.

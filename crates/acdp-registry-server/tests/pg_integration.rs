@@ -102,6 +102,8 @@ fn config(playground: bool) -> RegistryConfig {
         auth,
         webhook: WebhookConfig::default(),
         limits: LimitsConfig::default(),
+        rate_limit: Default::default(),
+        metrics: Default::default(),
         playground: PlaygroundConfig {
             enabled: playground,
             ..Default::default()
