@@ -61,7 +61,7 @@ base64       = "0.22"
 hex          = "0.4"
 
 # Config
-config  = { version = "0.14", default-features = false, features = ["toml"] }
+config  = { version = "0.15", default-features = false, features = ["toml"] }
 dotenvy = "0.15"
 toml    = "0.8"
 
