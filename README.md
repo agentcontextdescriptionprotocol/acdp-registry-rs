@@ -2,18 +2,20 @@
 
 [![CI](https://img.shields.io/badge/CI-passing-brightgreen)](https://github.com/agentcontextdistributionprotocol/acdp-registry-rs/actions)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
-[![MSRV](https://img.shields.io/badge/MSRV-1.86-blue)](Cargo.toml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue)](Cargo.toml)
 
 Reference **registry** implementation for the
 [Agent Context Distribution Protocol](https://github.com/agentcontextdistributionprotocol/agentcontextdistributionprotocol)
-v0.1.0 / v0.2.0. Implements the `acdp-registry-core` and
+v0.1.0 through v0.4.0. Implements the `acdp-registry-core` and
 `acdp-registry-discovery` profiles on top of
 [`acdp`](https://github.com/agentcontextdistributionprotocol/acdp-rs) —
-plus, with a `[receipt]` signing key configured, the ACDP 0.2.0
-trust-hardening surface: the `acdp-registry-receipts` profile (signed,
-atomically-persisted publish receipts, RFC-ACDP-0010), self-certifying
-`did:key` producers, and a self-hosted `/.well-known/did.json`
-(see [docs/RECEIPTS.md](docs/RECEIPTS.md)).
+plus, as the corresponding config sections are enabled: the ACDP 0.2.0
+trust-hardening surface (the `acdp-registry-receipts` profile — signed,
+atomically-persisted publish receipts, RFC-ACDP-0010 — self-certifying
+`did:key` producers, and a self-hosted `/.well-known/did.json`,
+see [docs/RECEIPTS.md](docs/RECEIPTS.md)), the 0.3.0 lifecycle,
+transparency-log, and head-receipt profiles, and 0.4.0 witness cosignature
+aggregation (RFC-ACDP-0015).
 
 ## What you get
 
@@ -28,8 +30,15 @@ atomically-persisted publish receipts, RFC-ACDP-0010), self-certifying
   `tenant` claim, with an optional strict mode.
 - **Cross-registry resolution** — foreign `ctx_id`s are resolved against their
   home registry (public-only, SSRF-guarded).
+- **Signed receipts & lifecycle** — RFC-ACDP-0010 publish receipts and head
+  receipts, plus RFC-ACDP-0013 retract/republish lifecycle events.
+- **Transparency log** — RFC-ACDP-0012 append-only Merkle log with signed
+  checkpoints, inclusion/consistency proofs, and RFC-ACDP-0015 witness
+  cosignature aggregation.
 - **HMAC-signed webhooks** — `context.published`, `context.retrieved`,
   `search.executed`.
+- **Abuse controls & observability** — per-IP and global `/auth/*` rate
+  limiting, and an optional Prometheus `/metrics` endpoint.
 - **Playground mode** — compile-time + runtime feature that skips DID
   verification for hands-on demos.
 
@@ -104,21 +113,34 @@ Selected fields:
 
 ## HTTP surface
 
+Selected routes (the full surface, including request/response shapes, is in
+[docs/HTTP-API.md](docs/HTTP-API.md)):
+
 | Method | Path                              | Notes |
 |--------|-----------------------------------|-------|
 | GET    | `/.well-known/acdp.json`          | Capabilities document. |
 | GET    | `/.well-known/jwks.json`          | JWKS (EdDSA public key; empty for HS256). |
+| GET    | `/.well-known/did.json`           | Registry DID document (when a receipt key is configured). |
 | GET    | `/healthz`                        | Storage liveness. |
+| GET    | `/metrics`                        | Prometheus metrics (when `metrics.enabled`). |
 | POST   | `/contexts`                       | Publish (full RFC-ACDP-0003 §2.1 pipeline). |
 | GET    | `/contexts/{ctx_id}`              | Retrieve full context. |
 | GET    | `/contexts/{ctx_id}/body`         | Retrieve body only. |
 | GET    | `/contexts/search`                | Keyword + filter search. |
+| POST   | `/contexts/{ctx_id}/retract`      | Producer retraction (RFC-ACDP-0013). |
+| POST   | `/contexts/{ctx_id}/republish`    | Producer republish (RFC-ACDP-0013). |
 | GET    | `/lineages/{lineage_id}`          | Full lineage (visibility-filtered). |
 | GET    | `/lineages/{lineage_id}/current`  | Newest non-superseded version. |
+| GET    | `/log/checkpoint`                 | Signed transparency-log checkpoint (RFC-ACDP-0012). |
+| GET    | `/log/proof`                      | Inclusion / consistency proofs. |
+| GET    | `/log/entries`                    | Log leaves (visibility-filtered). |
 | POST   | `/auth/challenge`                 | Issue a nonce for DID challenge-response (when `auth.enabled`). |
 | POST   | `/auth/token`                     | Verify signed challenge → JWT (when `auth.enabled`). |
 | POST   | `/auth/token/revoke`              | Revoke your own token by `jti` (when `auth.enabled`). |
 | GET    | `/admin/status`                   | Operational snapshot (admin bearer). |
+| GET    | `/admin/lineages/{id}/audit`      | On-demand lineage integrity audit (admin bearer). |
+| POST   | `/admin/contexts/{id}/retract`    | Admin retraction (admin bearer). |
+| POST   | `/admin/contexts/{id}/republish`  | Admin republish (admin bearer). |
 | GET    | `/admin/contexts`                 | Compile-gated by `playground` (admin bearer). |
 | POST   | `/admin/pinned-keys/reload`       | Compile-gated by `playground` (admin bearer). |
 
@@ -127,8 +149,8 @@ RFC-ACDP-0008 §4.5; authenticated callers identify themselves via
 `Authorization: Bearer <jwt>`. Full request/response shapes, error envelope,
 auth flow, config, and ops are documented under [`docs/`](docs/README.md).
 
-When `auth.enabled = false`, the `/auth/challenge` and `/auth/token` routes
-are not mounted, and any `Authorization` header is ignored — every caller
+When `auth.enabled = false`, the `/auth/challenge`, `/auth/token`, and
+`/auth/token/revoke` routes are not mounted, and any `Authorization` header is ignored — every caller
 is treated as anonymous, so the public/restricted/private gate runs against
 `None`.
 

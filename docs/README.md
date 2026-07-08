@@ -1,9 +1,11 @@
 # acdp-registry-rs documentation
 
 Reference documentation for the Agent Context Distribution Protocol (ACDP)
-registry (protocol v0.1.0, with v0.2.0 trust-hardening — registry receipts
-and did:key — available when a receipt signing key is configured). Start with the [project README](../README.md) for a quick
-start; these docs go deeper.
+registry. The baseline is protocol v0.1.0; higher protocol levels light up as
+their sections are configured — v0.2.0 trust-hardening (registry receipts,
+did:key), v0.3.0 (lifecycle events, the transparency log, head receipts), and
+v0.4.0 (witness cosignature aggregation). Start with the
+[project README](../README.md) for a quick start; these docs go deeper.
 
 ## Map
 
@@ -59,5 +61,8 @@ verification, SSRF defenses, or the canonical error-code registry lives in the
 
 ## Spec profiles implemented
 
-`acdp-registry-core` and `acdp-registry-discovery`, advertised at
-`GET /.well-known/acdp.json`. See [HTTP-API.md](HTTP-API.md#get-well-knownacdpjson).
+`acdp-registry-core` and `acdp-registry-discovery` always; `acdp-registry-receipts`,
+`acdp-registry-head-receipts`, `acdp-registry-lifecycle`, and
+`acdp-registry-transparency-log` are advertised when their config sections are
+enabled. All are served at `GET /.well-known/acdp.json`.
+See [HTTP-API.md](HTTP-API.md#get-well-knownacdpjson).

@@ -218,7 +218,9 @@ Query parameters (all optional):
 | `cursor` | Opaque pagination cursor from a prior `next_cursor`. |
 
 Response: a `SearchResponse` — `{ matches: [...], total_estimate, next_cursor }`.
-Visibility and tenant are post-filtered with a bounded refill loop (up to 6
+Visibility (RFC-ACDP-0008 §4.5) is enforced in the SQL `WHERE` clause on both
+backends, and `total_estimate` is the count of §4.5-visible matches for the
+caller. Tenant narrowing is post-filtered with a bounded refill loop (up to 6
 inner pages), so a page may return fewer than `limit` rows near the end of a
 result set even though `next_cursor` is set — keep paging until `next_cursor`
 is absent.

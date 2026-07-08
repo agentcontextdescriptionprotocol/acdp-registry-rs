@@ -170,8 +170,9 @@ downstream. At startup it logs the authority, port, storage backend, and
 playground flag; on bind it logs the listen address; on `SIGTERM`/`Ctrl-C` it
 drains in-flight requests for up to 30 s before exiting.
 
-There is no Prometheus `/metrics` endpoint yet. In the meantime, forward the
-JSON logs and poll `GET /admin/status` for queue/idempotency/migration state.
+For numeric telemetry, enable the Prometheus `/metrics` endpoint (see
+[Metrics](#metrics) above); `GET /admin/status` remains the JSON snapshot for
+queue/idempotency/migration state.
 
 ## Backup and restore
 
