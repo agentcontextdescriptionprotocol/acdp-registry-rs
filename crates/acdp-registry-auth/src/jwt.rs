@@ -6,7 +6,7 @@
 //!     `GET /.well-known/jwks.json` so federated peers can verify without
 //!     out-of-band secret distribution.
 //!
-//! The [`JwtSigner`] dispatches on its [`SigningMaterial`] variant. Operators
+//! The [`JwtSigner`] dispatches on its `SigningMaterial` variant. Operators
 //! migrate by setting `auth.jwt_signing_alg = "EdDSA"` and providing
 //! `auth.jwt_private_key_pem`; the symmetric `auth.jwt_secret` is then
 //! ignored. Existing HS256 deployments need no config change.
@@ -121,7 +121,7 @@ impl SigningMaterial {
     }
 }
 
-/// JWT signer/verifier. Dispatches on the chosen [`SigningMaterial`].
+/// JWT signer/verifier. Dispatches on the chosen `SigningMaterial`.
 #[derive(Clone)]
 pub struct JwtSigner {
     material: SigningMaterial,

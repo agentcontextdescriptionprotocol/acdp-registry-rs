@@ -341,11 +341,13 @@ pub struct TenantAgentBinding {
 ///
 /// Wire format (TOML):
 ///
-///   [[auth.revocation_feeds]]
-///   issuer        = "did:web:control-plane.example"
-///   feed_url      = "https://control-plane.example/auth/revocations"
-///   admin_token   = "..."           # api key with admin role on the issuer
-///   poll_seconds  = 60              # default 300
+/// ```toml
+/// [[auth.revocation_feeds]]
+/// issuer        = "did:web:control-plane.example"
+/// feed_url      = "https://control-plane.example/auth/revocations"
+/// admin_token   = "..."           # api key with admin role on the issuer
+/// poll_seconds  = 60              # default 300
+/// ```
 ///
 /// The poller runs in the background, paged by `revoked_at_ms` cursor;
 /// each propagated entry is inserted into the local revocation store
@@ -908,10 +910,12 @@ fn default_log_instance() -> String {
 ///
 /// Wire format (TOML):
 ///
-///   [[witnesses]]
-///   did          = "did:web:witness.example.org"
-///   url          = "https://witness.example.org/log/witness"
-///   poll_seconds = 60              # default 300
+/// ```toml
+/// [[witnesses]]
+/// did          = "did:web:witness.example.org"
+/// url          = "https://witness.example.org/log/witness"
+/// poll_seconds = 60              # default 300
+/// ```
 ///
 /// The background poller GETs `<url>?log_id=<this registry's log_id>`,
 /// VERIFIES every returned cosignature (RFC-ACDP-0015 §8: closed parse,
