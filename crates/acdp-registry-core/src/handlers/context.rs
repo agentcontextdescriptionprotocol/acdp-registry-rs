@@ -738,7 +738,7 @@ const SEARCH_REFILL_MAX_PAGES: usize = 6;
 /// §7 fix: bounded refill. The handler asks the store for successive
 /// pages along the cursor and accumulates only rows that match the
 /// caller's tenant until `target` is reached. The loop is capped at
-/// [`SEARCH_REFILL_MAX_PAGES`] so a tenant with zero matches doesn't
+/// `SEARCH_REFILL_MAX_PAGES` so a tenant with zero matches doesn't
 /// turn one HTTP request into an unbounded backend scan.
 ///
 /// DESIGN-01: the RFC-ACDP-0008 §4.5 *visibility* disclosure predicate now

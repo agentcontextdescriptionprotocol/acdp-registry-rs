@@ -717,6 +717,12 @@ mod transparency_log {
 
     // ── Witness cosignature aggregation (RFC-ACDP-0015 §6.1) ───────────
 
+    /// A stand-in wire object; the store treats it as opaque bytes and
+    /// serves it back verbatim (verification happens in the aggregator).
+    fn cosig_json(witness: &str, at: &str) -> String {
+        format!(r#"{{"witness_id":"{witness}","witnessed_at":"{at}"}}"#)
+    }
+
     /// Upsert + read-back by exact tuple, distinct witnesses, tuple
     /// isolation, and newest-wins re-observation — on the Postgres SQL
     /// path. Run-unique keys avoid collisions against the shared database.
@@ -729,7 +735,6 @@ mod transparency_log {
         let root = format!("sha256:{}", "0".repeat(64));
         let wa = format!("did:web:wa-{}.example.org", uuid::Uuid::new_v4().simple());
         let wb = format!("did:web:wb-{}.example.org", uuid::Uuid::new_v4().simple());
-        let cj = |w: &str, at: &str| format!(r#"{{"witness_id":"{w}","witnessed_at":"{at}"}}"#);
 
         store
             .upsert_witness_cosignature(
@@ -738,7 +743,7 @@ mod transparency_log {
                 &root,
                 &wa,
                 "2026-07-05T00:00:00.000Z",
-                &cj(&wa, "2026-07-05T00:00:00.000Z"),
+                &cosig_json(&wa, "2026-07-05T00:00:00.000Z"),
             )
             .await
             .unwrap();
@@ -749,7 +754,7 @@ mod transparency_log {
                 &root,
                 &wb,
                 "2026-07-05T00:00:01.000Z",
-                &cj(&wb, "2026-07-05T00:00:01.000Z"),
+                &cosig_json(&wb, "2026-07-05T00:00:01.000Z"),
             )
             .await
             .unwrap();
@@ -762,7 +767,7 @@ mod transparency_log {
                 &root6,
                 &wa,
                 "2026-07-05T00:00:02.000Z",
-                &cj(&wa, "2026-07-05T00:00:02.000Z"),
+                &cosig_json(&wa, "2026-07-05T00:00:02.000Z"),
             )
             .await
             .unwrap();
@@ -786,7 +791,7 @@ mod transparency_log {
                 &root,
                 &wa,
                 "2026-07-05T02:00:00.000Z",
-                &cj(&wa, "2026-07-05T02:00:00.000Z"),
+                &cosig_json(&wa, "2026-07-05T02:00:00.000Z"),
             )
             .await
             .unwrap();
@@ -806,6 +811,190 @@ mod transparency_log {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    /// A fresh re-observation from the same witness at the same tuple
+    /// UPSERTs (newest witnessed_at wins) — one row per witness per tuple,
+    /// cosignatures being ephemeral per-observation evidence (§4).
+    /// Run-unique keys avoid collisions against the shared database.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn witness_cosignature_reobservation_upserts() {
+        let Some(url) = pg_url_or_skip() else { return };
+        let store = log_store(&url).await;
+
+        let log_id = format!("did:web:reg.test/log/{}", uuid::Uuid::new_v4().simple());
+        let root = format!("sha256:{}", "0".repeat(64));
+        let wa = format!("did:web:wa-{}.example.org", uuid::Uuid::new_v4().simple());
+
+        store
+            .upsert_witness_cosignature(
+                &log_id,
+                5,
+                &root,
+                &wa,
+                "2026-07-05T00:00:00.000Z",
+                &cosig_json(&wa, "2026-07-05T00:00:00.000Z"),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_witness_cosignature(
+                &log_id,
+                5,
+                &root,
+                &wa,
+                "2026-07-05T01:00:00.000Z",
+                &cosig_json(&wa, "2026-07-05T01:00:00.000Z"),
+            )
+            .await
+            .unwrap();
+        let got = store
+            .witness_cosignatures_for(&log_id, 5, &root)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 1, "one row per (tuple, witness)");
+        assert_eq!(
+            got[0]["witnessed_at"], "2026-07-05T01:00:00.000Z",
+            "newest wins"
+        );
+    }
+
+    // ── log-001 golden fixture (spec schemas/conformance) ─────────────
+    //
+    // Same fixture as the SQLite suite: the fixture's ctx_ids live on
+    // registry.example.com, not this test authority, so its leaves
+    // cannot arrive through publish; the pinned JCS leaf encodings are
+    // inserted as stored rows and the store's read path must reproduce
+    // every pinned §5.1 leaf hash, the pinned tree-size-5 root, and the
+    // pinned inclusion path for leaf 0.
+    //
+    // The fixture pins DENSE leaf indexes 0..5 and a whole-tree root,
+    // which cannot coexist with the shared database's accreting log — so
+    // unlike its neighbors this test isolates itself in a run-unique
+    // Postgres schema via `search_path` (the migrations are
+    // schema-relocatable) rather than with run-unique producers.
+
+    const LOG_001_LEAVES: [&str; 5] = [
+        r#"{"content_hash":"sha256:f170150ddbf59d99794e7797824591b374d459782084597b644ecc57a41031b5","created_at":"2026-04-16T10:30:15.123Z","ctx_id":"acdp://registry.example.com/12345678-1234-4321-8123-123456781234","key_fingerprint":"sha256:139e3940e64b5491722088d9a0d741628fc826e09475d341a780acde3c4b8070","leaf_version":"acdp-log-leaf/1","lineage_id":"lin:sha256:c7fef01c000f8edaa9cb46122ceb5d7bca38328f002fb0f40e362e3b289bbb2a","origin_registry":"registry.example.com","receipt_hash":"sha256:9deaa52778ad3b6be27a96d607c3017e9e11442905891a8972f34d8c2dbca9cf"}"#,
+        r#"{"content_hash":"sha256:5b8be477da9b3e1354ebf2868494acb702301aaa825c1c3af3f92c5536ba7bd1","created_at":"2026-07-01T01:00:00.000Z","ctx_id":"acdp://registry.example.com/00000000-0000-4000-8000-000000000001","key_fingerprint":"sha256:139e3940e64b5491722088d9a0d741628fc826e09475d341a780acde3c4b8070","leaf_version":"acdp-log-leaf/1","lineage_id":"lin:sha256:a65dce2bc7d3d2f52513c14c9d7262903c960490b17308b272981240a76c2d42","origin_registry":"registry.example.com","receipt_hash":"sha256:2b8fa37afe87358aa039e78802f4a9b9fb4bc5df2a814a3f7cf5200f7f64b3df"}"#,
+        r#"{"content_hash":"sha256:a0c8d76890ec38db8791e82d7a8e24194f84c13ae67bdaa167540b58cb95507b","created_at":"2026-07-02T02:00:00.000Z","ctx_id":"acdp://registry.example.com/00000000-0000-4000-8000-000000000002","key_fingerprint":"sha256:139e3940e64b5491722088d9a0d741628fc826e09475d341a780acde3c4b8070","leaf_version":"acdp-log-leaf/1","lineage_id":"lin:sha256:518c191ba24d2fea433a768e232cb1d0ff152a39b38f28ac7f91960c9f8f7aba","origin_registry":"registry.example.com","receipt_hash":"sha256:591fa4c29669546b777bd1a4583aa724e9586b083c096d4b62f68b630dd18834"}"#,
+        r#"{"content_hash":"sha256:acbd2ea0c5608db56e1bd38bb0145a6f8363b30d8610abb746014a11f1a53c55","created_at":"2026-07-03T03:00:00.000Z","ctx_id":"acdp://registry.example.com/00000000-0000-4000-8000-000000000003","key_fingerprint":"sha256:139e3940e64b5491722088d9a0d741628fc826e09475d341a780acde3c4b8070","leaf_version":"acdp-log-leaf/1","lineage_id":"lin:sha256:1d941fb2ecdad88db6f9f3ecd5993178ab94f72e1061e685441d11ef04d92c05","origin_registry":"registry.example.com","receipt_hash":"sha256:342e57dc6d174cc7fe974c99f16c19ba598dfa31f41e560112db3f5ef21c5d91"}"#,
+        r#"{"content_hash":"sha256:6f72132b15b294cea2e753efc9b7a105d6d7ebd1527adecd9f2bfc7a677a129b","created_at":"2026-07-04T04:00:00.000Z","ctx_id":"acdp://registry.example.com/00000000-0000-4000-8000-000000000004","key_fingerprint":"sha256:139e3940e64b5491722088d9a0d741628fc826e09475d341a780acde3c4b8070","leaf_version":"acdp-log-leaf/1","lineage_id":"lin:sha256:c1987e0ba3e82db332daaafd64547aa6cbb66f191d53d2023a0ff78dc6c07063","origin_registry":"registry.example.com","receipt_hash":"sha256:88ee7b664509a56dbd597ccd2f8e19c39e0aaf2c75133d0b73781ce14cf5169f"}"#,
+    ];
+
+    const LOG_001_LEAF_HASHES: [&str; 5] = [
+        "sha256:95d99654d4d3de54a4d7cc04e079de61135023c78bb8192bdb79a09253afb8c1",
+        "sha256:846b4d6c07ca099eea348c1e219345ddd426c0531cc30d3dd626d0fa34ec7704",
+        "sha256:db94dd74b5c68f6d362129703ea587c8756d65cad0cc9859829021746a114451",
+        "sha256:dc309b7856483acb5b2a92323dd9c1571a778bdb7b446587100022b49ee5fb3b",
+        "sha256:6f673f8532d24869047264d89e2ad65f6ff2fa3c2674bb2fb9fa02855e090b3a",
+    ];
+
+    const LOG_001_ROOT: &str =
+        "sha256:0b5978172c671ca050b44790a749b18fc29d58a7a17495fbb4e0f86eb885f731";
+
+    const LOG_001_INCLUSION_PATH_LEAF_0: [&str; 3] = [
+        "sha256:846b4d6c07ca099eea348c1e219345ddd426c0531cc30d3dd626d0fa34ec7704",
+        "sha256:54d7edc4ba9d151eedd7f4bb872884f0af5ff32b39f98866d67873b00687c605",
+        "sha256:6f673f8532d24869047264d89e2ad65f6ff2fa3c2674bb2fb9fa02855e090b3a",
+    ];
+
+    /// Connect a log-enabled store whose tables live in a fresh,
+    /// run-unique schema (`search_path` pinned on the connection), giving
+    /// the fixture the EMPTY log its pinned indexes require. Returns the
+    /// isolated store, an admin handle on the default schema for
+    /// cleanup, and the schema name.
+    async fn schema_isolated_log_store(url: &str) -> (PgStore, PgStore, String) {
+        let schema = format!("log001_{}", uuid::Uuid::new_v4().simple());
+        let admin = PgStore::connect(url, 1).await.expect("pg connect");
+        sqlx::query(&format!("CREATE SCHEMA \"{schema}\""))
+            .execute(admin.pool())
+            .await
+            .expect("create run-unique schema");
+        let sep = if url.contains('?') { '&' } else { '?' };
+        let store = PgStore::connect(&format!("{url}{sep}options[search_path]={schema}"), 4)
+            .await
+            .expect("pg connect (isolated schema)")
+            .with_transparency_log();
+        store.migrate().await.expect("pg migrate (isolated schema)");
+        (store, admin, schema)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn log_001_fixture_leaves_reproduce_pinned_root() {
+        let Some(url) = pg_url_or_skip() else { return };
+        let (store, admin, schema) = schema_isolated_log_store(&url).await;
+
+        for (i, leaf_json) in LOG_001_LEAVES.iter().enumerate() {
+            let leaf: serde_json::Value = serde_json::from_str(leaf_json).unwrap();
+            let ctx_id = leaf["ctx_id"].as_str().unwrap();
+            // Stub context row to satisfy the log_leaves FK (the fixture
+            // leaves did not arrive through publish).
+            sqlx::query(
+                "INSERT INTO contexts (ctx_id, lineage_id, agent_id, origin_registry, \
+                 created_at, visibility, context_type, version, title, content_hash, body_json) \
+                 VALUES ($1, $2, 'did:key:fixture', 'registry.example.com', $3::timestamptz, \
+                 'public', 'data_snapshot', 1, 'log-001 fixture', $4, '{}'::jsonb)",
+            )
+            .bind(ctx_id)
+            .bind(leaf["lineage_id"].as_str().unwrap())
+            .bind(leaf["created_at"].as_str().unwrap())
+            .bind(leaf["content_hash"].as_str().unwrap())
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+            // The store persists the exact canonical bytes + their hash —
+            // recomputed here exactly as commit_publish computes them.
+            let hash = acdp::crypto::merkle::leaf_hash(leaf_json.as_bytes());
+            let hash_hex = encode_sha256_hex(&hash);
+            assert_eq!(
+                hash_hex, LOG_001_LEAF_HASHES[i],
+                "leaf {i}: §5.1 hash over the pinned JCS bytes must match the fixture"
+            );
+            sqlx::query(
+                "INSERT INTO log_leaves (leaf_index, ctx_id, leaf_json, leaf_hash) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(i as i64)
+            .bind(ctx_id)
+            .bind(*leaf_json)
+            .bind(&hash_hex)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        }
+
+        // Root reproduction through the store's read path.
+        assert_eq!(store.log_tree_size().await.unwrap(), 5);
+        let hashes = store.log_leaf_hashes(5).await.unwrap();
+        let root = acdp::crypto::merkle::merkle_tree_hash(&hashes);
+        assert_eq!(
+            encode_sha256_hex(&root),
+            LOG_001_ROOT,
+            "tree-size-5 root over the stored fixture leaves must match log-001"
+        );
+
+        // Pinned inclusion path for leaf 0 at size 5.
+        let path = acdp::crypto::merkle::inclusion_path(0, &hashes).unwrap();
+        let path_hex: Vec<String> = path.iter().map(encode_sha256_hex).collect();
+        assert_eq!(path_hex, LOG_001_INCLUSION_PATH_LEAF_0);
+
+        // The stored rows round-trip through the typed leaf and rehash
+        // identically (byte-exact reproducibility).
+        for e in store.log_entries(0, 5).await.unwrap() {
+            assert_eq!(
+                e.leaf().unwrap().leaf_hash_hex().unwrap(),
+                e.leaf_hash,
+                "stored leaf bytes reproduce the stored hash"
+            );
+        }
+
+        // Drop the run-unique schema so reruns never accrete schemas.
+        sqlx::query(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
+            .execute(admin.pool())
+            .await
+            .expect("drop run-unique schema");
     }
 }
 

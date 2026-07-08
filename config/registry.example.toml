@@ -68,7 +68,7 @@ anonymous_public_reads = true
 # Enforce tenant scoping on every authenticated request. Default false keeps
 # V0 behavior (a request that asserts no tenant runs with the tenant filter
 # disabled, gated only by visibility). Set true on a multi-tenant deployment:
-# a request that resolves to no tenant is rejected (401), and an
+# a request that resolves to no tenant is rejected (403 not_authorized), and an
 # authenticated caller's tenant is taken ONLY from the JWT `tenant` claim, so
 # an unbound token can't assert a tenant via the X-Tenant-Id header.
 require_tenant = false

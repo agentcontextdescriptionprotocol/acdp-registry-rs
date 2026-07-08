@@ -35,6 +35,13 @@ issue. We aim to acknowledge reports within 72 hours.
 - Leave the per-agent rate limits (`limits.publish_rate_per_minute`,
   `limits.challenge_rate_per_minute`) enabled; front multi-replica deployments
   with a shared/proxy limiter for a global bound.
+- Leave the `[rate_limit]` per-IP + global `/auth/*` limiter enabled (it is on
+  by default). Behind a reverse proxy, set `rate_limit.trusted_proxies` to the
+  proxy's CIDR so the client IP is read from `X-Forwarded-For` — the header is
+  never trusted otherwise, since an unauthenticated client could spoof it to
+  dodge the per-IP bucket.
+- If you enable the Prometheus `/metrics` endpoint on a network you don't fully
+  trust, gate it with `metrics.bearer_token` (or keep it behind the proxy).
 - Revoke compromised tokens with `POST /auth/token/revoke` instead of rotating
   the signing key when a full rotation is too disruptive.
 - Restrict the Postgres role to the application database — the migrations are

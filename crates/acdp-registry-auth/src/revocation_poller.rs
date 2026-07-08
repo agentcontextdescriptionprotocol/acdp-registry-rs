@@ -7,7 +7,7 @@
 //!
 //! Per-issuer cursor (in unix-ms) is persisted via
 //! [`RevocationStore::get_revocation_cursor`] /
-//! [`set_revocation_cursor`] (plan §5). On startup the poller reads
+//! [`RevocationStore::set_revocation_cursor`] (plan §5). On startup the poller reads
 //! the persisted cursor; on a successfully-applied batch it writes
 //! the new cursor. A restart picks up exactly where the prior
 //! instance left off — no re-fetching the whole feed from `since=0`.

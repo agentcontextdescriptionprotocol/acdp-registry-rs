@@ -10,10 +10,17 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 
+# Superseded pushes to the same PR cancel their in-flight run; pushes to
+# main always run to completion so the cache and badge stay trustworthy.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -25,6 +32,7 @@ jobs:
   clippy:
     name: clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -44,9 +52,43 @@ jobs:
             --features storage-sqlite,playground \
             --all-targets -- -D warnings
 
+  # The workspace declares rust-version = 1.88; make that claim enforceable
+  # instead of aspirational. Checks both shipped storage backends.
+  msrv:
+    name: msrv (1.88)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check (sqlite default)
+        run: cargo check --workspace --all-targets
+      - name: cargo check (postgres)
+        run: |
+          cargo check -p acdp-registry-server \
+            --no-default-features --features storage-pg \
+            --all-targets
+
+  docs:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RUSTDOCFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo doc
+        run: cargo doc --workspace --no-deps
+
   test:
     name: tests
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     services:
       postgres:
         image: postgres:16-alpine
@@ -67,6 +109,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo test (sqlite)
         run: cargo test --workspace
+      - name: cargo test (playground)
+        run: |
+          cargo test -p acdp-registry-server \
+            --features storage-sqlite,playground
       - name: cargo test (postgres)
         env:
           ACDP_REGISTRY_TEST_PG_URL: postgres://acdp:acdp@localhost:5432/acdp_registry
@@ -76,9 +122,51 @@ jobs:
             --no-default-features --features storage-pg \
             --test pg_integration
 
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: acdp
+          POSTGRES_PASSWORD: acdp
+          POSTGRES_DB: acdp_registry
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U acdp"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: cargo llvm-cov
+        env:
+          ACDP_REGISTRY_TEST_PG_URL: postgres://acdp:acdp@localhost:5432/acdp_registry
+        run: |
+          cargo llvm-cov --workspace --lcov --output-path lcov.info
+      - name: coverage summary
+        run: |
+          echo '## Coverage' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cargo llvm-cov report --summary-only >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lcov
+          path: lcov.info
+
   audit:
     name: cargo-deny
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2

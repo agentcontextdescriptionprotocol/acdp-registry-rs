@@ -63,9 +63,10 @@ The store carries the tenant binding alongside each context:
   binding.
 - `list_contexts(tenant)` and `/admin/contexts` filter at the **SQL level**, so
   pagination pages don't short.
-- Search and lineage **post-filter** in the handler with a bounded refill loop
-  (up to 6 inner pages) — so a search page may come back shorter than `limit`;
-  keep paging until `next_cursor` is absent.
+- Search and lineage **post-filter the tenant binding** in the handler with a
+  bounded refill loop (up to 6 inner pages) — so a search page may come back
+  shorter than `limit`; keep paging until `next_cursor` is absent. (Visibility
+  itself is enforced in SQL and never causes short pages.)
 
 ## Configuration
 

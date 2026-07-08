@@ -210,8 +210,8 @@ pub struct LogProofQuery {
     pub second: Option<String>,
 }
 
-/// `GET /log/proof` (§8.2) — inclusion mode (`?ctx_id=` | `?leaf_index=`
-/// [`&tree_size=`]) or consistency mode (`?first=&second=`).
+/// `GET /log/proof` (§8.2) — inclusion mode (`?ctx_id=` | `?leaf_index=`,
+/// optionally `&tree_size=`) or consistency mode (`?first=&second=`).
 pub async fn log_proof<S: ExtendedRegistryStore + 'static>(
     State(state): State<Arc<AppState<S>>>,
     headers: HeaderMap,
@@ -439,7 +439,7 @@ pub struct LogEntriesQuery {
 /// entry unconditionally (ordered leaf hashes alone let any third party
 /// recompute every root); `leaf` only for entries whose context the
 /// requester is authorized to retrieve. The page is capped at
-/// [`LOG_ENTRIES_PAGE_CAP`]; callers continue from `start + len(entries)`.
+/// `LOG_ENTRIES_PAGE_CAP`; callers continue from `start + len(entries)`.
 pub async fn log_entries<S: ExtendedRegistryStore + 'static>(
     State(state): State<Arc<AppState<S>>>,
     headers: HeaderMap,

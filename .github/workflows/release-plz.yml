@@ -9,6 +9,11 @@ permissions:
   pull-requests: write
   contents: write
 
+# Never run two release-plz invocations concurrently — overlapping runs can
+# race on the release PR and on publishing. Queue instead of cancel.
+concurrency:
+  group: release-plz
+
 jobs:
   release-plz:
     runs-on: ubuntu-latest

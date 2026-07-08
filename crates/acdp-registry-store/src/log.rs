@@ -220,4 +220,82 @@ mod tests {
         let err = build_leaf_record(&b, &serde_json::json!({})).unwrap_err();
         assert!(matches!(err, AcdpError::RegistryInternal(_)), "{err:?}");
     }
+
+    /// A `LogEntryRecord` with the given stored columns (the read-back
+    /// projection of one `log_leaves` row).
+    fn record(leaf_json: &str, leaf_hash: &str) -> LogEntryRecord {
+        LogEntryRecord {
+            leaf_index: 0,
+            ctx_id: "acdp://reg.test/00000000-0000-4000-8000-000000000001".into(),
+            leaf_hash: leaf_hash.into(),
+            leaf_json: leaf_json.into(),
+        }
+    }
+
+    /// Stored `leaf_json` that is not valid JSON at all is REGISTRY
+    /// corruption, not caller error: `leaf_value()` (and `leaf()`, which
+    /// parses through it) reports `registry_internal`, naming the ctx_id
+    /// so the broken row is findable.
+    #[test]
+    fn corrupt_leaf_json_is_registry_internal() {
+        let r = record("not json {", &format!("sha256:{}", "a".repeat(64)));
+        match r.leaf_value().unwrap_err() {
+            AcdpError::RegistryInternal(msg) => {
+                assert!(msg.contains(&r.ctx_id), "message names the ctx_id: {msg}");
+                assert!(msg.contains("not valid JSON"), "{msg}");
+            }
+            other => panic!("expected RegistryInternal, got {other:?}"),
+        }
+        assert!(
+            matches!(r.leaf(), Err(AcdpError::RegistryInternal(_))),
+            "leaf() surfaces the same corruption"
+        );
+    }
+
+    /// Valid JSON that is not a complete RFC-ACDP-0012 §4 leaf fails the
+    /// closed-schema `leaf()` parse with `invalid_log_proof`, while
+    /// `leaf_value()` (the raw wire projection) still succeeds.
+    #[test]
+    fn incomplete_leaf_fails_closed_schema_parse() {
+        let r = record("{}", &format!("sha256:{}", "a".repeat(64)));
+        assert_eq!(r.leaf_value().unwrap(), serde_json::json!({}));
+        let err = r.leaf().unwrap_err();
+        assert!(matches!(err, AcdpError::InvalidLogProof(_)), "{err:?}");
+
+        // A structurally complete leaf with a wrong leaf_version is
+        // rejected the same way (the schema is closed on version too).
+        let (leaf_json, leaf_hash) = build_leaf_record(&body(), &receipt_for(&body())).unwrap();
+        let wrong_version = leaf_json.replace("acdp-log-leaf/1", "acdp-log-leaf/9");
+        let err = record(&wrong_version, &leaf_hash).leaf().unwrap_err();
+        assert!(matches!(err, AcdpError::InvalidLogProof(_)), "{err:?}");
+    }
+
+    /// `leaf_hash_bytes()` decodes only the exact §2 wire form
+    /// `"sha256:" + 64 lowercase hex digits`; every malformed variant is
+    /// `invalid_log_proof`.
+    #[test]
+    fn invalid_leaf_hash_is_rejected() {
+        for bad in [
+            "",                                      // empty
+            &"a".repeat(64),                         // missing "sha256:" prefix
+            &format!("md5:{}", "a".repeat(64)),      // wrong algorithm
+            &format!("sha256:{}", "a".repeat(63)),   // too short
+            &format!("sha256:{}", "a".repeat(65)),   // too long
+            &format!("sha256:{}", "A".repeat(64)),   // uppercase hex
+            &format!("sha256:{}zz", "a".repeat(62)), // non-hex digits
+        ] {
+            let err = record("{}", bad).leaf_hash_bytes().unwrap_err();
+            assert!(
+                matches!(err, AcdpError::InvalidLogProof(_)),
+                "'{bad}' must be rejected as invalid_log_proof, got {err:?}"
+            );
+        }
+        // The well-formed wire form round-trips to the raw digest.
+        assert_eq!(
+            record("{}", &format!("sha256:{}", "ab".repeat(32)))
+                .leaf_hash_bytes()
+                .unwrap(),
+            [0xabu8; 32]
+        );
+    }
 }

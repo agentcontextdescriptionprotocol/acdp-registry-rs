@@ -79,12 +79,14 @@ chosen at **compile time** by the `acdp-registry-server` Cargo features; the
 
 Every request passes through the middleware stack assembled in `build_router()`
 (`crates/acdp-registry-core/src/lib.rs`), outermost first: `x-request-id`
-assignment + propagation → `TraceLayer` → 30 s `TimeoutLayer` →
-`RequestBodyLimitLayer` (capped at `limits.max_payload_bytes`) → CORS. ACDP data
-and auth routes additionally carry an `application/acdp+json` response-header
-layer; an outermost `if_not_present` layer stamps that media type on
-middleware-generated errors (413/408) that bypass the per-route layer. Full
-endpoint reference: [HTTP-API.md](HTTP-API.md).
+assignment + propagation → request metrics (when `metrics.enabled`; FEAT-10) →
+`TraceLayer` → 30 s `TimeoutLayer` → `RequestBodyLimitLayer` (capped at
+`limits.max_payload_bytes`) → CORS. The `/auth/*` routes additionally carry the
+FEAT-06 per-IP/global rate-limit `route_layer`, and ACDP data and auth routes
+carry an `application/acdp+json` response-header layer; an outermost
+`if_not_present` layer stamps that media type on middleware-generated errors
+(413/408) that bypass the per-route layer. Full endpoint reference:
+[HTTP-API.md](HTTP-API.md).
 
 ## Publish pipeline
 
@@ -105,7 +107,9 @@ What this registry wraps around that call:
 4. Tenant resolution for the write (`tenant_for_publish`; see
    [MULTI-TENANCY.md](MULTI-TENANCY.md)).
 5. → `RegistryServer::publish_verified(req, idempotency_key, resolver)`.
-6. A `context.published` webhook on success (see [WEBHOOKS.md](WEBHOOKS.md)).
+6. Receipt minting and the transparency-log leaf append, when `[receipt]` /
+   `[log]` are enabled (see [RECEIPTS.md](RECEIPTS.md)).
+7. A `context.published` webhook on success (see [WEBHOOKS.md](WEBHOOKS.md)).
 
 DID verification reuses `acdp`'s `WebResolver` (LRU-cached, SSRF-policy-gated —
 see [acdp-rs · Security Model][acdp-security]) for **both** publish and
@@ -130,11 +134,12 @@ revocation, cross-issuer federation — is in
 ## Visibility
 
 Visibility enforcement is centralized: `RegistryServer::can_retrieve` for
-retrieval, and the `can_surface_in_search` predicate for search. Both implement
-the same RFC-ACDP-0008 §4.5 rule — handlers must never reimplement it. When you
-add an endpoint that returns ACDP-typed data, route errors through
+single-object retrieval, and the SQL `WHERE` clause each store builds for
+search (DESIGN-01 pushed the predicate into SQL on both backends). Both
+implement the same RFC-ACDP-0008 §4.5 rule — handlers must never reimplement
+it. When you add an endpoint that returns ACDP-typed data, route errors through
 `RegistryError` (so the wire envelope lands automatically) and cover the
-visibility rule in those shared predicates, not in the handler.
+visibility rule in those shared paths, not in the handler.
 
 ## Crate map
 

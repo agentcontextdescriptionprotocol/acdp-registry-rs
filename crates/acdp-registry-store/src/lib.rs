@@ -15,7 +15,7 @@ use async_trait::async_trait;
 
 pub use log::{build_leaf_record, LogEntryRecord};
 
-/// Cursor-keyed page returned by [`ExtendedRegistryStore::list`].
+/// Cursor-keyed page returned by [`ExtendedRegistryStore::list_contexts`].
 #[derive(Debug, Clone)]
 pub struct Page<T> {
     pub items: Vec<T>,

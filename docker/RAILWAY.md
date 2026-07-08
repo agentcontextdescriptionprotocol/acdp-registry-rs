@@ -6,7 +6,7 @@ every `v*` tag:
 
 ```
 ghcr.io/agentcontextdistributionprotocol/acdp-registry:latest   # default branch
-ghcr.io/agentcontextdistributionprotocol/acdp-registry:v0.1.0   # release tags
+ghcr.io/agentcontextdistributionprotocol/acdp-registry:0.1.0    # release tags (leading `v` stripped)
 ghcr.io/agentcontextdistributionprotocol/acdp-registry:sha-<sha>
 ```
 

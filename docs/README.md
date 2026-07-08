@@ -1,9 +1,11 @@
 # acdp-registry-rs documentation
 
 Reference documentation for the Agent Context Distribution Protocol (ACDP)
-registry (protocol v0.1.0, with v0.2.0 trust-hardening — registry receipts
-and did:key — available when a receipt signing key is configured). Start with the [project README](../README.md) for a quick
-start; these docs go deeper.
+registry. The baseline is protocol v0.1.0; higher protocol levels light up as
+their sections are configured — v0.2.0 trust-hardening (registry receipts,
+did:key), v0.3.0 (lifecycle events, the transparency log, head receipts), and
+v0.4.0 (witness cosignature aggregation). Start with the
+[project README](../README.md) for a quick start; these docs go deeper.
 
 ## Map
 
@@ -35,6 +37,7 @@ verification, SSRF defenses, or the canonical error-code registry lives in the
 | SSRF defenses, HTTPS/size/redirect caps, algorithm-downgrade rejection (`WebResolver`) | [acdp-rs · Security Model][acdp-security] |
 | The three-layer model (what is hashed/signed/mutable) | [acdp-rs · Architecture][acdp-arch] |
 | API reference for the `acdp` crate | [docs.rs/acdp](https://docs.rs/acdp) |
+| The IANA-style registries (profiles, error codes, lifecycle event types, signature algorithms) | [spec · registries][spec-registries] |
 | Normative protocol rules | [RFC set][spec] |
 
 [acdp-registry]: https://github.com/agentcontextdistributionprotocol/acdp-rs/blob/main/docs/registry.md
@@ -56,8 +59,17 @@ verification, SSRF defenses, or the canonical error-code registry lives in the
 - **RFC-ACDP-XXXX** references point at the [protocol spec][spec].
 
 [spec]: https://github.com/agentcontextdistributionprotocol/agentcontextdistributionprotocol
+[spec-registries]: https://github.com/agentcontextdistributionprotocol/agentcontextdistributionprotocol/tree/main/registries
+[spec-profiles]: https://github.com/agentcontextdistributionprotocol/agentcontextdistributionprotocol/blob/main/registries/profiles.md
 
 ## Spec profiles implemented
 
-`acdp-registry-core` and `acdp-registry-discovery`, advertised at
-`GET /.well-known/acdp.json`. See [HTTP-API.md](HTTP-API.md#get-well-knownacdpjson).
+The profile names, their status, and their prerequisites are defined
+canonically in the spec's [profile registry][spec-profiles] — this section only
+records **which** of them this implementation advertises, not what they mean.
+
+`acdp-registry-core` and `acdp-registry-discovery` always; `acdp-registry-receipts`,
+`acdp-registry-head-receipts`, `acdp-registry-lifecycle`, and
+`acdp-registry-transparency-log` are advertised when their config sections are
+enabled. All are served at `GET /.well-known/acdp.json`.
+See [HTTP-API.md](HTTP-API.md#get-well-knownacdpjson).

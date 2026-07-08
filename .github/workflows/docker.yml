@@ -10,9 +10,14 @@ on:
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/acdp-registry
 
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
       packages: write
@@ -35,12 +40,57 @@ jobs:
             type=semver,pattern={{version}}
             type=sha
             type=raw,value=latest,enable={{is_default_branch}}
-      - uses: docker/build-push-action@v6
+
+      # Build the native-arch image first and load it into the local daemon
+      # so it can be smoke-tested before anything is published. The
+      # multi-platform push below reuses this build via the buildx cache.
+      - name: build (amd64, local)
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: docker/Dockerfile
-          push: ${{ github.event_name != 'pull_request' }}
+          load: true
+          platforms: linux/amd64
+          tags: acdp-registry:smoke
+          build-args: STORAGE_FEATURE=storage-pg
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: smoke test
+        run: |
+          set -euxo pipefail
+          docker network create acdp-smoke
+          docker run -d --name pg --network acdp-smoke \
+            -e POSTGRES_USER=acdp -e POSTGRES_PASSWORD=acdp -e POSTGRES_DB=acdp_registry \
+            --health-cmd "pg_isready -U acdp" --health-interval 2s --health-retries 15 \
+            postgres:16-alpine
+          for i in $(seq 1 30); do
+            [ "$(docker inspect -f '{{.State.Health.Status}}' pg)" = healthy ] && break
+            sleep 2
+          done
+          docker run -d --name registry --network acdp-smoke -p 8443:8443 \
+            -v "$PWD/docker/config.docker.toml:/app/config.toml:ro" \
+            -e ACDP_REGISTRY_CONFIG=/app/config.toml \
+            -e ACDP_REGISTRY_STORAGE__POSTGRES_URL=postgres://acdp:acdp@pg:5432/acdp_registry \
+            acdp-registry:smoke
+          curl --fail --silent --show-error --retry 15 --retry-delay 2 --retry-all-errors \
+            http://localhost:8443/healthz
+          docker logs registry
+          docker rm -f registry pg
+          docker network rm acdp-smoke
+
+      # PRs stop here: the multi-arch build (arm64 under QEMU) is slow and
+      # its output is never published, so only pushes and tags pay for it.
+      - name: build + push (multi-platform)
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: STORAGE_FEATURE=storage-pg
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

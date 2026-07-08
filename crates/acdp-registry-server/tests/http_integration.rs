@@ -12,12 +12,16 @@
 //! - publish → retrieve → search round trip
 //! - `/contexts/{ctx_id}/body` bare-Body response
 //! - `/lineages/{id}` and `/lineages/{id}/current` (round trip + 404)
-//! - visibility filtering for restricted contexts
+//! - visibility filtering for restricted contexts (deny AND audience grant)
 //! - Idempotency-Key replay and collision
 //! - list pagination across same-second created_at
+//! - malformed search cursor → 400 `invalid_cursor`
 //! - webhook absence when disabled
 //! - 413 enforcement on `RequestBodyLimitLayer`
 //! - playground pinned-key strict/lax/wrong-key paths
+//! - `/auth/challenge` → `/auth/token` handshake (offline gates), token
+//!   revocation end-to-end, expired-bearer rejection
+//! - `/admin/lineages/{id}/audit` negative paths (bad token / unknown id)
 
 #![cfg(feature = "storage-sqlite")]
 
@@ -30,7 +34,8 @@ use acdp::registry::RegistryServer;
 use acdp::types::capabilities::{CapabilitiesDocument, Limits};
 use acdp::types::primitives::{AgentDid, ContextType, Visibility};
 use acdp_registry_auth::{
-    AuthService, ChallengeStore, InMemoryChallengeStore, JwtSecret, JwtSigner,
+    AuthService, ChallengeStore, InMemoryChallengeStore, InMemoryRevocationStore, JwtSecret,
+    JwtSigner, RevocationRecord, RevocationStore,
 };
 use acdp_registry_core::{build_router, AppStateInner};
 use acdp_registry_sqlite::SqliteStore;
@@ -720,6 +725,30 @@ fn tenant_bound_token(tenant: Option<&str>) -> String {
     signer.sign(&claims).unwrap()
 }
 
+/// Forge an untenanted bearer for `sub` expiring `exp_offset_seconds` from
+/// now — the exact claim set `AuthService::issue_token` mints, signed by the
+/// same HS256 secret the default harness wires. A negative offset yields an
+/// already-expired token (the harness signer's leeway is 30s).
+fn forged_bearer(sub: &str, jti: &str, exp_offset_seconds: i64) -> String {
+    let secret = JwtSecret::from_bytes(&[42u8; 32]);
+    let signer = JwtSigner::new(secret, format!("did:web:{AUTHORITY}"), AUTHORITY.into(), 30);
+    let now = chrono::Utc::now().timestamp();
+    let claims = BearerClaims {
+        iss: format!("did:web:{AUTHORITY}"),
+        sub: sub.to_string(),
+        aud: AUTHORITY.into(),
+        jti: jti.to_string(),
+        iat: now - 60,
+        exp: now + exp_offset_seconds,
+        acdp: AcdpClaims {
+            registry: AUTHORITY.into(),
+            key_id: format!("{sub}#key-1"),
+        },
+        tenant: None,
+    };
+    signer.sign(&claims).unwrap()
+}
+
 #[tokio::test]
 async fn publish_rejects_tenant_header_that_contradicts_bound_token() {
     // A token bound to tenant-a must NOT be able to write a context into
@@ -756,10 +785,12 @@ async fn publish_rejects_tenant_header_that_contradicts_bound_token() {
         )
         .await
         .unwrap();
-    assert!(
-        resp.status() == StatusCode::UNAUTHORIZED || resp.status() == StatusCode::FORBIDDEN,
-        "spoofed X-Tenant-Id must be rejected, got {}",
-        resp.status()
+    // The mismatch surfaces as `AuthChallenge` → `not_authorized`, which
+    // RFC-ACDP-0007 §5 (and #19) pins to HTTP 403.
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "spoofed X-Tenant-Id must be rejected with 403 not_authorized"
     );
 }
 
@@ -1402,6 +1433,21 @@ async fn search_returns_published_context() {
 }
 
 #[tokio::test]
+async fn search_rejects_malformed_cursor_with_invalid_cursor() {
+    // Cursors are opaque base64("mint_ms|anchor_ms|ctx_id") strings minted
+    // by the store. One that isn't base64 at all — or decodes to the wrong
+    // shape — is a caller error: 400 `invalid_cursor`, not a 500 and not a
+    // silently-ignored filter.
+    let h = harness(true).await;
+    // "!!not-base64!!" (percent-encoded) and base64("not-a-cursor").
+    for cursor in ["%21%21not-base64%21%21", "bm90LWEtY3Vyc29y"] {
+        let (status, v) = get_json(&h.router, &format!("/contexts/search?cursor={cursor}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "cursor={cursor}: {v}");
+        assert_eq!(v["error"]["code"], "invalid_cursor", "cursor={cursor}: {v}");
+    }
+}
+
+#[tokio::test]
 async fn restricted_context_blocked_for_anonymous() {
     let h = harness(true).await;
     let app = &h.router;
@@ -1427,12 +1473,98 @@ async fn restricted_context_blocked_for_anonymous() {
         )
         .await
         .unwrap();
-    // Anonymous reader against restricted context — server-side gate
-    // returns NotFound rather than leaking existence.
-    assert!(
-        matches!(resp.status(), StatusCode::NOT_FOUND | StatusCode::FORBIDDEN),
-        "unauthorized read should fail, got {}",
-        resp.status()
+    // Anonymous reader against restricted context — the server-side gate
+    // returns 404 (same shape as absence), never a 403 that would leak
+    // the row's existence.
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "unauthorized read must be indistinguishable from absence"
+    );
+}
+
+#[tokio::test]
+async fn restricted_context_served_to_audience_member() {
+    // The RFC-ACDP-0008 §4.5 grant side — the mirror of
+    // `restricted_context_blocked_for_anonymous`: an authenticated agent
+    // listed in `audience` gets the full context AND the bare body, while
+    // an authenticated agent NOT in the audience gets the same 404 shape
+    // as absence (no existence oracle for the merely-logged-in).
+    let mut cfg = config(true);
+    cfg.auth.enabled = true;
+    let h = harness_from_config(cfg).await;
+    let req = producer(13)
+        .publish_request()
+        .title("audience-secret")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Restricted)
+        .audience(vec![AgentDid::new("did:web:agents.test:audience-1")])
+        .build()
+        .unwrap();
+    let (status, v) = publish(&h.router, &req, None).await;
+    assert_eq!(status, StatusCode::OK, "publish body = {v}");
+    let ctx_id = v["ctx_id"].as_str().unwrap().to_string();
+
+    // Audience member: full context served.
+    let member = forged_bearer("did:web:agents.test:audience-1", "aud-member-jti", 3600);
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/contexts/{}", pct_encode_path_segment(&ctx_id)))
+                .header("authorization", format!("Bearer {member}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "audience member gets 200");
+    let v = body_to_json(resp).await;
+    assert_eq!(v["body"]["title"], "audience-secret");
+
+    // Audience member: bare body served too (the /body route runs the
+    // same §4.5 predicate).
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/contexts/{}/body",
+                    pct_encode_path_segment(&ctx_id)
+                ))
+                .header("authorization", format!("Bearer {member}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "audience member gets /body");
+    let v = body_to_json(resp).await;
+    assert_eq!(v["title"], "audience-secret");
+
+    // Authenticated but NOT in the audience → same 404 shape as absence.
+    let stranger = forged_bearer("did:web:agents.test:stranger", "aud-stranger-jti", 3600);
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/contexts/{}/body",
+                    pct_encode_path_segment(&ctx_id)
+                ))
+                .header("authorization", format!("Bearer {stranger}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "a non-audience bearer must see the same shape as absence"
     );
 }
 
@@ -2655,6 +2787,257 @@ async fn token_endpoint_rejects_unknown_nonce() {
 }
 
 #[tokio::test]
+async fn token_endpoint_accepts_signed_challenge_through_offline_gates() {
+    // As much of the RFC-ACDP-0008 §3 handshake as an in-process build can
+    // drive: POST /auth/challenge issues the nonce, the agent signs the
+    // server-provided `signing_input` with its Ed25519 key, and POST
+    // /auth/token passes every OFFLINE verification gate — nonce take,
+    // agent/expires_at bindings (steps 1–3), the algorithm allow-list (4),
+    // and key_id parsing/agent binding — before failing at the DID-document
+    // fetch (step 5). A full 200 is not reachable here: the auth service
+    // accepts only `did:web` (no did:key branch), `did_web_to_url` is
+    // https-only, and this test build cannot host an in-process TLS server
+    // (rustls carries BOTH the `ring` and `aws-lc-rs` provider features via
+    // reqwest + axum-server, so `ServerConfig::builder()` refuses to pick a
+    // default and installing one needs a direct rustls dependency).
+    // `did:web:localhost` makes the resolution step fail deterministically
+    // OFFLINE at the SSRF loopback gate, so the assertion pins: everything
+    // before resolution passed and the failure IS the resolution step —
+    // not nonce/binding/algorithm policing.
+    let mut cfg = config(false);
+    cfg.auth.enabled = true;
+    let h = harness_from_config(cfg).await;
+
+    let agent_did = "did:web:localhost";
+    let key = SigningKey::from_bytes(&[77u8; 32]);
+
+    // 1. Challenge.
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/challenge")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "agent_id": agent_did }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let challenge = body_to_json(resp).await;
+    let nonce = challenge["nonce"].as_str().expect("nonce");
+    let expires_at = challenge["expires_at"].as_i64().expect("expires_at");
+    let signing_input = challenge["signing_input"].as_str().expect("signing_input");
+
+    // 2. Sign the exact server-provided input (RFC-ACDP-0001 §5.8 string
+    // form — the same encoding `verify_ed25519` expects).
+    let signature = key.sign_string(signing_input);
+
+    // 3. Redeem. The ONLY failure left is step 5 (DID-document fetch),
+    // which the resolver refuses offline: `localhost` resolves to loopback
+    // and the SSRF policy rejects the answer before any socket activity.
+    let body = json!({
+        "nonce": nonce,
+        "agent_id": agent_did,
+        "expires_at": expires_at,
+        "algorithm": "ed25519",
+        "key_id": format!("{agent_did}#key-1"),
+        "signature": signature,
+    });
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/token")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let v = body_to_json(resp).await;
+    assert_eq!(v["error"]["code"], "not_authorized", "body = {v}");
+    let msg = v["error"]["message"].as_str().expect("message");
+    assert!(
+        msg.contains("SSRF") || msg.contains("resolution"),
+        "the rejection must come from the DID-resolution step, not an \
+         earlier gate (nonce/binding/algorithm errors carry their own \
+         messages): {msg}"
+    );
+}
+
+#[tokio::test]
+async fn revoke_endpoint_revokes_bearer_end_to_end() {
+    // FEAT-02 happy path over HTTP — the inverse of the 503 test above:
+    // wire an `InMemoryRevocationStore` into BOTH the signer (`validate`
+    // consults it on every bearer check) and the service (`revoke_token`
+    // writes it), mint a bearer under the shared HS256 secret, record its
+    // issuance (so `owner_of` authorizes the self-revoke), then walk
+    // accepted → 204 revoke → rejected.
+    let db = tempfile::Builder::new()
+        .prefix("acdp-rev-e2e-")
+        .suffix(".sqlite")
+        .tempfile()
+        .unwrap();
+    let store = SqliteStore::connect(db.path(), 1).await.unwrap();
+    store.migrate().await.unwrap();
+    let server = Arc::new(RegistryServer::try_new(store, caps(), AUTHORITY).unwrap());
+    let challenges: Arc<dyn ChallengeStore> = Arc::new(InMemoryChallengeStore::new());
+    let revocations = Arc::new(InMemoryRevocationStore::new());
+    let secret = JwtSecret::from_bytes(&[42u8; 32]);
+    let signer = JwtSigner::new(secret, format!("did:web:{AUTHORITY}"), AUTHORITY.into(), 30)
+        .with_revocations(revocations.clone());
+    let resolver = Arc::new(WebResolver::new());
+    let auth = Arc::new(
+        AuthService::new(
+            AuthConfig {
+                enabled: true,
+                anonymous_public_reads: true,
+                ..AuthConfig::default()
+            },
+            challenges,
+            signer,
+            resolver,
+            AUTHORITY.into(),
+        )
+        .with_revocations(revocations.clone()),
+    );
+    let mut cfg = config(true);
+    cfg.auth.enabled = true;
+    let state = AppStateInner::new(server, auth, None, cfg, None);
+    let app = build_router(state);
+
+    let sub = format!("did:web:{AUTHORITY}:agents:revokee");
+    let token = forged_bearer(&sub, "revoke-e2e-jti", 3600);
+    revocations
+        .record_issued(RevocationRecord {
+            jti: "revoke-e2e-jti".into(),
+            agent_did: sub.clone(),
+            expires_at: chrono::Utc::now() + chrono::Duration::seconds(3600),
+        })
+        .await
+        .unwrap();
+
+    let read_with_bearer = |bearer: String| {
+        let app = app.clone();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .uri("/contexts/search?q=anything")
+                    .header("authorization", format!("Bearer {bearer}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+        }
+    };
+    let revoke_with_header = |auth_header: Option<String>| {
+        let app = app.clone();
+        async move {
+            let mut builder = Request::builder()
+                .method("POST")
+                .uri("/auth/token/revoke")
+                .header("content-type", "application/json");
+            if let Some(v) = auth_header {
+                builder = builder.header("authorization", v);
+            }
+            app.oneshot(
+                builder
+                    .body(Body::from(json!({ "jti": "revoke-e2e-jti" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    // Live token → accepted on a bearer-validating read.
+    assert_eq!(
+        read_with_bearer(token.clone()).await,
+        StatusCode::OK,
+        "the minted bearer must be accepted before revocation"
+    );
+
+    // Revoke with a missing bearer → 403 (auth-layer rejections are
+    // `not_authorized`, which #19 pins to 403 — this registry has no
+    // 401-bearing code).
+    let resp = revoke_with_header(None).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let v = body_to_json(resp).await;
+    assert_eq!(v["error"]["code"], "not_authorized", "body = {v}");
+
+    // Revoke with a garbage bearer → same 403.
+    let resp = revoke_with_header(Some("Bearer garbage-token".into())).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // The failed attempts revoked nothing — the token still works.
+    assert_eq!(read_with_bearer(token.clone()).await, StatusCode::OK);
+
+    // Self-revoke with the valid bearer → 204 No Content.
+    let resp = revoke_with_header(Some(format!("Bearer {token}"))).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // The revoked bearer is now rejected on the same read it passed above.
+    assert_eq!(
+        read_with_bearer(token).await,
+        StatusCode::FORBIDDEN,
+        "a revoked bearer must be rejected, not degraded to anonymous"
+    );
+}
+
+#[tokio::test]
+async fn expired_bearer_rejected_at_http_layer() {
+    // A bearer whose `exp` is an hour past — far beyond the harness
+    // signer's 30s leeway — must be rejected outright with the auth-layer
+    // 403 (`not_authorized`), NOT silently degraded to an anonymous read:
+    // `caller_from_headers` refuses to downgrade a present-but-invalid
+    // credential so an expired client sees the failure explicitly.
+    let mut cfg = config(true);
+    cfg.auth.enabled = true;
+    let h = harness_from_config(cfg).await;
+
+    let stale = forged_bearer("did:web:agents.test:stale", "expired-jti", -3600);
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/contexts/search?q=anything")
+                .header("authorization", format!("Bearer {stale}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let v = body_to_json(resp).await;
+    assert_eq!(v["error"]["code"], "not_authorized", "body = {v}");
+
+    // Control: the same claims with a future exp validate fine.
+    let live = forged_bearer("did:web:agents.test:stale", "live-jti", 3600);
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/contexts/search?q=anything")
+                .header("authorization", format!("Bearer {live}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn unsupported_method_on_context_route_is_405() {
     // A known path with an unsupported method returns 405 (axum's MethodRouter
     // fallback), not 404 — distinguishing "no such route" from "wrong verb".
@@ -3090,6 +3473,55 @@ async fn lineage_audit_walks_a_clean_chain() {
         v["receiptless_contexts"], 0,
         "every receipts-era context carries a receipt"
     );
+}
+
+/// Negative paths for `/admin/lineages/{id}/audit`: a WRONG bearer is
+/// refused by the admin gate (403, admin-only envelope) and an unknown
+/// lineage id with a valid admin bearer is a 404. (The missing-token 403
+/// and the happy path live in `lineage_audit_walks_a_clean_chain`.)
+#[tokio::test]
+async fn lineage_audit_rejects_bad_token_and_404s_unknown_lineage() {
+    let mut cfg = config(true);
+    cfg.auth.admin_tokens = vec!["audit-admin".into()];
+    let h = harness_from_config(cfg).await;
+
+    let ghost = format!("lin:sha256:{}", "cd".repeat(32));
+    let uri = format!("/admin/lineages/{}/audit", pct_encode_path_segment(&ghost));
+
+    // Wrong admin token → 403 with the admin convention's envelope; the
+    // lineage read never runs.
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&uri)
+                .header("authorization", "Bearer wrong-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let v = body_to_json(resp).await;
+    assert_eq!(v["error"], "admin-only", "body = {v}");
+
+    // Unknown (never-published) lineage with the right token → 404.
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&uri)
+                .header("authorization", "Bearer audit-admin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let v = body_to_json(resp).await;
+    assert_eq!(v["error"], "not_found", "body = {v}");
 }
 
 /// Upgrade boundary: enabling receipts must not break idempotent replays
