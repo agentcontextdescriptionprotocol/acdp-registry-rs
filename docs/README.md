@@ -37,6 +37,7 @@ verification, SSRF defenses, or the canonical error-code registry lives in the
 | SSRF defenses, HTTPS/size/redirect caps, algorithm-downgrade rejection (`WebResolver`) | [acdp-rs · Security Model][acdp-security] |
 | The three-layer model (what is hashed/signed/mutable) | [acdp-rs · Architecture][acdp-arch] |
 | API reference for the `acdp` crate | [docs.rs/acdp](https://docs.rs/acdp) |
+| The IANA-style registries (profiles, error codes, lifecycle event types, signature algorithms) | [spec · registries][spec-registries] |
 | Normative protocol rules | [RFC set][spec] |
 
 [acdp-registry]: https://github.com/agentcontextdistributionprotocol/acdp-rs/blob/main/docs/registry.md
@@ -58,8 +59,14 @@ verification, SSRF defenses, or the canonical error-code registry lives in the
 - **RFC-ACDP-XXXX** references point at the [protocol spec][spec].
 
 [spec]: https://github.com/agentcontextdistributionprotocol/agentcontextdistributionprotocol
+[spec-registries]: https://github.com/agentcontextdistributionprotocol/agentcontextdistributionprotocol/tree/main/registries
+[spec-profiles]: https://github.com/agentcontextdistributionprotocol/agentcontextdistributionprotocol/blob/main/registries/profiles.md
 
 ## Spec profiles implemented
+
+The profile names, their status, and their prerequisites are defined
+canonically in the spec's [profile registry][spec-profiles] — this section only
+records **which** of them this implementation advertises, not what they mean.
 
 `acdp-registry-core` and `acdp-registry-discovery` always; `acdp-registry-receipts`,
 `acdp-registry-head-receipts`, `acdp-registry-lifecycle`, and
