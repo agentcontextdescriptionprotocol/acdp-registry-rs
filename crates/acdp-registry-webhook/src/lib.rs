@@ -255,16 +255,17 @@ pub fn sign(secret: &str, body: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
     use super::*;
     use chrono::Utc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    /// Accept exactly one HTTP/1.1 request, return its raw bytes, and
-    /// reply `200 OK`. Enough to assert on the delivered headers + body
-    /// without pulling in an HTTP server dependency.
-    async fn capture_one_request(listener: TcpListener) -> String {
-        let (mut socket, _) = listener.accept().await.expect("accept");
+    /// Read one full HTTP/1.1 request (headers plus `Content-Length` body)
+    /// from the socket. Shared by the probe servers below.
+    async fn read_one_request(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
         let mut buf = Vec::new();
         let mut chunk = [0u8; 1024];
         // Read until we've seen the header terminator and the full body.
@@ -289,12 +290,69 @@ mod tests {
                 }
             }
         }
+        buf
+    }
+
+    /// Accept exactly one HTTP/1.1 request, return its raw bytes, and
+    /// reply `200 OK`. Enough to assert on the delivered headers + body
+    /// without pulling in an HTTP server dependency.
+    async fn capture_one_request(listener: TcpListener) -> String {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let buf = read_one_request(&mut socket).await;
         socket
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
             .await
             .expect("write response");
         socket.flush().await.ok();
         String::from_utf8_lossy(&buf).to_string()
+    }
+
+    /// Serve requests sequentially, answering with each scripted status line
+    /// in turn and `200 OK` once the script is exhausted. Every served
+    /// request bumps `hits`, so tests can assert on exact attempt counts.
+    async fn respond_with_statuses(
+        listener: TcpListener,
+        script: Vec<&'static str>,
+        hits: Arc<AtomicUsize>,
+    ) {
+        let mut script = script.into_iter();
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            read_one_request(&mut socket).await;
+            let status = script.next().unwrap_or("200 OK");
+            let resp =
+                format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            socket.write_all(resp.as_bytes()).await.ok();
+            socket.flush().await.ok();
+            hits.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Accept connections but never respond, parking the worker mid-delivery
+    /// so the queue backs up deterministically. Sockets are held open for the
+    /// life of the task so the client keeps waiting instead of erroring.
+    async fn hang_forever(listener: TcpListener) {
+        let mut held = Vec::new();
+        loop {
+            let Ok((socket, _)) = listener.accept().await else {
+                return;
+            };
+            held.push(socket);
+        }
+    }
+
+    /// Poll `cond` every 10ms until it holds, panicking after `deadline`.
+    async fn wait_until(deadline: Duration, mut cond: impl FnMut() -> bool) {
+        let start = std::time::Instant::now();
+        while !cond() {
+            assert!(
+                start.elapsed() < deadline,
+                "condition not met within {deadline:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     fn published_event() -> WebhookEvent {
@@ -540,5 +598,160 @@ mod tests {
             !raw.to_ascii_lowercase().contains("x-tenant-id"),
             "did not expect X-Tenant-Id header, got:\n{raw}"
         );
+    }
+
+    // ── retry / backoff classification ───────────────────────────────
+
+    #[tokio::test]
+    async fn non_429_client_error_is_permanent_no_retry() {
+        // A 4xx (other than 429) won't change on retry: the worker must give
+        // up after exactly one attempt even with retries budgeted.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let hits = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(respond_with_statuses(
+            listener,
+            vec!["404 Not Found"],
+            Arc::clone(&hits),
+        ));
+
+        let config = WebhookConfig {
+            enabled: true,
+            url: format!("http://{addr}/hook"),
+            secret: "shhh".into(),
+            timeout_seconds: 5,
+            max_retries: 5,
+            queue_capacity: 8,
+        };
+        let emitter = WebhookEmitter::spawn_with_policy(config, SsrfPolicy::allow_test_loopback());
+        emitter.emit(published_event());
+
+        wait_until(Duration::from_secs(5), || hits.load(Ordering::SeqCst) >= 1).await;
+        // A (buggy) retry would land after the initial 250ms backoff; give it
+        // 3x that and assert nothing else arrived.
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "4xx (non-429) must not be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn retries_429_and_5xx_until_success() {
+        // 429 and 5xx are transient: the worker retries with backoff and the
+        // event is eventually delivered. Script: 429 → 500 → 200, so the
+        // success requires surviving both retryable classifications.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let hits = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(respond_with_statuses(
+            listener,
+            vec!["429 Too Many Requests", "500 Internal Server Error"],
+            Arc::clone(&hits),
+        ));
+
+        let config = WebhookConfig {
+            enabled: true,
+            url: format!("http://{addr}/hook"),
+            secret: "shhh".into(),
+            timeout_seconds: 5,
+            max_retries: 5,
+            queue_capacity: 8,
+        };
+        let emitter = WebhookEmitter::spawn_with_policy(config, SsrfPolicy::allow_test_loopback());
+        emitter.emit(published_event());
+
+        // Backoff for the two retries is 250ms + 500ms; 10s is generous.
+        wait_until(Duration::from_secs(10), || hits.load(Ordering::SeqCst) >= 3).await;
+        // Brief settle window to catch a spurious 4th attempt after the 200.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            3,
+            "expected exactly 429, 500, then a delivered 200"
+        );
+    }
+
+    // ── queue backpressure & status ──────────────────────────────────
+
+    #[tokio::test]
+    async fn queue_full_drops_overflow_without_blocking() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(hang_forever(listener));
+
+        let config = WebhookConfig {
+            enabled: true,
+            url: format!("http://{addr}/hook"),
+            secret: "shhh".into(),
+            // Long enough that the worker stays parked on the hung delivery
+            // for the whole test.
+            timeout_seconds: 30,
+            max_retries: 1,
+            queue_capacity: 1,
+        };
+        let emitter = WebhookEmitter::spawn_with_policy(config, SsrfPolicy::allow_test_loopback());
+
+        // First event: the worker pulls it off the queue and parks on the
+        // never-responding server.
+        emitter.emit(published_event());
+        wait_until(Duration::from_secs(5), || emitter.queue_status().0 == 0).await;
+
+        // Second event fills the single-slot queue.
+        emitter.emit(published_event());
+        assert_eq!(emitter.queue_status(), (1, 1));
+
+        // Everything past capacity must be dropped immediately: no blocking
+        // of the (would-be) HTTP handler, no panic, no queue growth.
+        let start = std::time::Instant::now();
+        for _ in 0..64 {
+            emitter.emit(published_event());
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "emit must never block on a full queue"
+        );
+        assert_eq!(
+            emitter.queue_status(),
+            (1, 1),
+            "overflow events must be dropped, not queued"
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_status_reports_depth_and_capacity() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(hang_forever(listener));
+
+        let config = WebhookConfig {
+            enabled: true,
+            url: format!("http://{addr}/hook"),
+            secret: "shhh".into(),
+            timeout_seconds: 30,
+            max_retries: 1,
+            queue_capacity: 4,
+        };
+        let emitter = WebhookEmitter::spawn_with_policy(config, SsrfPolicy::allow_test_loopback());
+
+        // Idle: nothing buffered, full capacity reported.
+        assert_eq!(emitter.queue_status(), (0, 4));
+
+        // Park the worker on the hung endpoint, then populate the queue:
+        // the two buffered events are visible as in-flight depth.
+        emitter.emit(published_event());
+        wait_until(Duration::from_secs(5), || emitter.queue_status().0 == 0).await;
+        emitter.emit(published_event());
+        emitter.emit(published_event());
+        assert_eq!(emitter.queue_status(), (2, 4));
+
+        // queue_capacity: 0 is clamped to 1 so the channel can always hold
+        // at least one event.
+        let mut zero_cap = cfg("", "", false);
+        zero_cap.queue_capacity = 0;
+        let clamped =
+            WebhookEmitter::spawn_with_policy(zero_cap, SsrfPolicy::allow_test_loopback());
+        assert_eq!(clamped.queue_status(), (0, 1));
     }
 }

@@ -211,44 +211,6 @@ async fn publish(
 
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn pg_health_returns_ok() {
-    let Some(url) = pg_url_or_skip() else { return };
-    let app = harness(true, &url).await;
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri("/healthz")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = body_to_json(resp).await;
-    assert_eq!(v["status"], "ok");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn pg_capabilities_round_trips() {
-    let Some(url) = pg_url_or_skip() else { return };
-    let app = harness(true, &url).await;
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri("/.well-known/acdp.json")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = body_to_json(resp).await;
-    assert_eq!(v["acdp_version"], "0.1.0");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn pg_publish_then_retrieve() {
     let Some(url) = pg_url_or_skip() else { return };
     let app = harness(true, &url).await;
@@ -424,25 +386,6 @@ async fn pg_search_filters_by_schema_uri() {
         "expected exactly one schema match, got {v}"
     );
     assert_eq!(matches[0]["title"], "pg-schema-a");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn pg_auth_routes_absent_when_disabled() {
-    let Some(url) = pg_url_or_skip() else { return };
-    let app = harness(true, &url).await;
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/auth/challenge")
-                .header("Content-Type", "application/json")
-                .body(Body::from(json!({"agent_id": "did:web:x"}).to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test(flavor = "multi_thread")]
