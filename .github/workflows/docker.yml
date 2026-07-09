@@ -41,9 +41,9 @@ jobs:
             type=sha
             type=raw,value=latest,enable={{is_default_branch}}
 
-      # Build the native-arch image first and load it into the local daemon
-      # so it can be smoke-tested before anything is published. The
-      # multi-platform push below reuses this build via the buildx cache.
+      # Build the image first and load it into the local daemon so it can be
+      # smoke-tested before anything is published. The push below reuses this
+      # build via the buildx cache.
       - name: build (amd64, local)
         uses: docker/build-push-action@v6
         with:
@@ -79,16 +79,15 @@ jobs:
           docker rm -f registry pg
           docker network rm acdp-smoke
 
-      # PRs stop here: the multi-arch build (arm64 under QEMU) is slow and
-      # its output is never published, so only pushes and tags pay for it.
-      - name: build + push (multi-platform)
+      # PRs stop at the smoke test above; only pushes and tags publish.
+      - name: build + push
         if: github.event_name != 'pull_request'
         uses: docker/build-push-action@v6
         with:
           context: .
           file: docker/Dockerfile
           push: true
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: STORAGE_FEATURE=storage-pg
