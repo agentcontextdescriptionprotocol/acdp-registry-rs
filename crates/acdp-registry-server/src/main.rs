@@ -811,7 +811,21 @@ fn build_capabilities(cfg: &RegistryConfig) -> CapabilitiesDocument {
             "0.1.0".into()
         },
         registry_did: authority_to_did_web(&cfg.registry.authority),
-        supported_signature_algorithms: vec!["ed25519".into()],
+        // Advertise exactly the set the registry actually verifies. Every
+        // publish path runs `acdp-server`'s validator step-5 gate, which
+        // rejects `schema_violation: unsupported algorithm` for any algorithm
+        // absent here — so an under-claim silently breaks otherwise-valid
+        // publishes. All three verify paths honor both algorithms
+        // unconditionally: the auth handshake (`AuthService` step 4, hardcoded
+        // `{ed25519, ecdsa-p256}`), the pinned-key playground path
+        // (`playground::enforce_pinned_signature`), and the production DID path
+        // (`acdp::verify::verify_publish_request_signature`). Unlike
+        // `supported_did_methods` — a genuine per-deployment choice (resolver
+        // reach, SSRF surface) — algorithm support is compiled in, not
+        // configurable, so it is stated here rather than read from config to
+        // keep the advertisement from drifting out of sync with the code that
+        // must honor it.
+        supported_signature_algorithms: vec!["ed25519".into(), "ecdsa-p256".into()],
         supported_did_methods: cfg.auth.did_methods.clone(),
         profiles: {
             let mut profiles = if cfg.registry.profiles.is_empty() {
@@ -1204,5 +1218,28 @@ mod tests {
         );
         cfg.auth.require_tenant = true;
         assert!(validate_config(&cfg).is_ok());
+    }
+
+    // The capabilities `supported_signature_algorithms` gate is enforced by
+    // `acdp-server`'s publish validator (step 5): any algorithm absent from
+    // this list is rejected with `schema_violation: unsupported algorithm`
+    // before the signature is ever verified. The registry verifies both
+    // ed25519 and ecdsa-p256 on every publish path, so both MUST be advertised
+    // — a regression to ed25519-only silently 400s every P-256 publish even
+    // against a correctly pinned P-256 key.
+    #[test]
+    fn capabilities_advertise_every_verified_algorithm() {
+        let caps = build_capabilities(&RegistryConfig::defaults());
+        assert!(
+            caps.supports_algorithm("ed25519"),
+            "ed25519 must be advertised: {:?}",
+            caps.supported_signature_algorithms
+        );
+        assert!(
+            caps.supports_algorithm("ecdsa-p256"),
+            "ecdsa-p256 must be advertised — the auth handshake and pinned-key \
+             path both verify it, so the publish gate must accept it: {:?}",
+            caps.supported_signature_algorithms
+        );
     }
 }

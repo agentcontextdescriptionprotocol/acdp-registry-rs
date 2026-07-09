@@ -60,7 +60,8 @@ fn caps() -> CapabilitiesDocument {
     CapabilitiesDocument {
         acdp_version: "0.1.0".into(),
         registry_did: format!("did:web:{AUTHORITY}"),
-        supported_signature_algorithms: vec!["ed25519".into()],
+        // Mirror the binary: both algorithms the registry actually verifies.
+        supported_signature_algorithms: vec!["ed25519".into(), "ecdsa-p256".into()],
         supported_did_methods: vec!["did:web".into()],
         profiles: vec!["acdp-registry-core".into()],
         limits: Limits {
