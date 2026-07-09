@@ -27,7 +27,7 @@
 
 use std::sync::Arc;
 
-use acdp::crypto::SigningKey;
+use acdp::crypto::{P256SigningKey, SigningKey};
 use acdp::did::WebResolver;
 use acdp::producer::Producer;
 use acdp::registry::RegistryServer;
@@ -59,7 +59,10 @@ fn caps() -> CapabilitiesDocument {
     CapabilitiesDocument {
         acdp_version: "0.1.0".into(),
         registry_did: format!("did:web:{AUTHORITY}"),
-        supported_signature_algorithms: vec!["ed25519".into()],
+        // Mirror the binary's `build_capabilities`: the registry verifies both
+        // ed25519 and ecdsa-p256 on every publish path, and the validator's
+        // step-5 gate 400s any algorithm absent here.
+        supported_signature_algorithms: vec!["ed25519".into(), "ecdsa-p256".into()],
         supported_did_methods: vec!["did:web".into()],
         profiles: vec!["acdp-registry-core".into()],
         limits: Limits {
@@ -2617,6 +2620,64 @@ async fn playground_pinned_agent_with_matching_key_publishes() {
 
     // Retrieve to confirm the row actually persisted, not just that the
     // response 200'd.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/contexts/{}", pct_encode_path_segment(&ctx_id)))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn playground_pinned_ecdsa_p256_agent_publishes() {
+    // Regression for the capabilities under-claim: `build_capabilities`
+    // advertised `supported_signature_algorithms: ["ed25519"]`, so the
+    // validator's step-5 gate 400'd every P-256 publish with
+    // `schema_violation: unsupported algorithm 'ecdsa-p256'` — before the
+    // pinned-key verifier (which *does* accept P-256) ever ran. With both
+    // algorithms advertised, a correctly-pinned P-256 agent round-trips.
+    let key = P256SigningKey::generate();
+    let did = "did:web:agents.test:smoke-pinned-p256";
+    // Pinned public key is the SEC1-uncompressed point (65 bytes, 0x04-led),
+    // exactly what `playground::verify_ecdsa_p256_pinned` expects.
+    let pub_b64 = B64.encode(key.verifying_key_sec1());
+    let p = Producer::new_p256(key, AgentDid::new(did), format!("{did}#key-1"));
+
+    let h = harness_with_playground(PlaygroundConfig {
+        enabled: true,
+        pinned_keys: vec![PinnedAgentKey {
+            agent_did: did.into(),
+            public_key_b64: pub_b64,
+            algorithm: "ecdsa-p256".into(),
+            valid_from: None,
+            valid_until: None,
+        }],
+        pinned_only: true,
+    })
+    .await;
+    let app = &h.router;
+
+    let req = p
+        .publish_request()
+        .title("pinned-p256-ok")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (status, v) = publish(app, &req, None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "P-256 pinned publish must succeed once ecdsa-p256 is advertised; body = {v}"
+    );
+    let ctx_id = v["ctx_id"].as_str().unwrap().to_string();
+
+    // Confirm the row persisted, not merely that the publish 200'd.
     let resp = app
         .clone()
         .oneshot(
