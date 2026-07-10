@@ -369,7 +369,39 @@ async fn publish_inner<S: ExtendedRegistryStore + 'static>(
         .read()
         .expect("playground RwLock poisoned")
         .clone();
-    let response: PublishResponse = if playground_snapshot.enabled {
+    let response: PublishResponse = if req.agent_id.as_str().starts_with("did:key:") {
+        // did:key producers (ACDP 0.2.0 workstream C): steps 7–8 run
+        // through acdp's pure offline verifier — the DID *is* the key, so
+        // no DID document fetch and no SSRF surface. The capabilities gate
+        // inside the validator rejects with `key_resolution_failed` when
+        // `did:key` is not advertised in `supported_did_methods` (the
+        // anchor-plan / dk-003 pinned behavior). The pipeline is sync, so
+        // it runs on the blocking pool like the store calls.
+        //
+        // Checked BEFORE the playground gate below, unconditionally: a
+        // did:key identity is self-verifying by construction, so whether
+        // an operator has `[playground]` enabled (for OTHER, did:web
+        // agents' convenience) must never change how a did:key publish is
+        // authorized — it should neither need pinning (pinned_only=true)
+        // nor silently skip verification (pinned_only=false). Before this
+        // ordering, a did:key publish to a playground-enabled registry hit
+        // the pinned-key gate like any did:web agent, so it was only ever
+        // truly cryptographically verified on a registry with `[playground]`
+        // absent entirely (e.g. the old dedicated receipts-only registry).
+        let server2 = server.clone();
+        let req_clone = req.clone();
+        let idem = idempotency_key.clone();
+        let tenant = publish_tenant.clone();
+        tokio::task::spawn_blocking(move || {
+            server2.publish_verified_did_key_in_tenant(
+                &req_clone,
+                idem.as_deref(),
+                tenant.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| RegistryError::Internal(format!("join: {e}")))??
+    } else if playground_snapshot.enabled {
         // Playground: skip DID verification — stop after schema + size + hash.
         // `publish_unverified_for_tests` doesn't accept an idempotency key,
         // so we run idempotency lookup/record around it via the store to
@@ -438,27 +470,6 @@ async fn publish_inner<S: ExtendedRegistryStore + 'static>(
             .map_err(|e| RegistryError::Internal(format!("join: {e}")))??;
         }
         resp
-    } else if req.agent_id.as_str().starts_with("did:key:") {
-        // did:key producers (ACDP 0.2.0 workstream C): steps 7–8 run
-        // through acdp's pure offline verifier — the DID *is* the key, so
-        // no DID document fetch and no SSRF surface. The capabilities gate
-        // inside the validator rejects with `key_resolution_failed` when
-        // `did:key` is not advertised in `supported_did_methods` (the
-        // anchor-plan / dk-003 pinned behavior). The pipeline is sync, so
-        // it runs on the blocking pool like the store calls.
-        let server2 = server.clone();
-        let req_clone = req.clone();
-        let idem = idempotency_key.clone();
-        let tenant = publish_tenant.clone();
-        tokio::task::spawn_blocking(move || {
-            server2.publish_verified_did_key_in_tenant(
-                &req_clone,
-                idem.as_deref(),
-                tenant.as_deref(),
-            )
-        })
-        .await
-        .map_err(|e| RegistryError::Internal(format!("join: {e}")))??
     } else {
         // Production path: full RFC-ACDP-0003 §2.1 pipeline. The resolved
         // tenant is threaded into the atomic commit so `tenant_id` is written
