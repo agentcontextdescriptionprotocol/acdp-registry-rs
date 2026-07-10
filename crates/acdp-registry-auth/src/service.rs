@@ -59,13 +59,15 @@ impl AuthService {
     /// `agent_id` is stored alongside the nonce so the token-issue path can
     /// reject any peer that tries to redeem the nonce under a different DID.
     ///
-    /// SEC-05: a lightweight `did:web:` prefix and length check runs before
-    /// any storage work — full DID-web parsing still happens on
+    /// SEC-05: a lightweight `did:web:`/`did:key:` prefix and length check
+    /// runs before any storage work — full DID parsing (and, for did:key,
+    /// the `auth.did_methods` capability gate) still happens on
     /// `issue_token`. Without this the challenge table fills with garbage
-    /// from clients that mistype the DID method.
+    /// from clients that mistype the DID method. `did:web` and `did:key`
+    /// share a prefix length (8 chars), so one length bound covers both.
     #[tracing::instrument(skip(self), fields(agent = %agent_id))]
     pub async fn issue_challenge(&self, agent_id: &str) -> Result<AuthChallenge, AuthError> {
-        if !agent_id.starts_with("did:web:")
+        if !(agent_id.starts_with("did:web:") || agent_id.starts_with("did:key:"))
             || agent_id.len() < "did:web:".len() + 1
             || agent_id.len() > 2048
         {
@@ -102,8 +104,11 @@ impl AuthService {
     ///    what the registry committed at challenge issuance.
     /// 3. Reject if `expires_at` is past.
     /// 4. Reject algorithm ∉ {ed25519, ecdsa-p256}.
-    /// 5. Re-derive the canonical signing input and verify against the
-    ///    DID document's `assertionMethod` key via the algorithm-specific
+    /// 5. Resolve the signing key — `did:web` via the DID document's
+    ///    `assertionMethod` (a live HTTP fetch), `did:key` via the pure
+    ///    offline decoder (the DID *is* the key; gated on `did:key` being
+    ///    in `auth.did_methods`, mirroring the publish-path capability
+    ///    gate) — then verify against it via the algorithm-specific
     ///    verifier ([`acdp::crypto::verify::verify_ed25519`] or
     ///    [`acdp::crypto::verify::verify_ecdsa_p256`]).
     /// 6. Mint a JWT bound to the agent DID.
@@ -155,41 +160,97 @@ impl AuthService {
         if did_portion != req.agent_id {
             return Err(AuthError::KeyIdMismatch);
         }
-        if !did_portion.starts_with("did:web:") {
-            return Err(AuthError::UnsupportedDidMethod(did_portion.to_string()));
-        }
         let fragment = req
             .key_id
             .split('#')
             .nth(1)
             .ok_or_else(|| AuthError::KeyIdMalformed(req.key_id.clone()))?;
-        let doc = self
-            .resolver
-            .resolve(did_portion)
-            .await
-            .map_err(|e| AuthError::Resolution(e.to_string()))?;
-        let vm = doc.find_by_fragment(fragment).ok_or_else(|| {
-            AuthError::KeyIdMalformed(format!("fragment '{fragment}' not in DID doc"))
-        })?;
-        if !doc.is_assertion_method(&req.key_id) {
-            return Err(AuthError::KeyNotAssertion);
-        }
-        // Algorithm-downgrade defense (RFC-ACDP-0008 §3.9): if the
-        // verification method declares an algorithm (via `type` or
-        // `publicKeyJwk` params), it MUST match `req.algorithm`.
-        // Otherwise an attacker could submit `algorithm = ed25519`
-        // pointing at a key authored under a different scheme.
-        // `Verifier::verify_body` enforces the same check on the
-        // publish path; do the same on the auth handshake.
-        if let Some(declared) = vm.declared_algorithm() {
-            if declared != req.algorithm {
-                return Err(AuthError::AlgorithmNotSupported(format!(
-                    "request algorithm '{}' does not match verification method type \
-                     (declared '{}')",
-                    req.algorithm, declared
+
+        let pub_bytes: Vec<u8> = if did_portion.starts_with("did:web:") {
+            let doc = self
+                .resolver
+                .resolve(did_portion)
+                .await
+                .map_err(|e| AuthError::Resolution(e.to_string()))?;
+            let vm = doc.find_by_fragment(fragment).ok_or_else(|| {
+                AuthError::KeyIdMalformed(format!("fragment '{fragment}' not in DID doc"))
+            })?;
+            if !doc.is_assertion_method(&req.key_id) {
+                return Err(AuthError::KeyNotAssertion);
+            }
+            // Algorithm-downgrade defense (RFC-ACDP-0008 §3.9): if the
+            // verification method declares an algorithm (via `type` or
+            // `publicKeyJwk` params), it MUST match `req.algorithm`.
+            // Otherwise an attacker could submit `algorithm = ed25519`
+            // pointing at a key authored under a different scheme.
+            // `Verifier::verify_body` enforces the same check on the
+            // publish path; do the same on the auth handshake.
+            if let Some(declared) = vm.declared_algorithm() {
+                if declared != req.algorithm {
+                    return Err(AuthError::AlgorithmNotSupported(format!(
+                        "request algorithm '{}' does not match verification method type \
+                         (declared '{}')",
+                        req.algorithm, declared
+                    )));
+                }
+            }
+            match req.algorithm.as_str() {
+                "ed25519" => vm
+                    .ed25519_public_key_bytes()
+                    .map(|b| b.to_vec())
+                    .map_err(|e| AuthError::Resolution(format!("key decode: {e}")))?,
+                "ecdsa-p256" => vm
+                    .ecdsa_p256_public_key_sec1()
+                    .map(|b| b.to_vec())
+                    .map_err(|e| AuthError::Resolution(format!("key decode: {e}")))?,
+                // unreachable — guarded by the algorithm check in step 4,
+                // but stay defensive.
+                other => return Err(AuthError::AlgorithmNotSupported(other.into())),
+            }
+        } else if did_portion.starts_with("did:key:") {
+            // did:key: the DID *is* the key (acdp_did::key — a pure,
+            // offline decoder), so there is no document to fetch and no
+            // assertionMethod relationship to check; the key is authorized
+            // by construction. Gated on `did:key` being in
+            // `auth.did_methods`, mirroring the publish path's capability
+            // gate (context.rs) — an operator who hasn't opted in to
+            // did:key shouldn't have it silently accepted for auth either.
+            if !self.config.did_methods.iter().any(|m| m == "did:key") {
+                return Err(AuthError::UnsupportedDidMethod(did_portion.to_string()));
+            }
+            // Convention (acdp_did::key module doc): the key_id fragment
+            // mirrors the DID's own method-specific id, i.e.
+            // `did:key:z<mb>#z<mb>`. Require that match here as a defense
+            // check — otherwise a mismatched fragment would silently
+            // verify against the DID's own key regardless of what fragment
+            // the caller claimed.
+            let msi = did_portion.strip_prefix("did:key:").unwrap_or_default();
+            if fragment != msi {
+                return Err(AuthError::KeyIdMalformed(format!(
+                    "did:key fragment '{fragment}' does not match method-specific id '{msi}'"
                 )));
             }
-        }
+            let material = acdp::did::resolve_did_key(did_portion)
+                .map_err(|e| AuthError::Resolution(e.to_string()))?;
+            // Algorithm-downgrade defense: the did:key multicodec prefix
+            // fixes the algorithm — it MUST match the request's declared
+            // algorithm, the same intent as the did:web `declared_algorithm`
+            // check above.
+            if material.algorithm() != req.algorithm {
+                return Err(AuthError::AlgorithmNotSupported(format!(
+                    "request algorithm '{}' does not match did:key algorithm '{}'",
+                    req.algorithm,
+                    material.algorithm()
+                )));
+            }
+            match material {
+                acdp::did::DidKeyMaterial::Ed25519(b) => b.to_vec(),
+                acdp::did::DidKeyMaterial::EcdsaP256(b) => b.to_vec(),
+            }
+        } else {
+            return Err(AuthError::UnsupportedDidMethod(did_portion.to_string()));
+        };
+
         let signing_input = AuthChallenge::signing_input(
             &req.nonce,
             &req.agent_id,
@@ -198,20 +259,20 @@ impl AuthService {
         );
         // Algorithm dispatch — Ed25519 stays the default; ECDSA-P256 is
         // accepted for agents that advertise an `EcdsaSecp256r1*` verification
-        // method. Algorithm-downgrade defense already ran above (declared
-        // algorithm on the VM must match req.algorithm).
+        // method (did:web) or an ecdsa-p256 multicodec key (did:key).
+        // Algorithm-downgrade defense already ran above in both branches.
         match req.algorithm.as_str() {
             "ed25519" => {
-                let pub_bytes = vm
-                    .ed25519_public_key_bytes()
-                    .map_err(|e| AuthError::Resolution(format!("key decode: {e}")))?;
-                acdp::crypto::verify::verify_ed25519(&pub_bytes, &req.signature, &signing_input)
+                let arr: [u8; 32] = pub_bytes.as_slice().try_into().map_err(|_| {
+                    AuthError::Resolution(format!(
+                        "ed25519 key must be 32 bytes, got {}",
+                        pub_bytes.len()
+                    ))
+                })?;
+                acdp::crypto::verify::verify_ed25519(&arr, &req.signature, &signing_input)
                     .map_err(|e| AuthError::SignatureInvalid(e.to_string()))?;
             }
             "ecdsa-p256" => {
-                let pub_bytes = vm
-                    .ecdsa_p256_public_key_sec1()
-                    .map_err(|e| AuthError::Resolution(format!("key decode: {e}")))?;
                 acdp::crypto::verify::verify_ecdsa_p256(&pub_bytes, &req.signature, &signing_input)
                     .map_err(|e| AuthError::SignatureInvalid(e.to_string()))?;
             }
@@ -519,9 +580,13 @@ mod tests {
 
     #[tokio::test]
     async fn issue_challenge_rejects_malformed_did() {
-        // SEC-05: cheap prefix/length screen before any storage work.
+        // SEC-05: cheap prefix/length screen before any storage work. Note
+        // did:key is now a cheaply-accepted prefix too (full validation,
+        // including the auth.did_methods gate, defers to issue_token —
+        // see issue_challenge_accepts_valid_did_key below), so a
+        // well-formed-looking did:key isn't in this rejected set anymore.
         let svc = bare_service();
-        for bad in ["", "did:key:zabc", "did:web:", "https://not-a-did"] {
+        for bad in ["", "did:key:", "did:web:", "https://not-a-did"] {
             let err = svc.issue_challenge(bad).await.unwrap_err();
             assert!(
                 matches!(err, AuthError::UnsupportedDidMethod(_)),
@@ -534,6 +599,18 @@ mod tests {
             svc.issue_challenge(&huge).await.unwrap_err(),
             AuthError::UnsupportedDidMethod(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn issue_challenge_accepts_valid_did_key() {
+        // The cheap prefix/length screen accepts did:key too; the
+        // auth.did_methods opt-in gate is enforced later, in issue_token.
+        let svc = bare_service();
+        let ch = svc
+            .issue_challenge("did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK")
+            .await
+            .expect("valid did:key challenge issues");
+        assert!(!ch.nonce.is_empty());
     }
 
     #[tokio::test]
@@ -695,5 +772,235 @@ mod tests {
             !matches!(err, AuthError::AlgorithmNotSupported(_)),
             "ecdsa-p256 should not bounce off the algorithm check; got {err:?}"
         );
+    }
+
+    // ── did:key auth (unlike did:web, this is fully offline — no live
+    //    document to fetch — so these ARE genuine end-to-end tests, not
+    //    just "doesn't bounce off an earlier check") ─────────────────────
+
+    /// Build an AuthService with a given `AuthConfig` and a pre-seeded
+    /// challenge, mirroring `service_with_challenge` but parameterized so
+    /// did:key tests can opt in via `auth.did_methods`.
+    fn service_with_challenge_and_config(
+        config: AuthConfig,
+        nonce: &str,
+        agent_id: &str,
+        expires_at: chrono::DateTime<Utc>,
+    ) -> AuthService {
+        let challenges: Arc<dyn ChallengeStore> = Arc::new(InMemoryChallengeStore::default());
+        let signer = JwtSigner::new(
+            JwtSecret::from_bytes(&[7u8; 32]),
+            format!("did:web:{agent_id}-registry"),
+            "registry.test".into(),
+            30,
+        );
+        let resolver = Arc::new(WebResolver::new());
+        let svc = AuthService::new(
+            config,
+            challenges.clone(),
+            signer,
+            resolver,
+            "registry.test".into(),
+        );
+        futures_block_on(async {
+            challenges
+                .put(ChallengeRecord {
+                    nonce: nonce.into(),
+                    agent_id: agent_id.into(),
+                    expires_at,
+                })
+                .await
+                .unwrap();
+        });
+        svc
+    }
+
+    fn did_key_config_enabled() -> AuthConfig {
+        AuthConfig {
+            did_methods: vec!["did:web".into(), "did:key".into()],
+            ..AuthConfig::default()
+        }
+    }
+
+    /// (did:key DID, key_id, signing key) for a deterministic Ed25519 seed.
+    fn did_key_fixture(seed: u8) -> (String, String, ed25519_dalek::SigningKey) {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let did = acdp::did::did_key_from_ed25519(sk.verifying_key().as_bytes());
+        let msi = did.strip_prefix("did:key:").unwrap().to_string();
+        let key_id = format!("{did}#{msi}");
+        (did, key_id, sk)
+    }
+
+    fn sign_b64(sk: &ed25519_dalek::SigningKey, message: &str) -> String {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use ed25519_dalek::Signer;
+        STANDARD.encode(sk.sign(message.as_bytes()).to_bytes())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn issue_token_rejects_did_key_when_not_in_did_methods() {
+        // Default config is did:web-only — mirrors the publish path's
+        // capability gate: did:key must be an explicit operator opt-in.
+        let (did, key_id, sk) = did_key_fixture(41);
+        let expires_at = Utc::now() + Duration::seconds(60);
+        let svc = service_with_challenge_and_config(
+            AuthConfig::default(),
+            "nonce-dk-1",
+            &did,
+            expires_at,
+        );
+        let signing_input = AuthChallenge::signing_input(
+            "nonce-dk-1",
+            &did,
+            "registry.test",
+            expires_at.timestamp(),
+        );
+        let req = TokenRequest {
+            nonce: "nonce-dk-1".into(),
+            agent_id: did.clone(),
+            expires_at: expires_at.timestamp(),
+            algorithm: "ed25519".into(),
+            key_id,
+            signature: sign_b64(&sk, &signing_input),
+        };
+        assert!(matches!(
+            svc.issue_token(req).await.unwrap_err(),
+            AuthError::UnsupportedDidMethod(_)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn issue_token_end_to_end_with_did_key() {
+        // Genuine end-to-end: real keypair, real challenge signing_input,
+        // real signature — verifies the full offline did:key path mints a
+        // token, something we cannot do for did:web without a live did.json.
+        let (did, key_id, sk) = did_key_fixture(42);
+        let expires_at = Utc::now() + Duration::seconds(60);
+        let svc = service_with_challenge_and_config(
+            did_key_config_enabled(),
+            "nonce-dk-2",
+            &did,
+            expires_at,
+        );
+        let signing_input = AuthChallenge::signing_input(
+            "nonce-dk-2",
+            &did,
+            "registry.test",
+            expires_at.timestamp(),
+        );
+        let req = TokenRequest {
+            nonce: "nonce-dk-2".into(),
+            agent_id: did.clone(),
+            expires_at: expires_at.timestamp(),
+            algorithm: "ed25519".into(),
+            key_id,
+            signature: sign_b64(&sk, &signing_input),
+        };
+        let resp = svc.issue_token(req).await.expect("did:key token issues");
+        assert_eq!(resp.token_type, "Bearer");
+        let claims = svc
+            .validate_bearer_claims(&resp.token)
+            .expect("token validates");
+        assert_eq!(claims.sub, did);
+        assert_eq!(claims.acdp.registry, "registry.test");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn issue_token_rejects_did_key_tampered_signature() {
+        let (did, key_id, _sk) = did_key_fixture(43);
+        let (_other_did, _other_key_id, other_sk) = did_key_fixture(44);
+        let expires_at = Utc::now() + Duration::seconds(60);
+        let svc = service_with_challenge_and_config(
+            did_key_config_enabled(),
+            "nonce-dk-3",
+            &did,
+            expires_at,
+        );
+        let signing_input = AuthChallenge::signing_input(
+            "nonce-dk-3",
+            &did,
+            "registry.test",
+            expires_at.timestamp(),
+        );
+        let req = TokenRequest {
+            nonce: "nonce-dk-3".into(),
+            agent_id: did.clone(),
+            expires_at: expires_at.timestamp(),
+            algorithm: "ed25519".into(),
+            key_id,
+            // Signed by a DIFFERENT key than the one embedded in `did`.
+            signature: sign_b64(&other_sk, &signing_input),
+        };
+        assert!(matches!(
+            svc.issue_token(req).await.unwrap_err(),
+            AuthError::SignatureInvalid(_)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn issue_token_rejects_did_key_fragment_mismatch() {
+        let (did, _key_id, sk) = did_key_fixture(45);
+        let (other_did, _o, _os) = did_key_fixture(46);
+        let other_msi = other_did.strip_prefix("did:key:").unwrap();
+        let expires_at = Utc::now() + Duration::seconds(60);
+        let svc = service_with_challenge_and_config(
+            did_key_config_enabled(),
+            "nonce-dk-4",
+            &did,
+            expires_at,
+        );
+        let signing_input = AuthChallenge::signing_input(
+            "nonce-dk-4",
+            &did,
+            "registry.test",
+            expires_at.timestamp(),
+        );
+        let req = TokenRequest {
+            nonce: "nonce-dk-4".into(),
+            agent_id: did.clone(),
+            expires_at: expires_at.timestamp(),
+            algorithm: "ed25519".into(),
+            // Fragment names a DIFFERENT did:key's method-specific id.
+            key_id: format!("{did}#{other_msi}"),
+            signature: sign_b64(&sk, &signing_input),
+        };
+        assert!(matches!(
+            svc.issue_token(req).await.unwrap_err(),
+            AuthError::KeyIdMalformed(_)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn issue_token_rejects_did_key_algorithm_downgrade() {
+        // The did:key is Ed25519 (its multicodec fixes the algorithm), but
+        // the request claims ecdsa-p256 — must be rejected before any
+        // signature verification, same intent as the did:web
+        // declared_algorithm defense.
+        let (did, key_id, sk) = did_key_fixture(47);
+        let expires_at = Utc::now() + Duration::seconds(60);
+        let svc = service_with_challenge_and_config(
+            did_key_config_enabled(),
+            "nonce-dk-5",
+            &did,
+            expires_at,
+        );
+        let signing_input = AuthChallenge::signing_input(
+            "nonce-dk-5",
+            &did,
+            "registry.test",
+            expires_at.timestamp(),
+        );
+        let req = TokenRequest {
+            nonce: "nonce-dk-5".into(),
+            agent_id: did.clone(),
+            expires_at: expires_at.timestamp(),
+            algorithm: "ecdsa-p256".into(),
+            key_id,
+            signature: sign_b64(&sk, &signing_input),
+        };
+        assert!(matches!(
+            svc.issue_token(req).await.unwrap_err(),
+            AuthError::AlgorithmNotSupported(_)
+        ));
     }
 }
