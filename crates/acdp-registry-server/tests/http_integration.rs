@@ -2584,6 +2584,46 @@ async fn playground_strict_mode_rejects_unknown_agent() {
 }
 
 #[tokio::test]
+async fn did_key_publish_bypasses_playground_pinned_only_entirely() {
+    // Regression: did:key must ALWAYS take its own dedicated, fully
+    // verified path (context.rs checks `starts_with("did:key:")` before
+    // the playground gate) — it is self-verifying by construction, so a
+    // did:key agent that is NOT in playground.pinned_keys must still
+    // publish successfully even under pinned_only=true, which would 403
+    // any *did:web* agent in the same position (see
+    // playground_strict_mode_rejects_unknown_agent above). Before this
+    // ordering, a did:key publish to a playground-enabled registry hit
+    // the pinned-key gate like any other agent and was rejected here.
+    let unpinned = did_key_producer(200);
+
+    let mut cfg = config(true);
+    cfg.auth.did_methods = vec!["did:web".into(), "did:key".into()];
+    cfg.playground.pinned_only = true;
+    cfg.playground.pinned_keys = vec![PinnedAgentKey {
+        agent_did: "did:web:agents.test:someone-else".into(),
+        public_key_b64: B64.encode(SigningKey::from_bytes(&[1u8; 32]).verifying_key_bytes()),
+        algorithm: "ed25519".into(),
+        valid_from: None,
+        valid_until: None,
+    }];
+    let h = build_harness_with_caps(cfg, receipts_caps(), None).await;
+
+    let req = unpinned
+        .publish_request()
+        .title("did:key bypasses pinned_only")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (status, v) = publish(&h.router, &req, None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "did:key must publish regardless of playground.pinned_only, got {v}"
+    );
+}
+
+#[tokio::test]
 async fn playground_pinned_agent_with_matching_key_publishes() {
     // Positive case: a pinned agent publishes with the correct key — the
     // Ed25519 verifier accepts and the row lands in storage. Confirms the
