@@ -25,7 +25,7 @@ readme        = "README.md"
 # Published `acdp` 0.5.3 from crates.io: carries acdp-types 0.3.2
 # (`acdp::types::cosignature`) + acdp-client 0.4.1 (witness verification),
 # the RFC-ACDP-0015 §6.1 aggregation surface the registry needs.
-acdp = { version = "0.6.2", features = ["server", "client"] }
+acdp = { version = "0.8.0", features = ["server", "client"] }
 
 # HTTP
 axum       = { version = "0.7", features = ["macros"] }
