@@ -6,9 +6,14 @@ updates:
       interval: weekly
     open-pull-requests-limit: 5
     groups:
-      patch-and-minor:
-        update-types: [patch, minor]
+      minor-and-patch:
+        update-types: [minor, patch]
+      major-updates:
+        update-types: [major]
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: monthly
+    groups:
+      actions:
+        patterns: ['*']
