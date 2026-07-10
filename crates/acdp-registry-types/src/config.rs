@@ -69,11 +69,15 @@ impl RegistryConfig {
                 Some(rest) => rest.contains("__"),
                 None => true,
             })
-            // `AUTH__TENANT_AGENTS_JSON` is a hand-rolled escape hatch
-            // (handled below, after deserialization) — not a real config
-            // path. Left in this snapshot it would reach AuthConfig's
-            // `deny_unknown_fields` as an unknown `tenant_agents_json` key.
-            .filter(|(k, _)| k != "ACDP_REGISTRY_AUTH__TENANT_AGENTS_JSON")
+            // `AUTH__TENANT_AGENTS_JSON` / `PLAYGROUND__PINNED_KEYS_JSON` are
+            // hand-rolled escape hatches (handled below, after
+            // deserialization) — not real config paths. Left in this
+            // snapshot they'd reach AuthConfig's / PlaygroundConfig's
+            // `deny_unknown_fields` as unknown keys.
+            .filter(|(k, _)| {
+                k != "ACDP_REGISTRY_AUTH__TENANT_AGENTS_JSON"
+                    && k != "ACDP_REGISTRY_PLAYGROUND__PINNED_KEYS_JSON"
+            })
             .collect();
         builder = builder.add_source(
             config::Environment::with_prefix("ACDP_REGISTRY")
@@ -107,6 +111,19 @@ impl RegistryConfig {
                 config::ConfigError::Message(format!(
                     "ACDP_REGISTRY_AUTH__TENANT_AGENTS_JSON: invalid JSON array of \
                      {{agent_did, tenant_id}}: {e}"
+                ))
+            })?;
+        }
+
+        // `playground.pinned_keys` is `Vec<PinnedAgentKey>` — same problem,
+        // same fix. Needed to pin a stable, rotating identity (e.g. for key
+        // rotation / historical-key receipt scenarios) on a deployment with
+        // no TOML-file mechanism.
+        if let Ok(json) = std::env::var("ACDP_REGISTRY_PLAYGROUND__PINNED_KEYS_JSON") {
+            cfg.playground.pinned_keys = serde_json::from_str(&json).map_err(|e| {
+                config::ConfigError::Message(format!(
+                    "ACDP_REGISTRY_PLAYGROUND__PINNED_KEYS_JSON: invalid JSON array of \
+                     {{agent_did, public_key_b64, algorithm?, valid_from?, valid_until?}}: {e}"
                 ))
             })?;
         }
@@ -1494,6 +1511,12 @@ backend = "sqlite"
                 "ACDP_REGISTRY_AUTH__TENANT_AGENTS_JSON",
                 r#"[{"agent_did":"did:key:z6MkA","tenant_id":"tenant-a"},{"agent_did":"did:key:z6MkB","tenant_id":"tenant-b"}]"#,
             ),
+            // Same problem, same fix, for `playground.pinned_keys`
+            // (Vec<PinnedAgentKey>).
+            (
+                "ACDP_REGISTRY_PLAYGROUND__PINNED_KEYS_JSON",
+                r#"[{"agent_did":"did:web:x:agents:rotor","public_key_b64":"AAAA","algorithm":"ed25519"}]"#,
+            ),
             // A prefixed but un-nested var must NOT trip `deny_unknown_fields`
             // via the env source. `..._TEST_PG_URL` is the CI test harness var;
             // `ACDP_REGISTRY_CONFIG` is the same shape but is excluded here
@@ -1532,6 +1555,12 @@ backend = "sqlite"
                 },
             ]
         );
+        assert_eq!(cfg.playground.pinned_keys.len(), 1);
+        assert_eq!(
+            cfg.playground.pinned_keys[0].agent_did,
+            "did:web:x:agents:rotor"
+        );
+        assert_eq!(cfg.playground.pinned_keys[0].public_key_b64, "AAAA");
 
         // Malformed JSON is rejected with an attributed error — a second,
         // sequential (not concurrent) round-trip of the same env var within
