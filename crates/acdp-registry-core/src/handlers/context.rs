@@ -419,57 +419,88 @@ async fn publish_inner<S: ExtendedRegistryStore + 'static>(
             "playground pinned-key check"
         );
 
-        if let Some(key) = idempotency_key.as_deref() {
+        if let crate::playground::PinOutcome::Verified {
+            public_key_b64,
+            algorithm,
+        } = pin_outcome
+        {
+            // Pinned + cryptographically verified: route through the SDK's
+            // dedicated method so a receipts-advertising registry can mint
+            // a receipt off the pinned key's fingerprint. This method
+            // handles idempotency internally (unlike
+            // `publish_unverified_for_tests` below), so no manual
+            // lookup/record dance is needed here.
             let server2 = server.clone();
-            let agent2 = req.agent_id.clone();
-            let key2 = key.to_string();
-            let prior = tokio::task::spawn_blocking(move || {
-                server2.store().idempotency_lookup(&agent2, &key2)
+            let req_clone = req.clone();
+            let idem = idempotency_key.clone();
+            let tenant = publish_tenant.clone();
+            tokio::task::spawn_blocking(move || {
+                server2.publish_pinned_verified_in_tenant(
+                    &req_clone,
+                    idem.as_deref(),
+                    tenant.as_deref(),
+                    &public_key_b64,
+                    &algorithm,
+                )
             })
             .await
-            .map_err(|e| RegistryError::Internal(format!("join: {e}")))??;
-            if let Some(rec) = prior {
-                if rec.expires_at > Utc::now() {
-                    if rec.content_hash.0 == req.content_hash.0 {
-                        crate::metrics::record_publish("idempotent_replay");
-                        return Ok(Json(rec.response));
-                    } else {
-                        return Err(RegistryError::Acdp(
-                            acdp::error::AcdpError::DuplicatePublish(format!(
-                                "Idempotency-Key '{key}' was previously used by '{}' \
-                                 with a different content_hash",
-                                req.agent_id
-                            )),
-                        ));
+            .map_err(|e| RegistryError::Internal(format!("join: {e}")))??
+        } else {
+            if let Some(key) = idempotency_key.as_deref() {
+                let server2 = server.clone();
+                let agent2 = req.agent_id.clone();
+                let key2 = key.to_string();
+                let prior = tokio::task::spawn_blocking(move || {
+                    server2.store().idempotency_lookup(&agent2, &key2)
+                })
+                .await
+                .map_err(|e| RegistryError::Internal(format!("join: {e}")))??;
+                if let Some(rec) = prior {
+                    if rec.expires_at > Utc::now() {
+                        if rec.content_hash.0 == req.content_hash.0 {
+                            crate::metrics::record_publish("idempotent_replay");
+                            return Ok(Json(rec.response));
+                        } else {
+                            return Err(RegistryError::Acdp(
+                                acdp::error::AcdpError::DuplicatePublish(format!(
+                                    "Idempotency-Key '{key}' was previously used by '{}' \
+                                     with a different content_hash",
+                                    req.agent_id
+                                )),
+                            ));
+                        }
                     }
                 }
             }
-        }
-        let server2 = server.clone();
-        let req_clone = req.clone();
-        let resp =
-            tokio::task::spawn_blocking(move || server2.publish_unverified_for_tests(&req_clone))
-                .await
-                .map_err(|e| RegistryError::Internal(format!("join: {e}")))??;
-        if let Some(key) = idempotency_key.as_deref() {
             let server2 = server.clone();
-            let agent2 = req.agent_id.clone();
-            let key2 = key.to_string();
-            let hash = req.content_hash.clone();
-            let resp_clone = resp.clone();
-            // #25: honor the configured TTL instead of a hardcoded 24h, matching
-            // the production commit path (acdp::registry::server::commit_via_store).
-            let expires = Utc::now()
-                + chrono::Duration::seconds(state.config.limits.idempotency_key_ttl_seconds as i64);
-            tokio::task::spawn_blocking(move || {
-                server2
-                    .store()
-                    .idempotency_record(&agent2, &key2, &hash, &resp_clone, expires)
+            let req_clone = req.clone();
+            let resp = tokio::task::spawn_blocking(move || {
+                server2.publish_unverified_for_tests(&req_clone)
             })
             .await
             .map_err(|e| RegistryError::Internal(format!("join: {e}")))??;
+            if let Some(key) = idempotency_key.as_deref() {
+                let server2 = server.clone();
+                let agent2 = req.agent_id.clone();
+                let key2 = key.to_string();
+                let hash = req.content_hash.clone();
+                let resp_clone = resp.clone();
+                // #25: honor the configured TTL instead of a hardcoded 24h, matching
+                // the production commit path (acdp::registry::server::commit_via_store).
+                let expires = Utc::now()
+                    + chrono::Duration::seconds(
+                        state.config.limits.idempotency_key_ttl_seconds as i64,
+                    );
+                tokio::task::spawn_blocking(move || {
+                    server2
+                        .store()
+                        .idempotency_record(&agent2, &key2, &hash, &resp_clone, expires)
+                })
+                .await
+                .map_err(|e| RegistryError::Internal(format!("join: {e}")))??;
+            }
+            resp
         }
-        resp
     } else {
         // Production path: full RFC-ACDP-0003 §2.1 pipeline. The resolved
         // tenant is threaded into the atomic commit so `tenant_id` is written
