@@ -69,6 +69,11 @@ impl RegistryConfig {
                 Some(rest) => rest.contains("__"),
                 None => true,
             })
+            // `AUTH__TENANT_AGENTS_JSON` is a hand-rolled escape hatch
+            // (handled below, after deserialization) — not a real config
+            // path. Left in this snapshot it would reach AuthConfig's
+            // `deny_unknown_fields` as an unknown `tenant_agents_json` key.
+            .filter(|(k, _)| k != "ACDP_REGISTRY_AUTH__TENANT_AGENTS_JSON")
             .collect();
         builder = builder.add_source(
             config::Environment::with_prefix("ACDP_REGISTRY")
@@ -88,7 +93,24 @@ impl RegistryConfig {
                 .with_list_parse_key("registry.profiles")
                 .source(Some(env_snapshot)),
         );
-        builder.build()?.try_deserialize()
+        let mut cfg: Self = builder.build()?.try_deserialize()?;
+
+        // `auth.tenant_agents` is `Vec<TenantAgentBinding>` — a list of
+        // structs, which config-rs's env source has no mechanism to
+        // represent at all (list-splitting only ever produces
+        // `Vec<String>`). A deployment with no TOML-file mechanism (e.g.
+        // Railway "deploy from image" services) still needs a way to set
+        // it, so accept a JSON-array escape hatch, applied after the
+        // normal sources so it wins if both are somehow present.
+        if let Ok(json) = std::env::var("ACDP_REGISTRY_AUTH__TENANT_AGENTS_JSON") {
+            cfg.auth.tenant_agents = serde_json::from_str(&json).map_err(|e| {
+                config::ConfigError::Message(format!(
+                    "ACDP_REGISTRY_AUTH__TENANT_AGENTS_JSON: invalid JSON array of \
+                     {{agent_did, tenant_id}}: {e}"
+                ))
+            })?;
+        }
+        Ok(cfg)
     }
 
     /// Defaults suitable for local development (SQLite, no auth, no webhook).
@@ -341,7 +363,7 @@ impl AuthConfig {
 /// Agents not listed here mint tokens with `tenant: None`. Operators
 /// who want every agent to be tenant-bound should ensure every
 /// challenge-completing agent has an entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TenantAgentBinding {
     pub agent_did: String,
@@ -1464,6 +1486,14 @@ backend = "sqlite"
             // Not a `with_list_parse_key` field — must stay a scalar even
             // though it contains the list separator.
             ("ACDP_REGISTRY_AUTH__JWT_SECRET", "a,b,c-not-a-list"),
+            // `tenant_agents` is Vec<TenantAgentBinding> (a list of
+            // structs) — the JSON escape hatch, applied after the generic
+            // env source runs (and explicitly excluded from it, or
+            // AuthConfig's deny_unknown_fields would reject the raw key).
+            (
+                "ACDP_REGISTRY_AUTH__TENANT_AGENTS_JSON",
+                r#"[{"agent_did":"did:key:z6MkA","tenant_id":"tenant-a"},{"agent_did":"did:key:z6MkB","tenant_id":"tenant-b"}]"#,
+            ),
             // A prefixed but un-nested var must NOT trip `deny_unknown_fields`
             // via the env source. `..._TEST_PG_URL` is the CI test harness var;
             // `ACDP_REGISTRY_CONFIG` is the same shape but is excluded here
@@ -1489,5 +1519,30 @@ backend = "sqlite"
             vec!["acdp-registry-core", "acdp-registry-discovery"]
         );
         assert_eq!(cfg.auth.jwt_secret, "a,b,c-not-a-list");
+        assert_eq!(
+            cfg.auth.tenant_agents,
+            vec![
+                TenantAgentBinding {
+                    agent_did: "did:key:z6MkA".into(),
+                    tenant_id: "tenant-a".into(),
+                },
+                TenantAgentBinding {
+                    agent_did: "did:key:z6MkB".into(),
+                    tenant_id: "tenant-b".into(),
+                },
+            ]
+        );
+
+        // Malformed JSON is rejected with an attributed error — a second,
+        // sequential (not concurrent) round-trip of the same env var within
+        // this same test, preserving the "only one test in this crate
+        // touches process env" invariant.
+        std::env::set_var("ACDP_REGISTRY_AUTH__TENANT_AGENTS_JSON", "not json");
+        let err = RegistryConfig::load(None).unwrap_err();
+        std::env::remove_var("ACDP_REGISTRY_AUTH__TENANT_AGENTS_JSON");
+        assert!(
+            err.to_string().contains("TENANT_AGENTS_JSON"),
+            "expected a TENANT_AGENTS_JSON-attributed error, got: {err}"
+        );
     }
 }
