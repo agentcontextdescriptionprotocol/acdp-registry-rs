@@ -81,7 +81,12 @@ pub enum PinOutcome {
     /// `pinned_keys` was empty — no policy active.
     Skipped,
     /// Agent was pinned and the signature verified against the pinned key.
-    Verified,
+    /// Carries the matched entry's key material so the caller can mint a
+    /// receipt fingerprint without re-looking up the config.
+    Verified {
+        public_key_b64: String,
+        algorithm: String,
+    },
     /// Agent was not pinned and `pinned_only = false`.
     Unpinned,
 }
@@ -139,7 +144,10 @@ pub fn enforce_pinned_signature(
         PinnedAlgorithm::EcdsaP256 => verify_ecdsa_p256_pinned(agent_did, pinned, req)?,
     }
 
-    Ok(PinOutcome::Verified)
+    Ok(PinOutcome::Verified {
+        public_key_b64: pinned.public_key_b64.clone(),
+        algorithm: alg.wire_name().to_string(),
+    })
 }
 
 fn verify_ed25519_pinned(
@@ -271,13 +279,19 @@ mod tests {
         let (req, pub_b64) = build_signed_request(key, did);
         let pinned = PinnedAgentKey {
             agent_did: did.into(),
-            public_key_b64: pub_b64,
+            public_key_b64: pub_b64.clone(),
             algorithm: "ed25519".into(),
             valid_from: None,
             valid_until: None,
         };
         let outcome = enforce_pinned_signature(&req, &cfg(vec![pinned], false)).unwrap();
-        assert_eq!(outcome, PinOutcome::Verified);
+        assert_eq!(
+            outcome,
+            PinOutcome::Verified {
+                public_key_b64: pub_b64,
+                algorithm: "ed25519".into(),
+            }
+        );
     }
 
     #[test]
@@ -343,13 +357,19 @@ mod tests {
         let (req, pub_b64) = build_p256_signed_request(did);
         let pinned = PinnedAgentKey {
             agent_did: did.into(),
-            public_key_b64: pub_b64,
+            public_key_b64: pub_b64.clone(),
             algorithm: "ecdsa-p256".into(),
             valid_from: None,
             valid_until: None,
         };
         let outcome = enforce_pinned_signature(&req, &cfg(vec![pinned], false)).unwrap();
-        assert_eq!(outcome, PinOutcome::Verified);
+        assert_eq!(
+            outcome,
+            PinOutcome::Verified {
+                public_key_b64: pub_b64,
+                algorithm: "ecdsa-p256".into(),
+            }
+        );
     }
 
     #[test]

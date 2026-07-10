@@ -2623,6 +2623,62 @@ async fn did_key_publish_bypasses_playground_pinned_only_entirely() {
     );
 }
 
+/// S24-class regression: a pinned did:web agent on a receipts-advertising,
+/// pinned_only registry must mint a real, verifiable receipt — not silently
+/// skip verification. Before `publish_pinned_verified_in_tenant` existed,
+/// this combination had no SDK-level path at all (`publish_unverified_for_tests`
+/// hard-refuses when a receipt signer is configured, and the did:web
+/// resolver path requires a live-resolvable DID document, which playground
+/// DIDs never have).
+#[tokio::test]
+async fn playground_pinned_agent_with_receipts_mints_verifiable_receipt() {
+    use acdp::types::receipt::RegistryReceipt;
+
+    let key = SigningKey::from_bytes(&[13u8; 32]);
+    let did = "did:web:agents.test:smoke-pinned-receipt";
+    let pub_b64 = B64.encode(key.verifying_key_bytes());
+    let p = Producer::new(key, AgentDid::new(did), format!("{did}#key-1"));
+
+    let mut cfg = config(true);
+    cfg.receipt.signing_key_seed_b64 = B64.encode(RECEIPT_SEED);
+    cfg.playground.pinned_only = true;
+    cfg.playground.pinned_keys = vec![PinnedAgentKey {
+        agent_did: did.into(),
+        public_key_b64: pub_b64,
+        algorithm: "ed25519".into(),
+        valid_from: None,
+        valid_until: None,
+    }];
+    let h = build_harness_with_caps(cfg, receipts_caps(), None).await;
+
+    let req = p
+        .publish_request()
+        .title("pinned + receipts")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (status, v) = publish(&h.router, &req, None).await;
+    assert_eq!(status, StatusCode::OK, "publish body = {v}");
+
+    let receipt_json = v["registry_receipt"].clone();
+    assert!(
+        receipt_json.is_object(),
+        "a receipts-advertising registry MUST return the receipt in the publish response: {v}"
+    );
+    let receipt = RegistryReceipt::from_value(&receipt_json).expect("closed-schema receipt");
+    receipt
+        .verify_signature_with_key(Some(&receipt_public_key()), None)
+        .expect("receipt signature");
+    let ctx_id = acdp::types::primitives::CtxId(v["ctx_id"].as_str().unwrap().to_string());
+    let expected_fingerprint = acdp::crypto::fingerprint::fingerprint_ed25519(
+        &SigningKey::from_bytes(&[13u8; 32]).verifying_key_bytes(),
+    );
+    receipt
+        .cross_check(&ctx_id, &req.content_hash, &expected_fingerprint)
+        .expect("receipt cross-checks against the pinned key's fingerprint");
+}
+
 #[tokio::test]
 async fn playground_pinned_agent_with_matching_key_publishes() {
     // Positive case: a pinned agent publishes with the correct key — the
