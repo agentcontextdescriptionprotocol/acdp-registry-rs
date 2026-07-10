@@ -75,6 +75,17 @@ impl RegistryConfig {
                 .prefix_separator("_")
                 .separator("__")
                 .try_parsing(true)
+                // `did_methods` and `profiles` are the only `Vec<String>`
+                // fields an operator plausibly overrides without a TOML
+                // file (e.g. Railway, which has no config-file mechanism
+                // for "deploy from image" services). `config`'s env source
+                // only ever splits a value into a list for keys named here
+                // — every other field (including base64 secrets, which may
+                // itself contain no comma but shouldn't be list-eligible on
+                // principle) keeps deserializing as a plain scalar.
+                .list_separator(",")
+                .with_list_parse_key("auth.did_methods")
+                .with_list_parse_key("registry.profiles")
                 .source(Some(env_snapshot)),
         );
         builder.build()?.try_deserialize()
@@ -1430,12 +1441,29 @@ backend = "sqlite"
         // them were no-ops (e.g. the storage backend could never be selected
         // for the Postgres-only container image). Keep this convention stable.
         //
+        // Also covers the `Vec<String>` fields (`auth.did_methods`,
+        // `registry.profiles`): `config`'s env source only ever splits a
+        // value into a list for keys passed to `with_list_parse_key` — every
+        // other field (including a comma-bearing JWT secret below) must keep
+        // deserializing as a scalar even though `list_separator` is now
+        // globally set on the source. Before this fix, an operator with no
+        // TOML-file mechanism (e.g. Railway "deploy from image" services)
+        // could not enable `did:key` at all.
+        //
         // SAFETY: no other test in this crate reads or writes process env, so
         // the set/remove pair here cannot race a concurrent reader.
         let vars = [
             ("ACDP_REGISTRY_REGISTRY__AUTHORITY", "env-host"),
             ("ACDP_REGISTRY_REGISTRY__PORT", "9191"),
             ("ACDP_REGISTRY_STORAGE__BACKEND", "postgres"),
+            ("ACDP_REGISTRY_AUTH__DID_METHODS", "did:web,did:key"),
+            (
+                "ACDP_REGISTRY_REGISTRY__PROFILES",
+                "acdp-registry-core,acdp-registry-discovery",
+            ),
+            // Not a `with_list_parse_key` field — must stay a scalar even
+            // though it contains the list separator.
+            ("ACDP_REGISTRY_AUTH__JWT_SECRET", "a,b,c-not-a-list"),
             // A prefixed but un-nested var must NOT trip `deny_unknown_fields`
             // via the env source. `..._TEST_PG_URL` is the CI test harness var;
             // `ACDP_REGISTRY_CONFIG` is the same shape but is excluded here
@@ -1455,5 +1483,11 @@ backend = "sqlite"
         assert_eq!(cfg.registry.authority, "env-host");
         assert_eq!(cfg.registry.port, 9191);
         assert_eq!(cfg.storage.backend, StorageBackend::Postgres);
+        assert_eq!(cfg.auth.did_methods, vec!["did:web", "did:key"]);
+        assert_eq!(
+            cfg.registry.profiles,
+            vec!["acdp-registry-core", "acdp-registry-discovery"]
+        );
+        assert_eq!(cfg.auth.jwt_secret, "a,b,c-not-a-list");
     }
 }
