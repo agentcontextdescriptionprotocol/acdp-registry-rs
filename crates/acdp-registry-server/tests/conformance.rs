@@ -220,7 +220,7 @@ async fn body_to_json(resp: axum::response::Response) -> Value {
 
 /// Mirror of `pct_encode_path_segment` in `http_integration.rs` — the
 /// `acdp://authority/uuid` ctx_ids contain `/` and `:` which need
-/// percent-encoding to satisfy axum's `:ctx_id` single-segment param.
+/// percent-encoding to satisfy axum's `{ctx_id}` single-segment param.
 fn pct_encode_path_segment(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 3);
     for b in s.bytes() {
@@ -701,7 +701,7 @@ async fn replays_spec_fixtures_when_present() {
 
         for ex in exchanges {
             // GET paths may carry a raw `acdp://` ctx_id needing single-
-            // segment percent-encoding for axum's `:ctx_id` matcher.
+            // segment percent-encoding for axum's `{ctx_id}` matcher.
             let mut p = ex.path.clone();
             if p.contains("acdp://") && ex.method == "GET" {
                 if let Some(idx) = p.rfind('/') {
