@@ -16,13 +16,21 @@
 //!     (HTTP 400) with an inline body, and stateless retrieval fixtures
 //!     (e.g. `ret-*` GET of a missing ctx → 404).
 //!   * **Skipped — requires pre-seeded state** — `vis-*`, `idem-*` and other
-//!     fixtures whose `setup`/`preconditions` need a context with a specific
-//!     registry-assigned `ctx_id` the publish API won't let us mint.
+//!     fixtures whose `setup`/`preconditions` (top-level or under `input`)
+//!     need a context with a specific registry-assigned `ctx_id` the publish
+//!     API won't let us mint.
+//!   * **Skipped — profile not advertised** — fixtures whose
+//!     `applies_to_profiles` is disjoint from `HARNESS_PROFILES`, e.g.
+//!     `lc-*` (`acdp-registry-lifecycle`), `fed-*`
+//!     (`acdp-registry-federated`). This is the harness's advertised
+//!     profile set, not a statement about what the registry implements.
 //!   * **Skipped — non-HTTP** — `can-*`/`sig-*` (canonicalization & signature
 //!     vectors; these belong against the `acdp` library, not the HTTP layer),
 //!     `caps-*`/`schema-*`/`meta-*` (document-schema validation), `rate-*`
 //!     (informative wire-shape pin), and positive/authz publish outcomes that
 //!     need valid crypto material the synthetic fixtures don't carry.
+//!   * **Skipped — unsubstituted template** — an exchange whose constructed
+//!     path still carries a `{...}` placeholder the harness couldn't fill.
 //!
 //! Any replayed exchange whose status or error code mismatches fails the test.
 
@@ -46,10 +54,15 @@ use acdp_registry_types::{
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tower::ServiceExt;
 
 const AUTHORITY: &str = "registry.test";
+
+/// Profiles the conformance harness registry advertises. Mirrors `caps().profiles`
+/// (`conformance.rs:61`) and `config().registry.profiles` (`:86`) — keep all three
+/// in step; `harness_profiles_match_caps_and_config` enforces it.
+const HARNESS_PROFILES: &[&str] = &["acdp-registry-core"];
 
 fn caps() -> CapabilitiesDocument {
     CapabilitiesDocument {
@@ -208,15 +221,76 @@ fn headers_of(req: &Value) -> std::collections::BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
+/// True iff the fixture declares `applies_to_profiles` and that set is
+/// disjoint from the profiles this harness's registry advertises
+/// (`HARNESS_PROFILES`). A fixture that names several profiles, only one of
+/// which we advertise, still runs — hence disjoint, not "not a subset".
+/// Fixtures that omit `applies_to_profiles` entirely are unaffected (treated
+/// as applying universally).
+fn targets_unadvertised_profile(fx: &Value) -> bool {
+    let Some(profiles) = fx.get("applies_to_profiles").and_then(Value::as_array) else {
+        return false;
+    };
+    let fixture_profiles: Vec<&str> = profiles.iter().filter_map(Value::as_str).collect();
+    !fixture_profiles.is_empty()
+        && !fixture_profiles
+            .iter()
+            .any(|p| HARNESS_PROFILES.contains(p))
+}
+
+/// True iff the fixture declares any of the four precondition-carrying keys
+/// the pinned corpus uses: top-level `setup`/`preconditions`, or
+/// `input.precondition`/`input.preconditions`. All four mean the fixture
+/// needs a ctx the publish API won't let us mint (registry assigns ctx_id),
+/// so we skip those.
+fn has_unseeded_precondition(fx: &Value) -> bool {
+    fx.get("setup").is_some()
+        || fx.get("preconditions").is_some()
+        || fx
+            .get("input")
+            .is_some_and(|i| i.get("precondition").is_some() || i.get("preconditions").is_some())
+}
+
 /// Turn a parsed fixture into replayable exchanges or a skip reason. Only
 /// fixtures that are self-contained HTTP exchanges with a deterministic
 /// expected status — and that do NOT depend on pre-seeded registry state —
-/// are replayed. `setup`/`preconditions` mean the fixture needs a ctx the
-/// publish API won't let us mint (registry assigns ctx_id), so we skip those.
+/// are replayed. `setup`/`preconditions` (top-level or under `input`) mean
+/// the fixture needs a ctx the publish API won't let us mint (registry
+/// assigns ctx_id), so we skip those.
+///
+/// Gate order: profile gate → precondition gate → shape dispatch → template
+/// gate (which needs a constructed `Exchange.path`, so it runs last). The
+/// most specific, most informative reason wins.
 fn extract(fx: &Value) -> Extracted {
-    if fx.get("setup").is_some() || fx.get("preconditions").is_some() {
+    if targets_unadvertised_profile(fx) {
+        return Extracted::Skip("fixture targets a profile this harness does not advertise");
+    }
+    if has_unseeded_precondition(fx) {
         return Extracted::Skip("requires pre-seeded registry state");
     }
+    let extracted = extract_shapes(fx);
+    // Template gate: inspect the *constructed* Exchange.path, never the
+    // fixture's declared `request.path` / `input.endpoint`. Shape C
+    // substitutes `input.ctx_id` into a brace-free path even though the
+    // declared `input.endpoint` (e.g. "GET /contexts/{ctx_id}") carries
+    // braces — applying this gate to the declared endpoint would wrongly
+    // drop ret-001. RFC 3986 doesn't permit unescaped `{`/`}` in a path, and
+    // `pct_encode_path_segment` escapes them anyway, so this can't
+    // false-positive on well-formed substituted input.
+    if let Extracted::Run(exchanges) = &extracted {
+        if exchanges
+            .iter()
+            .any(|e| e.path.contains('{') || e.path.contains('}'))
+        {
+            return Extracted::Skip("request path carries an unsubstituted {template} placeholder");
+        }
+    }
+    extracted
+}
+
+/// Shape dispatch: the actual per-family extraction logic, run after the
+/// profile and precondition gates have already passed.
+fn extract_shapes(fx: &Value) -> Extracted {
     // Shape A: top-level `request` + `expected`.
     if let (Some(req), Some(exp)) = (fx.get("request"), fx.get("expected")) {
         if let (Some(method), Some(path), Some(status)) = (
@@ -344,6 +418,11 @@ fn resolve_fixture_dir(dir: &str) -> Option<PathBuf> {
     .into_iter()
     .find(has_json)
 }
+
+/// Exchanges replayable at spec bff3cf3a: pub-004, pub-005, pub-008, ret-001.
+/// A gate that accidentally over-matches must fail loudly, not quietly shrink
+/// coverage to a still-nonzero number. Raise this as coverage grows.
+const MIN_REPLAYED_EXCHANGES: usize = 4;
 
 fn family_of(name: &str) -> String {
     // Prefix up to the digit group: `data-ref-ssrf-001-...` -> `data-ref-ssrf`.
@@ -493,7 +572,11 @@ async fn replays_spec_fixtures_when_present() {
     if !failures.is_empty() {
         panic!("conformance failures:\n  - {}", failures.join("\n  - "));
     }
-    assert!(replayed > 0, "expected at least one replayable fixture");
+    assert!(
+        replayed >= MIN_REPLAYED_EXCHANGES,
+        "replayed {replayed} exchange(s), expected at least {MIN_REPLAYED_EXCHANGES} \
+         (a fidelity gate may be over-matching and silently shrinking coverage)"
+    );
 }
 
 /// Returns `Ok(())` iff every key in `want` is present in `got` with a
@@ -671,4 +754,138 @@ async fn did_key_golden_vector_accepted_and_gated() {
     let (status, v) = post(rejecting, req_body).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "dk-003 body = {v}");
     assert_eq!(v["error"]["code"], "key_resolution_failed");
+}
+
+// ─── Phase 1: harness fidelity gates ───
+
+/// A fixture whose `applies_to_profiles` is disjoint from `HARNESS_PROFILES`
+/// must be skipped by the profile gate, with the specific reason string (not
+/// merely "some skip"). A fixture listing several profiles, only one of
+/// which we advertise, must still run.
+#[test]
+fn extract_skips_fixtures_outside_advertised_profiles() {
+    let out_of_profile = json!({
+        "applies_to_profiles": ["acdp-registry-lifecycle"],
+        "request": {"method": "GET", "path": "/health"},
+        "expected": {"status": 200}
+    });
+    match extract(&out_of_profile) {
+        Extracted::Skip(reason) => assert_eq!(
+            reason,
+            "fixture targets a profile this harness does not advertise"
+        ),
+        Extracted::Run(x) => panic!("expected profile-gate skip, got Run({x:?})"),
+    }
+
+    // Overlapping (not disjoint) — must run, not be skipped.
+    let overlapping = json!({
+        "applies_to_profiles": ["acdp-consumer", "acdp-registry-core"],
+        "request": {"method": "GET", "path": "/health"},
+        "expected": {"status": 200}
+    });
+    match extract(&overlapping) {
+        Extracted::Run(x) => assert_eq!(x.len(), 1),
+        Extracted::Skip(reason) => {
+            panic!("expected Run for overlapping profiles, got Skip({reason})")
+        }
+    }
+}
+
+/// The template gate inspects the *constructed* `Exchange.path`, not the
+/// fixture's declared `request.path` / `input.endpoint`. A shape-A fixture
+/// whose declared path still carries `{ctx_id}` must be skipped. A shape-C
+/// fixture (the `ret-001` shape) whose declared `input.endpoint` carries
+/// `{ctx_id}` but whose `input.ctx_id` substitutes cleanly into a brace-free
+/// path must still run — this is the single most important test in this
+/// phase, since a gate applied to the wrong field would silently drop
+/// `ret-001` and shrink `replayed` from 4 to 3.
+#[test]
+fn extract_skips_unsubstituted_path_templates() {
+    let unsubstituted = json!({
+        "request": {
+            "method": "POST",
+            "path": "/contexts/{ctx_id}/retract",
+            "body": {"foo": "bar"}
+        },
+        "expected": {"status": 400}
+    });
+    match extract(&unsubstituted) {
+        Extracted::Skip(reason) => assert_eq!(
+            reason,
+            "request path carries an unsubstituted {template} placeholder"
+        ),
+        Extracted::Run(x) => panic!("expected template-gate skip, got Run({x:?})"),
+    }
+
+    // ret-001 regression: declared endpoint carries braces, but the
+    // substituted ctx_id produces a brace-free path — must run.
+    let ret_001_shape = json!({
+        "input": {
+            "endpoint": "GET /contexts/{ctx_id}",
+            "ctx_id": "acdp://registry.example.com/00000000-0000-4000-8000-000000000000"
+        },
+        "expected": {"status": 404, "error_code": "not_found"}
+    });
+    match extract(&ret_001_shape) {
+        Extracted::Run(x) => {
+            assert_eq!(x.len(), 1);
+            assert!(
+                !x[0].path.contains('{') && !x[0].path.contains('}'),
+                "substituted path must be brace-free: {}",
+                x[0].path
+            );
+        }
+        Extracted::Skip(reason) => {
+            panic!("expected ret-001-shape fixture to run, got Skip({reason})")
+        }
+    }
+}
+
+/// `input.precondition` (singular, string) and `input.preconditions`
+/// (plural, object) must both be recognized alongside the top-level
+/// `setup`/`preconditions` keys.
+#[test]
+fn extract_skips_input_level_preconditions() {
+    let singular = json!({
+        "input": {"precondition": "some pre-seeded state"}
+    });
+    match extract(&singular) {
+        Extracted::Skip(reason) => assert_eq!(reason, "requires pre-seeded registry state"),
+        Extracted::Run(x) => panic!("expected precondition skip, got Run({x:?})"),
+    }
+
+    let plural = json!({
+        "input": {"preconditions": {"existing_context": {"ctx_id": "acdp://x/1"}}}
+    });
+    match extract(&plural) {
+        Extracted::Skip(reason) => assert_eq!(reason, "requires pre-seeded registry state"),
+        Extracted::Run(x) => panic!("expected precondition skip, got Run({x:?})"),
+    }
+}
+
+/// Drift guard: `HARNESS_PROFILES` must equal both `caps().profiles` and
+/// `config().registry.profiles`. If a later change widens the harness's
+/// advertised profiles without updating `HARNESS_PROFILES`, the profile gate
+/// would silently keep skipping fixtures it should now run.
+#[test]
+fn harness_profiles_match_caps_and_config() {
+    let caps = caps();
+    let caps_profiles: Vec<&str> = caps.profiles.iter().map(String::as_str).collect();
+    assert_eq!(
+        HARNESS_PROFILES,
+        caps_profiles.as_slice(),
+        "HARNESS_PROFILES must mirror caps().profiles"
+    );
+    let config = config();
+    let config_profiles: Vec<&str> = config
+        .registry
+        .profiles
+        .iter()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        HARNESS_PROFILES,
+        config_profiles.as_slice(),
+        "HARNESS_PROFILES must mirror config().registry.profiles"
+    );
 }

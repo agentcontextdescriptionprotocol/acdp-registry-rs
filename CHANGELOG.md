@@ -39,7 +39,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   checks TLS materials exist, and refuses the literal `changeme`
   placeholder.
 - **Conformance harness** (`BUG-07`): `tests/conformance.rs` replays
-  `pub-*` and `vis-*` fixtures from `ACDP_SPEC_DIR` when present;
+  `pub-*` and `ret-*` fixtures from `ACDP_SPEC_DIR` when present;
   status + `json_contains` assertions with a null-as-wildcard sentinel.
 - **Playground matrix test** (`DESIGN-03`): asserts `/admin/contexts` is
   mounted when the `playground` feature is compiled in but the runtime
