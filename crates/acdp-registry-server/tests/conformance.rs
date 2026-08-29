@@ -535,7 +535,7 @@ fn resolve_fixture_dir(dir: &str) -> Option<PathBuf> {
     .find(has_json)
 }
 
-/// Exchanges replayable at spec bff3cf3a: pub-004, pub-005, pub-008, ret-001.
+/// Exchanges replayable at spec 31cf874: pub-004, pub-005, pub-008, ret-001.
 /// A gate that accidentally over-matches must fail loudly, not quietly shrink
 /// coverage to a still-nonzero number. Raise this as coverage grows.
 const MIN_REPLAYED_EXCHANGES: usize = 4;
@@ -1168,7 +1168,7 @@ fn fixture_family_panics_naming_file_when_id_missing() {
 // ─── Phase 4: family-coverage ratchet (`KNOWN_FAMILIES` / `EXCUSED`) ───
 
 /// All 28 fixture families the pinned spec (`registries/profiles.json`'s
-/// `fixture_families` object) declares, as of SHA `bff3cf3a`. Every one has
+/// `fixture_families` object) declares, as of SHA `31cf874`. Every one has
 /// fixtures on disk and is classified (replayed or skipped-with-reason) by
 /// this harness. Listing all 28 — not just the ones we replay — is the
 /// honest statement "we have looked at every family"; a 29th family (the
