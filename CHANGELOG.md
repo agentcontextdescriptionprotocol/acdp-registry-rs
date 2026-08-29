@@ -128,6 +128,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   image ships (`STORAGE_FEATURE=storage-pg` by default in
   `docker/Dockerfile`), instead of only the default-features graph.
   `cargo deny --workspace check` remains green with no new findings.
+- **`axum-server` bumped 0.7 → 0.8** (`REG-6`): removes `rustls-pemfile`
+  from the dependency graph entirely (0.8.0 replaced it with
+  `rustls-pki-types`'s `PemObject` trait), so the `RUSTSEC-2025-0134`
+  ignore entry is deleted from `deny.toml` rather than merely
+  satisfied. `axum_server::Handle` is now generic over the bind
+  address (`Handle<A: Address>`); `main.rs` annotates its one
+  `Handle::<SocketAddr>::new()` construction site (shared by both the
+  non-TLS and TLS-capable serve paths) and the `spawn_shutdown_watcher`
+  signature accordingly. No router or crypto-provider changes —
+  `tls-rustls` still resolves to `rustls/aws-lc-rs`.
 
 ### Documentation
 

@@ -29,7 +29,7 @@ acdp = { version = "0.8.1", features = ["server", "client"] }
 
 # HTTP
 axum       = { version = "0.7", features = ["macros"] }
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 tower      = { version = "0.4", features = ["full"] }
 tower-http = { version = "0.5", features = ["cors", "trace", "request-id", "timeout", "util", "limit", "set-header"] }
 
