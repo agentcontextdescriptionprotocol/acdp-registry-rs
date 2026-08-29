@@ -20,9 +20,9 @@
 //!     nonexistent path, set to a path with no resolvable fixture directory,
 //!     or (in `did_key_golden_vector_accepted_and_gated`) pointing at
 //!     fixtures that don't contain `sig-003-did-key-golden.json`. This is
-//!     what the dedicated conformance CI job (a later phase) runs, so a
-//!     missing or misconfigured spec checkout is a red run, not a silent
-//!     green one. There is deliberately **no** sibling-directory fallback —
+//!     what the dedicated `conformance` CI job runs (see
+//!     `.github/workflows/ci.yml`), so a missing or misconfigured spec
+//!     checkout is a red run, not a silent green one. There is deliberately **no** sibling-directory fallback —
 //!     `ACDP_SPEC_DIR` is the single explicit contract; letting an unset
 //!     variable silently resolve to some other spec tree on disk would
 //!     defeat the entire point of require-mode and violate this repo's
@@ -616,8 +616,9 @@ fn bucket_family<'a>(id: &str, candidates: &[&'a str]) -> Option<&'a str> {
 /// falls back to the filename-stem heuristic only when `registries/
 /// profiles.json` is not reachable (`ACDP_SPEC_DIR` may point straight at a
 /// bare fixtures directory), or when the `id` doesn't match any declared
-/// family (a later phase's ratchet is what turns that into a hard failure,
-/// not this helper — the manifest must still get *a* label).
+/// family (`all_conformance_fixtures_are_bucketed_into_known_families` below
+/// is what turns that into a hard failure, not this helper — the manifest
+/// must still get *a* label).
 fn fixture_family(fx: &Value, path: &Path, spec_families: Option<&[&str]>) -> String {
     let id = fx
         .get("id")
@@ -1139,9 +1140,9 @@ fn fixture_family_falls_back_without_spec_families() {
 }
 
 /// A fixture `id` that matches no declared family must NOT panic here — this
-/// phase only produces manifest labels; turning "unaccounted family" into a
-/// hard failure is a later phase's ratchet. The label falls back to the
-/// filename-stem heuristic.
+/// helper only produces manifest labels; turning "unaccounted family" into a
+/// hard failure is `all_conformance_fixtures_are_bucketed_into_known_families`'s
+/// job. The label falls back to the filename-stem heuristic.
 #[test]
 fn fixture_family_id_matching_no_family_falls_back_without_panicking() {
     let fx = json!({"id": "totally-unknown-001", "description": "x"});
@@ -1154,7 +1155,7 @@ fn fixture_family_id_matching_no_family_falls_back_without_panicking() {
 }
 
 /// A fixture missing `id` must panic naming the file path, not silently fall
-/// back to filename-based bucketing — a later phase's ratchet could
+/// back to filename-based bucketing — the coverage ratchet below could
 /// otherwise be defeated by simply omitting `id`.
 #[test]
 #[should_panic(expected = "no-id-fixture.json")]
