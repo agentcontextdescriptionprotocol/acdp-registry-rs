@@ -79,6 +79,47 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Draft → **Final**. No fixture family, fixture shape, `id`, `request`,
   or `expected` field changed; the conformance harness runs unchanged
   against the new pin (`16 passed; 0 failed`, 4 exchanges replayed).
+- **SHA-pinned credential-bearing workflow actions** (`REG-8`): every
+  third-party action in `docker.yml` and `release-plz.yml` (plus
+  `peter-evans/repository-dispatch` in `notify-website.yml`) now
+  resolves at an immutable 40-hex commit SHA with a `# vX.Y.Z` (or
+  `# stable` for `dtolnay/rust-toolchain`, a selector rather than a
+  version) comment, matching `acdp-rs`'s two-tier pinning posture:
+  `docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+  # v3.12.0`, `docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+  # v3.7.0`, `docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051
+  # v5.10.0`, `docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+  # v6.19.2` (both call sites), `dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+  # stable` (matches `acdp-rs`'s own current pin verbatim),
+  `MarcoIeni/release-plz-action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9
+  # v0.5.131`, and `peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697
+  # v4.0.1`. First-party `actions/checkout@v4` stays tag-pinned
+  (deliberate, matching the sibling's first-party tier), and the
+  `acdp-ci/.github/workflows/*@v1` reusable-workflow refs are
+  untouched (pinning those would break family propagation).
+  `docker/login-action`, the pushing `docker/build-push-action` call,
+  `MarcoIeni/release-plz-action`, and `dtolnay/rust-toolchain` are not
+  exercised by this PR's own CI (gated off `pull_request` events or
+  behind `on: push: branches: [main]`). `docker/login-action`,
+  `docker/build-push-action`, and `MarcoIeni/release-plz-action` were
+  each independently re-verified against their tag via `gh api`.
+  `dtolnay/rust-toolchain` is the one deliberate exception: it is
+  pinned to match `acdp-rs`'s own current SHA verbatim rather than to
+  whatever `@stable` resolves to today (the two diverge — see the
+  Approach section of `plans/reg2-reg5-reg6-reg8-reg9-wave4.md`
+  Phase 9), so verifying it against `@stable` would show a mismatch
+  by design; parity with the sibling's pin is the actual check.
+- **Retired stale supply-chain narration** (`REG-9`): the
+  `Cargo.toml` comment above the `acdp` dependency wrongly described a
+  0.5.3-era, per-sub-crate version mix; it now states that `acdp`
+  0.8.1 is a facade crate over eleven sub-crates published to
+  crates.io and kept in lockstep at the same version, without naming
+  individual sub-crate versions. `deny.toml`'s dead `allow-git` entry
+  for the `acdp-rs` repo (a leftover from when `acdp` was git-sourced)
+  is removed, which silences a persistent `cargo deny`
+  `unmatched-source` warning. The one behavioral consequence: any
+  future git dependency on `acdp-rs` is now a `cargo deny` finding
+  instead of a silent allowance.
 - **BREAKING** (`SEC-07`): `auth.anonymous_public_reads` now defaults
   to `false`, matching `CLAUDE.md`. Operators upgrading who rely on
   world-readable public contexts MUST set the field explicitly:
