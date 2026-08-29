@@ -122,6 +122,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   queued empty `DATA` frames without limit, risking unbounded memory
   growth or a length-overflow panic. Reached transitively via
   `hyper` ← `axum` / `axum-server` / `hyper-rustls` / `reqwest`.
+- **`[graph] all-features = true`** (`REG-7`) in `deny.toml`: the
+  cargo-deny advisory/license/bans gate now resolves every
+  feature-gated subgraph, including the `storage-pg` path the Docker
+  image ships (`STORAGE_FEATURE=storage-pg` by default in
+  `docker/Dockerfile`), instead of only the default-features graph.
+  `cargo deny --workspace check` remains green with no new findings.
 
 ### Documentation
 
