@@ -60,7 +60,7 @@
 
 #![cfg(feature = "storage-sqlite")]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use acdp::registry::RegistryServer;
@@ -522,6 +522,79 @@ fn family_of(name: &str) -> String {
     }
 }
 
+/// Reads + parses a JSON file, panicking (naming the path) on any failure
+/// (missing file, invalid JSON). A spec checkout with an unparseable JSON
+/// file under it is not a usable spec checkout, so this is not a skip path.
+fn read_json(path: &Path) -> Value {
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+    serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("invalid JSON in {}: {e}", path.display()))
+}
+
+/// Reads `registries/profiles.json` under `root` and returns its
+/// `fixture_families` object's keys. `None` when the file is absent (the
+/// bare-fixtures-dir layout, where `ACDP_SPEC_DIR` points straight at
+/// `schemas/conformance` with no `registries/` sibling).
+fn spec_families(root: &Path) -> Option<Vec<String>> {
+    let profiles_path = root.join("registries/profiles.json");
+    if !profiles_path.exists() {
+        return None;
+    }
+    let profiles = read_json(&profiles_path);
+    let keys = profiles
+        .get("fixture_families")
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| {
+            panic!(
+                "{} missing 'fixture_families' object",
+                profiles_path.display()
+            )
+        })
+        .keys()
+        .cloned()
+        .collect();
+    Some(keys)
+}
+
+/// Longest-prefix match of a fixture `id` against a family list, mirroring
+/// `acdp-rs`'s `tests/conformance.rs::bucket_family`, which in turn mirrors
+/// the spec's own `scripts/check-consistency.py::check_families`: sort
+/// candidates by length descending and take the first one that is a true
+/// `-`-delimited prefix of `id`. A naive split-on-first-hyphen would
+/// mis-bucket `data-ref-ssrf-001` as `data` (or `data-ref`).
+fn bucket_family<'a>(id: &str, candidates: &[&'a str]) -> Option<&'a str> {
+    let mut ordered: Vec<&str> = candidates.to_vec();
+    ordered.sort_by_key(|fam| std::cmp::Reverse(fam.len()));
+    ordered
+        .into_iter()
+        .find(|fam| id.starts_with(&format!("{fam}-")))
+}
+
+/// Bucket a fixture into its spec-declared family. Prefers the fixture's own
+/// `id` and a longest-prefix match against the spec's declared families;
+/// falls back to the filename-stem heuristic only when `registries/
+/// profiles.json` is not reachable (`ACDP_SPEC_DIR` may point straight at a
+/// bare fixtures directory), or when the `id` doesn't match any declared
+/// family (a later phase's ratchet is what turns that into a hard failure,
+/// not this helper — the manifest must still get *a* label).
+fn fixture_family(fx: &Value, path: &Path, spec_families: Option<&[&str]>) -> String {
+    let id = fx
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("fixture {} missing string 'id'", path.display()));
+    let filename_stem = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    match spec_families {
+        Some(candidates) => bucket_family(id, candidates)
+            .map(str::to_string)
+            .unwrap_or_else(|| family_of(&filename_stem)),
+        None => family_of(&filename_stem),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn replays_spec_fixtures_when_present() {
     let Some(fixtures) = spec_fixtures() else {
@@ -532,6 +605,16 @@ async fn replays_spec_fixtures_when_present() {
         return;
     };
     eprintln!("conformance: fixtures dir = {}", fixtures.display());
+
+    // Spec-declared families, when reachable, so fixture bucketing is keyed
+    // on the fixture's own `id` (via `fixture_family`) rather than a bare
+    // filename heuristic. `spec_root()` cannot be `None` here: `fixtures`
+    // above only resolves once `spec_root()` has already resolved.
+    let root = spec_root().expect("spec_fixtures() resolved implies spec_root() resolves");
+    let spec_fams = spec_families(&root);
+    let spec_fam_refs: Option<Vec<&str>> = spec_fams
+        .as_ref()
+        .map(|v| v.iter().map(String::as_str).collect());
 
     let app = harness().await;
     let mut replayed = 0usize;
@@ -551,7 +634,6 @@ async fn replays_spec_fixtures_when_present() {
 
     for path in paths {
         let name = path.file_name().unwrap().to_string_lossy().to_string();
-        let family = family_of(&name);
         let raw = match std::fs::read(&path) {
             Ok(b) => b,
             Err(e) => {
@@ -566,6 +648,7 @@ async fn replays_spec_fixtures_when_present() {
                 continue;
             }
         };
+        let family = fixture_family(&fx, &path, spec_fam_refs.as_deref());
 
         let exchanges = match extract(&fx) {
             Extracted::Skip(reason) => {
@@ -967,4 +1050,76 @@ fn harness_profiles_match_caps_and_config() {
         config_profiles.as_slice(),
         "HARNESS_PROFILES must mirror config().registry.profiles"
     );
+}
+
+// ─── Phase 3: unified fixture bucketing (`bucket_family` / `fixture_family`) ───
+
+/// Direct test of `bucket_family`'s longest-prefix behavior: `data-ref-ssrf-001`
+/// must bucket as `data-ref-ssrf`, not `data-ref` — the case that motivates
+/// sorting candidates by length descending instead of taking the first match.
+#[test]
+fn fixture_family_bucketing_prefers_longest_match() {
+    let candidates = ["data-ref", "data-ref-ssrf", "lc"];
+    assert_eq!(
+        bucket_family("data-ref-ssrf-001", &candidates),
+        Some("data-ref-ssrf")
+    );
+    assert_eq!(bucket_family("data-ref-001", &candidates), Some("data-ref"));
+    assert_eq!(bucket_family("lc-001", &candidates), Some("lc"));
+    assert_eq!(bucket_family("unrelated-001", &candidates), None);
+}
+
+/// `fixture_family` must bucket from the fixture's `id`, not its filename —
+/// constructed so the two heuristics disagree: `id` "ret-001" prefix-matches
+/// "ret" in the spec family list, while the filename stem's split-until-digit
+/// heuristic on a deliberately unrelated filename would produce a different
+/// label entirely.
+#[test]
+fn fixture_family_prefers_id_over_filename() {
+    let fx = json!({"id": "ret-001", "description": "x"});
+    let path = Path::new("/tmp/totally-different-001-desc.json");
+    let spec_fams = ["ret", "pub"];
+    assert_eq!(fixture_family(&fx, path, Some(&spec_fams)), "ret");
+    // Confirm the filename-based heuristic really would have disagreed, so
+    // this test is actually discriminating between the two code paths.
+    assert_eq!(
+        family_of("totally-different-001-desc.json"),
+        "totally-different"
+    );
+}
+
+/// `spec_families = None` (bare-fixtures-dir layout, no `registries/` sibling
+/// to read) must route to the filename-stem `family_of` fallback regardless
+/// of what the fixture's `id` says.
+#[test]
+fn fixture_family_falls_back_without_spec_families() {
+    let fx = json!({"id": "ret-001", "description": "x"});
+    let path = Path::new("/tmp/pub-005-desc.json");
+    assert_eq!(fixture_family(&fx, path, None), "pub");
+}
+
+/// A fixture `id` that matches no declared family must NOT panic here — this
+/// phase only produces manifest labels; turning "unaccounted family" into a
+/// hard failure is a later phase's ratchet. The label falls back to the
+/// filename-stem heuristic.
+#[test]
+fn fixture_family_id_matching_no_family_falls_back_without_panicking() {
+    let fx = json!({"id": "totally-unknown-001", "description": "x"});
+    let path = Path::new("/tmp/totally-unknown-001-desc.json");
+    let spec_fams = ["ret", "pub"];
+    assert_eq!(
+        fixture_family(&fx, path, Some(&spec_fams)),
+        "totally-unknown"
+    );
+}
+
+/// A fixture missing `id` must panic naming the file path, not silently fall
+/// back to filename-based bucketing — a later phase's ratchet could
+/// otherwise be defeated by simply omitting `id`.
+#[test]
+#[should_panic(expected = "no-id-fixture.json")]
+fn fixture_family_panics_naming_file_when_id_missing() {
+    let fx = json!({"description": "no id here"});
+    let path = Path::new("/tmp/no-id-fixture.json");
+    fixture_family(&fx, path, None);
 }
