@@ -22,9 +22,12 @@ readme        = "README.md"
 
 [workspace.dependencies]
 # Protocol library — reuse types, crypto, validation, DID resolution.
-# Published `acdp` 0.5.3 from crates.io: carries acdp-types 0.3.2
-# (`acdp::types::cosignature`) + acdp-client 0.4.1 (witness verification),
-# the RFC-ACDP-0015 §6.1 aggregation surface the registry needs.
+# `acdp` is a facade crate over its eleven sub-crates (acdp-client, acdp-crypto,
+# acdp-did, acdp-jcs, acdp-primitives, acdp-producer, acdp-safe-http, acdp-server,
+# acdp-types, acdp-validation, acdp-verify), all published to crates.io and kept
+# in lockstep at the same version. The "server" and "client" features pull in
+# the RFC-ACDP-0015 §6.1 aggregation surface the registry needs (cosignature
+# types, witness verification).
 acdp = { version = "0.8.1", features = ["server", "client"] }
 
 # HTTP
