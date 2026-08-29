@@ -117,6 +117,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   no longer silently produce valid HMACs (`SEC-04`), and the
   `RequestBodyLimitLayer` (`SEC-06`) protects every route from
   arbitrarily-large request bodies.
+- **`h2` bumped 0.4.15 → 0.4.19** (lockfile-only version bump, not a
+  `deny.toml` ignore): resolves `RUSTSEC-2026-0258`, in which `h2`
+  queued empty `DATA` frames without limit, risking unbounded memory
+  growth or a length-overflow panic. Reached transitively via
+  `hyper` ← `axum` / `axum-server` / `hyper-rustls` / `reqwest`.
 
 ### Documentation
 
