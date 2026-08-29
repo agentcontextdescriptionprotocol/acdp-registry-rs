@@ -57,6 +57,46 @@
 //!     path still carries a `{...}` placeholder the harness couldn't fill.
 //!
 //! Any replayed exchange whose status or error code mismatches fails the test.
+//!
+//! ## Coverage ratchet (`KNOWN_FAMILIES` / `EXCUSED`)
+//!
+//! `KNOWN_FAMILIES` is the honest claim "we have looked at every fixture
+//! family the pinned spec declares" — all 28 keys of `registries/
+//! profiles.json`'s `fixture_families` object, each with fixtures on disk,
+//! each classified by the manifest above as replayed or skipped-with-reason.
+//! `all_conformance_fixtures_are_bucketed_into_known_families` is the ratchet
+//! itself: a 29th family (new fixture id prefix the spec adds later) fails
+//! the build until a human looks at it and adds it here.
+//!
+//! `EXCUSED` is a strict subset of `KNOWN_FAMILIES` naming the families this
+//! repo asserts don't need HTTP-replay coverage at all, each with a prose
+//! reason. An excuse is legitimate only when **both** hold:
+//!
+//!   1. **Spec-grounded** — no fixture in the family appears in
+//!      `registries/profiles.json`'s `acdp-registry-core` profile's
+//!      `required_fixtures`, nor anywhere in its `conditional_fixtures`
+//!      (fixtures required whenever this repo's advertised capabilities
+//!      satisfy the entry's condition — e.g. `dk-*` when `did:key` is
+//!      advertised, `idem-*` when idempotency-key support is advertised).
+//!      If the spec requires the family of the profile this repo
+//!      advertises — unconditionally or conditionally — it cannot be
+//!      excused, full stop — no amount of "obviously a pure library vector"
+//!      overrides this.
+//!   2. **Structural** — every fixture in the family is either a pure golden
+//!      vector over a library the server delegates to (no top-level
+//!      `request`, no `scenarios`, no `input.endpoint`), or declares
+//!      `applies_to_profiles` disjoint from `acdp-registry-core`.
+//!
+//! `no_excused_family_is_required_by_our_profile` mechanically enforces rule
+//! 1 by reading the spec's own `required_fixtures` AND `conditional_fixtures`
+//! and rejecting any excuse that contradicts either — this is what gives
+//! `EXCUSED` real teeth (unlike `acdp-rs`'s equivalent list, which is
+//! unenforced prose).
+//!
+//! When the ratchet trips, a contributor has exactly two options: add
+//! dedicated test coverage for the new family, or add a spec-grounded excuse
+//! to `EXCUSED` — and the latter is mechanically rejected if the spec
+//! requires the family of `acdp-registry-core`.
 
 #![cfg(feature = "storage-sqlite")]
 
@@ -1122,4 +1162,439 @@ fn fixture_family_panics_naming_file_when_id_missing() {
     let fx = json!({"description": "no id here"});
     let path = Path::new("/tmp/no-id-fixture.json");
     fixture_family(&fx, path, None);
+}
+
+// ─── Phase 4: family-coverage ratchet (`KNOWN_FAMILIES` / `EXCUSED`) ───
+
+/// All 28 fixture families the pinned spec (`registries/profiles.json`'s
+/// `fixture_families` object) declares, as of SHA `bff3cf3a`. Every one has
+/// fixtures on disk and is classified (replayed or skipped-with-reason) by
+/// this harness. Listing all 28 — not just the ones we replay — is the
+/// honest statement "we have looked at every family"; a 29th family (the
+/// spec adding a new fixture prefix) is what turns
+/// `all_conformance_fixtures_are_bucketed_into_known_families` red.
+const KNOWN_FAMILIES: &[&str] = &[
+    "body",
+    "can",
+    "caps",
+    "cur",
+    "data-ref",
+    "data-ref-ssrf",
+    "did-ssrf",
+    "dk",
+    "err",
+    "fed",
+    "fp",
+    "idem",
+    "lc",
+    "lhr",
+    "lin",
+    "log",
+    "meta",
+    "pub",
+    "rate",
+    "rcpt",
+    "ret",
+    "rev",
+    "rot",
+    "schema",
+    "sig",
+    "status",
+    "vis",
+    "wit",
+];
+
+/// Families excused from needing HTTP-replay coverage, each with a prose
+/// reason. An excuse is legitimate only when BOTH hold: (1) spec-grounded —
+/// no fixture in the family appears in `acdp-registry-core`'s
+/// `required_fixtures` or anywhere in its `conditional_fixtures`,
+/// mechanically checked by `no_excused_family_is_required_by_our_profile`;
+/// and (2) structural —
+/// every fixture in the family is a pure golden vector over a library the
+/// server delegates to, or declares `applies_to_profiles` disjoint from
+/// `acdp-registry-core`. See the module doc-comment's "Coverage ratchet"
+/// section for the full rule.
+const EXCUSED: &[(&str, &str)] = &[
+    (
+        "fp",
+        "Key-fingerprint encoding vectors (RFC-ACDP-0010 \u{a7}6): a pure acdp-crypto \
+         surface. 0/1 fixtures carry an HTTP request shape and none is in \
+         acdp-registry-core's required_fixtures or conditional_fixtures.",
+    ),
+    (
+        "data-ref-ssrf",
+        "applies_to_profiles = [acdp-consumer] on all 5 fixtures: DataRef location \
+         fetching is a consumer fetch-time duty (RFC-ACDP-0008 \u{a7}4.9). This registry \
+         never dereferences data_refs[].location, and none of the 5 is in \
+         acdp-registry-core's required_fixtures or conditional_fixtures.",
+    ),
+    (
+        "fed",
+        "applies_to_profiles = [acdp-registry-federated, acdp-consumer] on all 10 \
+         fixtures. This repo does not implement or advertise the \
+         acdp-registry-federated profile itself -- no crate under crates/ implements \
+         federated resolution (the profile name appears only in fixture data and in \
+         this excuse) -- and none of the 10 is in acdp-registry-core's \
+         required_fixtures or conditional_fixtures.",
+    ),
+    (
+        "rot",
+        "applies_to_profiles = [acdp-registry-receipts, acdp-consumer], and none of \
+         its 1 fixture is in acdp-registry-core's required_fixtures or \
+         conditional_fixtures -- same structural shape as lc (a profile this harness \
+         doesn't advertise), but excused on a substantive ground lc is not: RFC-ACDP-0010 \
+         \u{a7}10 assigns historical producer-key verification to the consumer holding \
+         the receipt, not to the issuing registry, so no harness configuration change \
+         would make this registry responsible for it.",
+    ),
+];
+
+/// Returns the `acdp-registry-core` profile object from `registries/
+/// profiles.json`'s `profiles[]` array, panicking (naming the checked path)
+/// if the file is unreadable/malformed, `profiles` isn't an array, or no
+/// entry's `id` is `"acdp-registry-core"`. The excuse rule loses its
+/// grounding without this profile, so absence is a hard failure, not a skip.
+fn core_profile(root: &Path) -> Value {
+    let profiles_path = root.join("registries/profiles.json");
+    let doc = read_json(&profiles_path);
+    let profiles = doc
+        .get("profiles")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("{} missing 'profiles' array", profiles_path.display()));
+    profiles
+        .iter()
+        .find(|p| p.get("id").and_then(Value::as_str) == Some("acdp-registry-core"))
+        .unwrap_or_else(|| {
+            panic!(
+                "{} has no profile entry with id == \"acdp-registry-core\"",
+                profiles_path.display()
+            )
+        })
+        .clone()
+}
+
+/// Reads `acdp-registry-core`'s `required_fixtures` array, panicking (naming
+/// the path) if it is absent or not an array — the excuse rule cannot be
+/// silently vacuous.
+fn core_required_fixtures(root: &Path) -> Vec<String> {
+    let profiles_path = root.join("registries/profiles.json");
+    let profile = core_profile(root);
+    profile
+        .get("required_fixtures")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| {
+            panic!(
+                "{} acdp-registry-core profile missing 'required_fixtures' array",
+                profiles_path.display()
+            )
+        })
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} required_fixtures contains a non-string entry: {v}",
+                        profiles_path.display()
+                    )
+                })
+                .to_string()
+        })
+        .collect()
+}
+
+/// Reads `acdp-registry-core`'s `conditional_fixtures` array and flattens
+/// every entry's `fixtures` array into one list, panicking (naming the path)
+/// if the top-level key is absent or malformed. Shape, confirmed by reading
+/// the pinned spec's `registries/profiles.json` directly (not guessed): an
+/// array of objects, each carrying a `fixtures` array of fixture ids plus
+/// descriptive `required_when` / `capability_key` / `capability_match`
+/// fields this helper doesn't need, e.g.:
+///
+/// ```json
+/// {
+///   "fixtures": ["dk-001-wrong-multicodec-prefix", "dk-002-malformed-multibase", ...],
+///   "required_when": "supported_did_methods includes \"did:key\" (0.2.0)",
+///   "capability_key": "supported_did_methods",
+///   "capability_match": "did:key"
+/// }
+/// ```
+///
+/// This deliberately does NOT filter by whether the harness's own
+/// capabilities document currently satisfies each entry's condition — the
+/// point of the caller (`no_excused_family_is_required_by_our_profile`) is
+/// to reject an excuse that would contradict the spec under *any*
+/// capability posture the profile allows, not just the one this harness
+/// happens to advertise today (`EXCUSED` growing to cover, say, `idem`
+/// should fail loudly regardless of whether `supports_idempotency_key` is
+/// currently `true` in `caps()`).
+///
+/// Unlike `required_fixtures`, `conditional_fixtures` is not conceptually
+/// mandatory on every profile — a profile with no capability-gated fixtures
+/// could legitimately omit it. But the pinned spec's `acdp-registry-core`
+/// entry does carry one (verified above), so on this specific profile its
+/// absence would mean a spec regression or a parsing bug, not a legitimate
+/// empty case. Treating that silently as `Vec::new()` would let the caller's
+/// non-empty assertion (mirroring `required_fixtures`'s) go vacuously easy,
+/// so this panics instead, exactly like `core_required_fixtures`.
+fn core_conditional_fixtures(root: &Path) -> Vec<String> {
+    let profiles_path = root.join("registries/profiles.json");
+    let profile = core_profile(root);
+    let entries = profile
+        .get("conditional_fixtures")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| {
+            panic!(
+                "{} acdp-registry-core profile missing 'conditional_fixtures' array \
+                 (expected present per the pinned spec; if the spec legitimately \
+                 dropped it, update this helper's expectations deliberately rather \
+                 than silently returning an empty list)",
+                profiles_path.display()
+            )
+        });
+    entries
+        .iter()
+        .flat_map(|entry| {
+            entry
+                .get("fixtures")
+                .and_then(Value::as_array)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} conditional_fixtures entry missing 'fixtures' array: {entry}",
+                        profiles_path.display()
+                    )
+                })
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "{} conditional_fixtures entry's 'fixtures' array contains a \
+                                 non-string entry: {v}",
+                                profiles_path.display()
+                            )
+                        })
+                        .to_string()
+                })
+                .collect::<Vec<String>>()
+        })
+        .collect()
+}
+
+/// Shared skip gate for all four ratchet tests below: resolves the fixtures
+/// directory and the spec's own declared families, then buckets every
+/// on-disk fixture's `id` into its family via `fixture_family` (the same
+/// helper `replays_spec_fixtures_when_present` uses). Returns `None` — the
+/// signal to skip, not panic — when `ACDP_SPEC_DIR` is unset/nonexistent, no
+/// fixture directory is resolvable under it, or `registries/profiles.json`
+/// isn't reachable (the bare-fixtures-dir layout `resolve_fixture_dir`
+/// supports). This is a deliberate divergence from `acdp-rs`'s equivalent
+/// test, which unconditionally `expect()`s both to exist because `acdp-rs`
+/// has no bare-dir layout to support; this repo does, so all four tests here
+/// degrade to a clean skip in that case rather than a panic.
+fn bucketed_fixtures() -> Option<(PathBuf, Vec<(String, String)>)> {
+    let fixtures = spec_fixtures()?;
+    let root = spec_root().expect("spec_fixtures() resolved implies spec_root() resolves");
+    let spec_fams = spec_families(&root)?;
+    let spec_fam_refs: Vec<&str> = spec_fams.iter().map(String::as_str).collect();
+
+    let entries = std::fs::read_dir(&fixtures).unwrap_or_else(|e| panic!("read {fixtures:?}: {e}"));
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().map(|x| x == "json").unwrap_or(false))
+        .collect();
+    paths.sort();
+
+    let out = paths
+        .into_iter()
+        .map(|path| {
+            let fx = read_json(&path);
+            let id = fx
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("fixture {} missing string 'id'", path.display()))
+                .to_string();
+            let family = fixture_family(&fx, &path, Some(&spec_fam_refs));
+            (id, family)
+        })
+        .collect();
+    Some((fixtures, out))
+}
+
+/// Every fixture on disk must bucket into a family `KNOWN_FAMILIES`
+/// declares. Skips (does not panic) when the spec, its fixtures directory, or
+/// `registries/profiles.json` isn't reachable.
+#[tokio::test(flavor = "multi_thread")]
+async fn all_conformance_fixtures_are_bucketed_into_known_families() {
+    let Some((fixtures, ids_and_families)) = bucketed_fixtures() else {
+        eprintln!(
+            "conformance: spec unavailable (ACDP_SPEC_DIR unset, no fixture dir, or no \
+             registries/profiles.json); skipping \
+             all_conformance_fixtures_are_bucketed_into_known_families"
+        );
+        return;
+    };
+    assert!(
+        !ids_and_families.is_empty(),
+        "expected at least one fixture under {}",
+        fixtures.display()
+    );
+    for (id, fam) in &ids_and_families {
+        assert!(
+            KNOWN_FAMILIES.contains(&fam.as_str()),
+            "fixture id \"{id}\" bucketed into family \"{fam}\", which is not in \
+             KNOWN_FAMILIES"
+        );
+    }
+}
+
+/// `KNOWN_FAMILIES` must equal exactly the spec's own `fixture_families` keys
+/// (`registries/profiles.json`) at the pinned SHA — not merely a subset. That
+/// exact-equality is the honest claim "we have classified every family the
+/// spec declares, and only those." Skips when the spec isn't reachable.
+#[tokio::test(flavor = "multi_thread")]
+async fn known_families_are_declared_by_the_spec() {
+    let Some(root) = spec_root() else {
+        eprintln!(
+            "conformance: ACDP_SPEC_DIR unset or nonexistent; skipping \
+             known_families_are_declared_by_the_spec"
+        );
+        return;
+    };
+    let Some(spec_fams) = spec_families(&root) else {
+        eprintln!(
+            "conformance: no registries/profiles.json under {}; skipping \
+             known_families_are_declared_by_the_spec",
+            root.display()
+        );
+        return;
+    };
+
+    let mut spec_sorted = spec_fams.clone();
+    spec_sorted.sort();
+    let mut known_sorted: Vec<String> = KNOWN_FAMILIES.iter().map(|s| s.to_string()).collect();
+    known_sorted.sort();
+
+    assert_eq!(
+        known_sorted, spec_sorted,
+        "KNOWN_FAMILIES must equal exactly the spec's fixture_families keys"
+    );
+}
+
+/// Every `(family, reason)` in `EXCUSED` must be well-formed: `family` is in
+/// `KNOWN_FAMILIES`, at least one fixture on disk buckets into it, and
+/// `reason` is non-empty. Catches a stale excuse (family renamed/removed) or
+/// a placeholder reason. Skips when the spec isn't reachable.
+#[tokio::test(flavor = "multi_thread")]
+async fn excused_families_are_known_and_present() {
+    let Some((fixtures, ids_and_families)) = bucketed_fixtures() else {
+        eprintln!(
+            "conformance: spec unavailable (ACDP_SPEC_DIR unset, no fixture dir, or no \
+             registries/profiles.json); skipping excused_families_are_known_and_present"
+        );
+        return;
+    };
+
+    for (family, reason) in EXCUSED {
+        assert!(
+            KNOWN_FAMILIES.contains(family),
+            "EXCUSED family \"{family}\" is not in KNOWN_FAMILIES"
+        );
+        assert!(
+            !reason.trim().is_empty(),
+            "EXCUSED family \"{family}\" has an empty reason"
+        );
+        let present = ids_and_families.iter().any(|(_, fam)| fam == family);
+        assert!(
+            present,
+            "EXCUSED family \"{family}\" has zero fixtures on disk under {}",
+            fixtures.display()
+        );
+    }
+}
+
+/// Every fixture id named in one of `ids` must bucket (via `bucket_family`)
+/// into a family, and that family must not be in `excused_families`. Shared
+/// by `no_excused_family_is_required_by_our_profile`'s two signals —
+/// `required_fixtures` and `conditional_fixtures` — so a failure's message
+/// names which spec key (`source`) caught it.
+fn assert_no_id_buckets_into_excused_family(
+    ids: &[String],
+    spec_fam_refs: &[&str],
+    excused_families: &[&str],
+    source: &str,
+) {
+    for id in ids {
+        let fam = bucket_family(id, spec_fam_refs).unwrap_or_else(|| {
+            panic!(
+                "acdp-registry-core.{source} entry \"{id}\" does not bucket \
+                 into any spec-declared family"
+            )
+        });
+        assert!(
+            !excused_families.contains(&fam),
+            "acdp-registry-core.{source} contains \"{id}\", which buckets into \
+             excused family \"{fam}\" -- the spec requires this family of the profile \
+             this repo advertises (via {source}), so it cannot be in EXCUSED"
+        );
+    }
+}
+
+/// The assertion that gives `EXCUSED` real teeth: no fixture in
+/// `acdp-registry-core`'s `required_fixtures` OR anywhere in its
+/// `conditional_fixtures` may bucket into an excused family. If the spec
+/// requires the family of the profile this repo advertises — unconditionally
+/// via `required_fixtures`, or conditionally (gated on an advertised
+/// capability, e.g. `dk-*` behind `did:key`, `idem-*` behind
+/// `supports_idempotency_key`) via `conditional_fixtures` — it cannot be
+/// excused. This test mechanically rejects such an excuse rather than
+/// relying on a human re-reading the spec by hand every time `EXCUSED`
+/// grows; a failure names both the offending fixture id and which of the two
+/// spec keys (`required_fixtures` vs `conditional_fixtures`) caught it.
+/// Skips when the spec isn't reachable.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_excused_family_is_required_by_our_profile() {
+    let Some(root) = spec_root() else {
+        eprintln!(
+            "conformance: ACDP_SPEC_DIR unset or nonexistent; skipping \
+             no_excused_family_is_required_by_our_profile"
+        );
+        return;
+    };
+    let Some(spec_fams) = spec_families(&root) else {
+        eprintln!(
+            "conformance: no registries/profiles.json under {}; skipping \
+             no_excused_family_is_required_by_our_profile",
+            root.display()
+        );
+        return;
+    };
+    let spec_fam_refs: Vec<&str> = spec_fams.iter().map(String::as_str).collect();
+    let excused_families: Vec<&str> = EXCUSED.iter().map(|(fam, _)| *fam).collect();
+
+    let required = core_required_fixtures(&root);
+    assert!(
+        !required.is_empty(),
+        "acdp-registry-core.required_fixtures resolved empty; the excuse rule \
+         would be vacuously true, which is not the intent"
+    );
+    assert_no_id_buckets_into_excused_family(
+        &required,
+        &spec_fam_refs,
+        &excused_families,
+        "required_fixtures",
+    );
+
+    let conditional = core_conditional_fixtures(&root);
+    assert!(
+        !conditional.is_empty(),
+        "acdp-registry-core.conditional_fixtures resolved empty; the excuse rule \
+         would be vacuously true for this signal, which is not the intent"
+    );
+    assert_no_id_buckets_into_excused_family(
+        &conditional,
+        &spec_fam_refs,
+        &excused_families,
+        "conditional_fixtures",
+    );
 }
