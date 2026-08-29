@@ -71,6 +71,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Pinned conformance spec SHA** (`REG-2`) adopted in
+  `.github/workflows/ci.yml`: now `31cf8743b62debe2c7c8572ce3a3a0b7ca5ad099`.
+  Annotation-only at this pin: RFC-ACDP-0015 promoted Draft → **Final**
+  (0.4.0), the `invalid_witness_cosignature` error code promoted
+  Proposed → **Stable**, and the `acdp-log-witness` profile promoted
+  Draft → **Final**. No fixture family, fixture shape, `id`, `request`,
+  or `expected` field changed; the conformance harness runs unchanged
+  against the new pin (`16 passed; 0 failed`, 4 exchanges replayed).
 - **BREAKING** (`SEC-07`): `auth.anonymous_public_reads` now defaults
   to `false`, matching `CLAUDE.md`. Operators upgrading who rely on
   world-readable public contexts MUST set the field explicitly:
