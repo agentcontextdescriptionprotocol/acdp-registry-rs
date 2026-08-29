@@ -71,7 +71,7 @@ pub fn install_recorder(duration_buckets: &[f64]) -> PrometheusHandle {
 
 /// Request-level middleware (FEAT-10). Records one `REQUEST_TOTAL` count and
 /// one `REQUEST_DURATION` observation per request, labelled by the **matched
-/// route pattern** (`/contexts/:ctx_id`, never the resolved `ctx_id`, so
+/// route pattern** (`/contexts/{ctx_id}`, never the resolved `ctx_id`, so
 /// label cardinality stays bounded), method, and status class.
 ///
 /// Adding a new route needs no change here — the labels come from whatever

@@ -175,7 +175,7 @@ async fn body_to_json(resp: axum::response::Response) -> Value {
 }
 
 /// `acdp://authority/uuid` ctx_ids contain `/` and `:`, which axum's
-/// `:ctx_id` single-segment route param won't match without percent
+/// `{ctx_id}` single-segment route param won't match without percent
 /// encoding. Mirror RFC 3986 §2.3.
 fn pct_encode_path_segment(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 3);

@@ -22,7 +22,7 @@ use std::time::Duration;
 use acdp_registry_store::ExtendedRegistryStore;
 use acdp_registry_types::RegistryError;
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::{HeaderName, HeaderValue, Method};
+use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::{from_fn, from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -63,19 +63,22 @@ pub fn build_router<S: ExtendedRegistryStore + 'static>(state: AppState<S>) -> R
         // Contexts
         .route("/contexts", post(handlers::publish::<S>))
         .route("/contexts/search", get(handlers::search::<S>))
-        .route("/contexts/:ctx_id", get(handlers::retrieve::<S>))
-        .route("/contexts/:ctx_id/body", get(handlers::retrieve_body::<S>))
+        .route("/contexts/{ctx_id}", get(handlers::retrieve::<S>))
+        .route("/contexts/{ctx_id}/body", get(handlers::retrieve_body::<S>))
         // Lifecycle events & retraction (RFC-ACDP-0013 §6). Always
         // mounted: a registry not advertising `acdp-registry-lifecycle`
         // answers 501 not_implemented from the handler, per §6.
-        .route("/contexts/:ctx_id/retract", post(handlers::retract::<S>))
+        .route("/contexts/{ctx_id}/retract", post(handlers::retract::<S>))
         .route(
-            "/contexts/:ctx_id/republish",
+            "/contexts/{ctx_id}/republish",
             post(handlers::republish::<S>),
         )
         // Lineages
-        .route("/lineages/:lineage_id", get(handlers::lineage::<S>))
-        .route("/lineages/:lineage_id/current", get(handlers::current::<S>))
+        .route("/lineages/{lineage_id}", get(handlers::lineage::<S>))
+        .route(
+            "/lineages/{lineage_id}/current",
+            get(handlers::current::<S>),
+        )
         // Transparency log (RFC-ACDP-0012 §8). Always mounted: a
         // registry not advertising `acdp-registry-transparency-log`
         // answers 501 not_implemented from the handler (the lifecycle
@@ -123,7 +126,7 @@ pub fn build_router<S: ExtendedRegistryStore + 'static>(state: AppState<S>) -> R
         // publish path anchors on the immediate predecessor; this is where
         // the complete chain is still re-checked.
         .route(
-            "/admin/lineages/:lineage_id/audit",
+            "/admin/lineages/{lineage_id}/audit",
             get(handlers::lineage_audit::<S>),
         )
         // Registry-attested lifecycle (RFC-ACDP-0013 §6 registry-initiated
@@ -133,11 +136,11 @@ pub fn build_router<S: ExtendedRegistryStore + 'static>(state: AppState<S>) -> R
         // every other `/admin/*` route; requires `[lifecycle] enabled`
         // (501 otherwise). Ships in every build.
         .route(
-            "/admin/contexts/:ctx_id/retract",
+            "/admin/contexts/{ctx_id}/retract",
             post(handlers::admin_retract::<S>),
         )
         .route(
-            "/admin/contexts/:ctx_id/republish",
+            "/admin/contexts/{ctx_id}/republish",
             post(handlers::admin_republish::<S>),
         );
 
@@ -166,7 +169,10 @@ pub fn build_router<S: ExtendedRegistryStore + 'static>(state: AppState<S>) -> R
     }
 
     app.layer(TraceLayer::new_for_http())
-        .layer(TimeoutLayer::new(Duration::from_secs(30)))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(30),
+        ))
         // SEC-06: cap every request body uniformly. The publish handler
         // used to perform this check inline; the layer applies it to
         // `/auth/challenge` and `/auth/token` as well so an unauthenticated

@@ -158,6 +158,27 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `ACDP_LOG_FORMAT=pretty`.
 - **Docker Compose**: secrets sourced from `${VAR:-default}` env
   substitution; `auth.jwt_secret = "changeme"` aborts startup.
+- **`axum` bumped 0.7 → 0.8, `tower` 0.4 → 0.5, `tower-http` 0.5 → 0.6**
+  (`REG-6`): completes the HTTP-stack line-up the prior `axum-server`
+  bump left half-done, collapsing the duplicate `tower` (0.4.13/0.5.3)
+  and `tower-http` (0.5.2/0.6.11) trees the lockfile carried from the
+  mismatched pairing — `Cargo.lock` now resolves a single `tower` 0.5.x
+  and `tower-http` 0.6.x. All nine route path params in
+  `acdp-registry-core::build_router` move from axum 0.7's `:ctx_id` /
+  `:lineage_id` syntax to 0.8's `{ctx_id}` / `{lineage_id}` syntax (no
+  behavior change — `matchit`'s static-over-dynamic route priority,
+  e.g. `/contexts/search` over `/contexts/{ctx_id}`, is preserved).
+  `TimeoutLayer::new` is deprecated in tower-http 0.6; the 30s response
+  timeout now uses
+  `TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, Duration::from_secs(30))`,
+  same behavior. **Operator-visible change:** the Prometheus `route=`
+  label on every parameterized endpoint (e.g. `GET /contexts/{ctx_id}`)
+  changes from the old `/contexts/:ctx_id` form to the new
+  `/contexts/{ctx_id}` form, since the label is sourced from axum's
+  `MatchedPath`. Dashboards or alerts keyed on the old label form will
+  go silently blank until updated to match. A new assertion in
+  `tests/metrics_integration.rs` pins the new label form on a
+  parameterized request so this doesn't regress unnoticed again.
 
 ### Security
 

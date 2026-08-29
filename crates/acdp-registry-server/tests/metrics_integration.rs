@@ -264,6 +264,25 @@ async fn metrics_endpoint_exposes_request_and_domain_series() {
         StatusCode::TOO_MANY_REQUESTS
     );
 
+    // A request against a parameterized route, so the scrape below can pin
+    // the axum 0.8 MatchedPath label form. The ctx_id need not resolve to a
+    // real (or even well-formed) context — MatchedPath is set from the
+    // matched route pattern before the handler runs, so this 400s on
+    // `CtxId::parse` and the route label is still recorded.
+    let param_resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/contexts/does-not-exist")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(param_resp.status(), StatusCode::BAD_REQUEST);
+
     // Scrape.
     let (status, ct, text) = scrape(&h.router).await;
     assert_eq!(status, StatusCode::OK);
@@ -288,6 +307,25 @@ async fn metrics_endpoint_exposes_request_and_domain_series() {
             &["acdp_registry_request_total", "route=\"/contexts\""]
         ) >= 3.0,
         "expected >=3 /contexts requests counted"
+    );
+
+    // axum 0.8 changed the MatchedPath syntax from `/contexts/:ctx_id` to
+    // `/contexts/{ctx_id}` — this is a real behavioral change to the
+    // Prometheus `route=` label on every parameterized route (dashboards and
+    // alerts keyed on the old `:ctx_id` form go silently blank). Pin the new
+    // form explicitly so a future axum/tower-http bump can't silently
+    // regress it back, or drift it further, without a test noticing.
+    assert_eq!(
+        metric_sum(
+            &text,
+            &[
+                "acdp_registry_request_total",
+                "route=\"/contexts/{ctx_id}\""
+            ]
+        ),
+        1.0,
+        "expected the parameterized route labeled with the new {{ctx_id}} \
+         form, not the old axum 0.7 `:ctx_id` form:\n{text}"
     );
 
     // Domain counters.
