@@ -1,5 +1,9 @@
 [graph]
-all-features = false
+# The Docker image builds `--no-default-features --features "${STORAGE_FEATURE}"`
+# with STORAGE_FEATURE defaulting to storage-pg (docker/Dockerfile:16-27), so a
+# default-features-only graph would let the entire Postgres subgraph escape the
+# advisory/license gate. (REG-7)
+all-features = true
 no-default-features = false
 
 [advisories]

@@ -117,6 +117,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   no longer silently produce valid HMACs (`SEC-04`), and the
   `RequestBodyLimitLayer` (`SEC-06`) protects every route from
   arbitrarily-large request bodies.
+- **`h2` bumped 0.4.15 → 0.4.19** (lockfile-only version bump, not a
+  `deny.toml` ignore): resolves `RUSTSEC-2026-0258`, in which `h2`
+  queued empty `DATA` frames without limit, risking unbounded memory
+  growth or a length-overflow panic. Reached transitively via
+  `hyper` ← `axum` / `axum-server` / `hyper-rustls` / `reqwest`.
+- **`[graph] all-features = true`** (`REG-7`) in `deny.toml`: the
+  cargo-deny advisory/license/bans gate now resolves every
+  feature-gated subgraph, including the `storage-pg` path the Docker
+  image ships (`STORAGE_FEATURE=storage-pg` by default in
+  `docker/Dockerfile`), instead of only the default-features graph.
+  `cargo deny --workspace check` remains green with no new findings.
 
 ### Documentation
 
