@@ -44,7 +44,26 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
 # Dependency audit (runs unconditionally in CI, not optional).
 cargo deny check
+
+# Spec conformance — replays HTTP-shaped fixtures from the ACDP spec
+# against a live server built from this crate. ACDP_SPEC_DIR must point
+# at a checkout of the *whole* spec repo (agentcontextdistributionprotocol/
+# agentcontextdistributionprotocol), not just its schemas/conformance
+# subdirectory — the harness also reads registries/profiles.json from
+# the spec root for the KNOWN_FAMILIES/EXCUSED coverage ratchet; pointed
+# at schemas/conformance alone, that ratchet silently skips instead of
+# running (same replay count and exit code either way — check the log
+# for "skipping" lines, not just the exit code). ACDP_REQUIRE_CONFORMANCE=1
+# turns a missing spec into a hard failure instead of a silent skip.
+ACDP_REQUIRE_CONFORMANCE=1 ACDP_SPEC_DIR=/path/to/spec/checkout \
+    cargo test -p acdp-registry-server --features storage-sqlite,playground \
+    --test conformance --test conformance_gate -- --nocapture
 ```
+
+CI's `conformance` job checks out the spec at a SHA pinned in
+`.github/workflows/ci.yml` (the `conformance` job's `ref:`), so a push to the
+spec repo cannot silently change this repo's CI result. When adopting new
+fixtures, bump that SHA deliberately in its own commit.
 
 CI also measures coverage with `cargo llvm-cov` (summary on the run page, lcov
 artifact attached) and smoke-tests the Docker image on every PR — it builds the
