@@ -122,6 +122,40 @@ jobs:
             --no-default-features --features storage-pg \
             --test pg_integration
 
+  # Runs the spec conformance suite against a SHA-pinned spec checkout.
+  # ACDP_REQUIRE_CONFORMANCE turns a missing spec into a hard failure, so
+  # a green run genuinely proves the fixtures executed rather than that
+  # the suite silently skipped them (REG-1). It does not, on its own,
+  # catch ACDP_SPEC_DIR pointing at the wrong subdirectory of a real
+  # checkout -- see the KNOWN_FAMILIES/EXCUSED ratchet tests in
+  # tests/conformance.rs, which is why ACDP_SPEC_DIR below is the spec
+  # *root* (where registries/profiles.json lives), not schemas/conformance.
+  conformance:
+    name: conformance (spec fixtures)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out the ACDP spec
+        uses: actions/checkout@v4
+        with:
+          repository: agentcontextdistributionprotocol/agentcontextdistributionprotocol
+          # Pinned so a spec-repo push cannot change this repo's CI result
+          # without a commit here. Bump deliberately when adopting new
+          # fixtures.
+          ref: bff3cf3afbdcea619834916e8f0bcac7e82ba658
+          path: acdp-spec
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Conformance (spec fixtures required)
+        env:
+          ACDP_SPEC_DIR: ${{ github.workspace }}/acdp-spec
+          ACDP_REQUIRE_CONFORMANCE: "1"
+        run: |
+          cargo test -p acdp-registry-server \
+            --features storage-sqlite,playground \
+            --test conformance --test conformance_gate -- --nocapture
+
   coverage:
     name: coverage
     runs-on: ubuntu-latest
