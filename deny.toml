@@ -9,13 +9,7 @@ no-default-features = false
 [advisories]
 version = 2
 yanked = "warn"
-ignore = [
-    # rustls-pemfile 2.x is unmaintained but the upstream guidance is to
-    # migrate to `rustls-pki-types`'s PemObject trait. We pull it in
-    # transitively through axum-server 0.7; the dependency disappears
-    # once axum-server cuts a release that drops rustls-pemfile.
-    "RUSTSEC-2025-0134",
-]
+ignore = []
 
 [licenses]
 version = 2

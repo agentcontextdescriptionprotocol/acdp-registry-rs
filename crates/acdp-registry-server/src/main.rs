@@ -763,7 +763,7 @@ async fn serve_with_store<S: ExtendedRegistryStore + 'static>(
     tracing::info!(addr = %addr, "listening");
     // OPS-03: graceful shutdown on SIGTERM / Ctrl-C. In-flight requests
     // get up to 30s to complete before the handle drops the listener.
-    let handle = axum_server::Handle::new();
+    let handle = axum_server::Handle::<SocketAddr>::new();
     spawn_shutdown_watcher(handle.clone());
     if cfg.registry.tls.enabled {
         let cert = cfg
@@ -792,7 +792,7 @@ async fn serve_with_store<S: ExtendedRegistryStore + 'static>(
     Ok(())
 }
 
-fn spawn_shutdown_watcher(handle: axum_server::Handle) {
+fn spawn_shutdown_watcher(handle: axum_server::Handle<SocketAddr>) {
     tokio::spawn(async move {
         #[cfg(unix)]
         let term = async {
