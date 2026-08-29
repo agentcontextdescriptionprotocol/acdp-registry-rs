@@ -3,9 +3,33 @@
 //! When `ACDP_SPEC_DIR` is set to a checkout of the spec repo, this test
 //! discovers the fixture directory (`schemas/conformance`, `fixtures`, or the
 //! dir itself), replays every fixture that is a *deterministic, self-contained
-//! HTTP exchange*, and asserts status + error code. When `ACDP_SPEC_DIR` is
-//! unset (the common CI case) the test logs a skip and returns success —
-//! running the spec suite is opt-in so the repo is independently testable.
+//! HTTP exchange*, and asserts status + error code.
+//!
+//! There are two modes, gated by `ACDP_REQUIRE_CONFORMANCE` (any value —
+//! including the empty string — counts as set/enabled; unset is the only way
+//! to get default mode):
+//!
+//!   * **Default mode** (`ACDP_REQUIRE_CONFORMANCE` unset) — every
+//!     spec-dependent path degrades to a logged skip when `ACDP_SPEC_DIR` is
+//!     unset, points at a nonexistent directory, or resolves to a directory
+//!     with no fixture layout the harness recognizes. Running the spec suite
+//!     is opt-in so the repo is independently testable without a spec
+//!     checkout on disk.
+//!   * **Require mode** (`ACDP_REQUIRE_CONFORMANCE` set) — every one of those
+//!     same paths panics instead of skipping: `ACDP_SPEC_DIR` unset, set to a
+//!     nonexistent path, set to a path with no resolvable fixture directory,
+//!     or (in `did_key_golden_vector_accepted_and_gated`) pointing at
+//!     fixtures that don't contain `sig-003-did-key-golden.json`. This is
+//!     what the dedicated conformance CI job (a later phase) runs, so a
+//!     missing or misconfigured spec checkout is a red run, not a silent
+//!     green one. There is deliberately **no** sibling-directory fallback —
+//!     `ACDP_SPEC_DIR` is the single explicit contract; letting an unset
+//!     variable silently resolve to some other spec tree on disk would
+//!     defeat the entire point of require-mode and violate this repo's
+//!     pinned-spec-worktree rule. See `crates/acdp-registry-server/tests/conformance_gate.rs`
+//!     for the companion guard against running require-mode with the
+//!     `storage-sqlite` feature off, which would compile this whole file
+//!     away and vacuously pass.
 //!
 //! The spec corpus is heterogeneous: only some families map to a single HTTP
 //! request/response the registry can replay through its public API. The rest
@@ -395,6 +419,58 @@ fn extract_shapes(fx: &Value) -> Extracted {
     Extracted::Skip("non-HTTP fixture (vectors / schema / informative)")
 }
 
+/// True when `ACDP_REQUIRE_CONFORMANCE` is set to any value, including the
+/// empty string — matches `acdp-rs`'s "any value = enabled" contract
+/// byte-for-byte. Do not "improve" this to a truthiness check.
+fn require_conformance() -> bool {
+    std::env::var("ACDP_REQUIRE_CONFORMANCE").is_ok()
+}
+
+/// Spec checkout root from `ACDP_SPEC_DIR`, or `None` (skip) when unset.
+///
+/// Under `ACDP_REQUIRE_CONFORMANCE`, every `None`-return path below panics
+/// instead. Deliberately **no** sibling-directory fallback: unlike
+/// `acdp-rs`, `ACDP_SPEC_DIR` is the single explicit contract here — unset
+/// (or pointing nowhere) means skip in default mode / panic in require
+/// mode, full stop. Falling back to some other spec tree on disk would let
+/// require-mode go green off an unpinned checkout, defeating its purpose.
+fn spec_root() -> Option<PathBuf> {
+    let require = require_conformance();
+    let Ok(dir) = std::env::var("ACDP_SPEC_DIR") else {
+        assert!(
+            !require,
+            "ACDP_REQUIRE_CONFORMANCE is set but ACDP_SPEC_DIR is not"
+        );
+        return None;
+    };
+    let p = PathBuf::from(dir);
+    if p.exists() {
+        return Some(p);
+    }
+    assert!(
+        !require,
+        "ACDP_REQUIRE_CONFORMANCE is set but ACDP_SPEC_DIR '{}' does not exist",
+        p.display()
+    );
+    None
+}
+
+/// `spec_root()` + `resolve_fixture_dir()`. Panics under require-mode when
+/// the root exists but carries no fixture directory the harness recognizes.
+fn spec_fixtures() -> Option<PathBuf> {
+    let root = spec_root()?;
+    let fixtures = resolve_fixture_dir(&root.to_string_lossy());
+    if fixtures.is_none() {
+        assert!(
+            !require_conformance(),
+            "ACDP_REQUIRE_CONFORMANCE is set but no fixture directory found under \
+             ACDP_SPEC_DIR '{}'",
+            root.display()
+        );
+    }
+    fixtures
+}
+
 /// Resolve the fixture directory from `ACDP_SPEC_DIR`. The variable may point
 /// at the spec root or directly at the fixtures, so try the known layouts.
 fn resolve_fixture_dir(dir: &str) -> Option<PathBuf> {
@@ -448,12 +524,11 @@ fn family_of(name: &str) -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn replays_spec_fixtures_when_present() {
-    let Ok(dir) = std::env::var("ACDP_SPEC_DIR") else {
-        eprintln!("conformance: ACDP_SPEC_DIR unset; skipping");
-        return;
-    };
-    let Some(fixtures) = resolve_fixture_dir(&dir) else {
-        eprintln!("conformance: no fixtures found under ACDP_SPEC_DIR={dir}; skipping");
+    let Some(fixtures) = spec_fixtures() else {
+        eprintln!(
+            "conformance: ACDP_SPEC_DIR unset or no fixtures resolvable; skipping \
+             (set ACDP_REQUIRE_CONFORMANCE to make this a hard failure)"
+        );
         return;
     };
     eprintln!("conformance: fixtures dir = {}", fixtures.display());
@@ -703,18 +778,22 @@ async fn did_key_harness(caps: CapabilitiesDocument) -> axum::Router {
 ///   * did:web-only (dk-003) → rejected `key_resolution_failed` / 400.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn did_key_golden_vector_accepted_and_gated() {
-    let Ok(dir) = std::env::var("ACDP_SPEC_DIR") else {
-        eprintln!("conformance: ACDP_SPEC_DIR unset; skipping sig-003/dk-003");
-        return;
-    };
-    let Some(fixtures) = resolve_fixture_dir(&dir) else {
-        eprintln!("conformance: no fixtures under ACDP_SPEC_DIR={dir}; skipping");
+    let Some(fixtures) = spec_fixtures() else {
+        eprintln!(
+            "conformance: ACDP_SPEC_DIR unset or no fixtures resolvable; skipping \
+             sig-003/dk-003 (set ACDP_REQUIRE_CONFORMANCE to make this a hard failure)"
+        );
         return;
     };
     let path = fixtures.join("sig-003-did-key-golden.json");
     let raw = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) => {
+            assert!(
+                !require_conformance(),
+                "ACDP_REQUIRE_CONFORMANCE is set but cannot read {}: {e}",
+                path.display()
+            );
             eprintln!("conformance: cannot read {}: {e}; skipping", path.display());
             return;
         }
