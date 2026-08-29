@@ -45,6 +45,18 @@ The binary validates config before serving and refuses to boot on a misconfig
 - **Receipts** — a configured `[receipt]` key must parse (exactly one source,
   valid base64, 32 bytes), and is incompatible with `playground.enabled`
   (RFC-ACDP-0010 §7: a receipts registry has no unverified publish path).
+- **Profile allowlist (REG-5)** — every entry in `registry.profiles` must be
+  one of the seven *registry* profiles the pinned ACDP spec defines
+  (`REGISTRY_ADVERTISABLE_PROFILES` in `crates/acdp-registry-types/src/
+  config.rs`: `acdp-registry-core`, `acdp-registry-discovery`,
+  `acdp-registry-federated`, `acdp-registry-receipts`,
+  `acdp-registry-head-receipts`, `acdp-registry-transparency-log`,
+  `acdp-registry-lifecycle`). This is checked before any other
+  `registry.profiles`-dependent guard below, so a typo or an out-of-scope
+  profile is reported first. `acdp-log-witness` is explicitly rejected with
+  a dedicated message: a witness is not a registry (RFC-ACDP-0015 §6.1) — a
+  registry MAY aggregate cosignatures under `acdp-registry-transparency-log`
+  without ever advertising `acdp-log-witness` itself.
 - **0.3.0 profiles** — `receipt.head_receipts = true` requires a configured
   `[receipt]` signing key (RFC-ACDP-0011 §9: head receipts are signed with
   the receipt key). `log.enabled = true` likewise requires a `[receipt]` key
@@ -81,7 +93,7 @@ values for illustration. Env var = `ACDP_REGISTRY_` + the bracketed path.
 | `bind` | string | `127.0.0.1` | Bind address. Non-loopback needs TLS/auth or `allow_public_bind`. |
 | `allow_public_bind` | bool | `false` | Opt-in to bind a public interface without TLS/auth. |
 | `base_url` | string | `https://{authority}` | Public URL advertised to consumers / federation control plane. |
-| `profiles` | string[] | `["acdp-registry-core","acdp-registry-discovery"]` | Advertised in capabilities. |
+| `profiles` | string[] | `["acdp-registry-core","acdp-registry-discovery"]` | Advertised in capabilities. Must be a subset of the seven `acdp-registry-*` profiles the pinned spec defines — any other value (including `acdp-log-witness`, which is not a registry profile) fails startup. |
 | `cross_registry_resolution` | bool | `true` | Forward foreign `ctx_id`s to their home registry; `false` returns 404 instead. |
 
 #### `[registry.tls]`
@@ -360,7 +372,11 @@ Aggregation is a pure convenience: the registry never holds a witness key,
 so it can neither forge a cosignature nor make itself a trust dependency —
 a consumer MAY always fetch direct from a witness (§6.2). There is **no new
 capability flag or profile**: a registry that aggregates does so under its
-existing `acdp-registry-transparency-log` profile (§10).
+existing `acdp-registry-transparency-log` profile (§10). Configuring
+`[[witnesses]]` does, however, raise the served `.well-known/acdp.json`
+`acdp_version` claim to `"0.4.0"`, since witness cosignature aggregation is
+itself the §6.1 wire member — see
+[HTTP-API.md](HTTP-API.md#get-well-knownacdpjson).
 
 Prerequisites (enforced at startup): `log.enabled = true` (there are no
 checkpoints to witness without a log), each `did` a `did:web` DID, and each

@@ -356,7 +356,13 @@ signed object as the bare form. When the registry has collected **no**
 cosignatures for the served tuple, the response is the **bare** checkpoint
 above (no envelope, no `witness_signatures`) — the array is never
 fabricated or served empty, and pre-0.4.0 consumers see exactly what they
-always did. The same top-level `witness_signatures` sibling is attached to
+always did. A registry only serves `witness_signatures` at all once
+`[[witnesses]]` is configured, and doing so also raises the `acdp_version`
+served at [`GET /.well-known/acdp.json`](#get-well-knownacdpjson) to
+`"0.4.0"` — a deployment with no witnesses configured therefore also
+serves the version claim it always did, since nothing triggers the
+rung that adds this member. The
+same top-level `witness_signatures` sibling is attached to
 the embedded checkpoint carried by `GET /log/proof` (inclusion and
 consistency modes) when cosignatures exist for that embedded checkpoint's
 tuple. A consumer verifies each cosignature under the witness DID's

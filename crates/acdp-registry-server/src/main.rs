@@ -31,7 +31,7 @@ use acdp_registry_auth::{AuthService, ChallengeStore, JwtSecret, JwtSigner, Revo
 use acdp_registry_auth::{InMemoryChallengeStore, InMemoryRevocationStore};
 use acdp_registry_core::{build_router, AppStateInner};
 use acdp_registry_store::ExtendedRegistryStore;
-use acdp_registry_types::{RegistryConfig, StorageBackend};
+use acdp_registry_types::{RegistryConfig, StorageBackend, REGISTRY_ADVERTISABLE_PROFILES};
 use acdp_registry_webhook::WebhookEmitter;
 
 #[tokio::main]
@@ -194,6 +194,36 @@ fn validate_config(cfg: &RegistryConfig) -> anyhow::Result<()> {
         // while capabilities keep advertising the receipts profile.
         acdp_registry_core::receipt::build_did_document(&cfg.receipt, &cfg.registry.authority)
             .map_err(|e| anyhow::anyhow!("receipt: {e}"))?;
+    }
+
+    // REG-5: "is this even a registry profile" logically precedes "can we
+    // honor it" — run this allowlist check BEFORE the per-profile
+    // backing-config guards below, so an operator with both a typo AND a
+    // missing backing config sees the typo (the more fundamental,
+    // actionable error) first. The allowlist is exactly the registry
+    // profiles the pinned spec defines (every `profiles[].id` in the
+    // spec's `registries/profiles.json` prefixed `acdp-registry-`); see
+    // `REGISTRY_ADVERTISABLE_PROFILES`'s doc comment. This deliberately
+    // does NOT special-case `acdp-log-witness` in the allowlist itself —
+    // the prefix rule already excludes it — but DOES special-case it in
+    // the error message, since a well-meaning operator confusing "runs a
+    // witness" with "is a registry" is the most likely mistake here.
+    for profile in &cfg.registry.profiles {
+        if !REGISTRY_ADVERTISABLE_PROFILES.contains(&profile.as_str()) {
+            if profile == "acdp-log-witness" {
+                anyhow::bail!(
+                    "registry.profiles advertises 'acdp-log-witness', but a witness is not a \
+                     registry (RFC-ACDP-0015 §6.1): aggregate cosignatures under \
+                     acdp-registry-transparency-log without advertising this profile. Remove \
+                     'acdp-log-witness' from registry.profiles."
+                );
+            }
+            anyhow::bail!(
+                "registry.profiles advertises '{profile}', which is not a registry profile the \
+                 pinned ACDP spec defines. Valid values: {:?}.",
+                REGISTRY_ADVERTISABLE_PROFILES
+            );
+        }
     }
 
     // RFC-ACDP-0010 §7/§11: advertising `acdp-registry-receipts` is a hard
@@ -818,12 +848,27 @@ fn build_capabilities(cfg: &RegistryConfig) -> CapabilitiesDocument {
     CapabilitiesDocument {
         // Plan A4: the version claim is gated on what the deployment
         // actually honors, exactly like the profiles (which the
-        // `with_*` builders append and version-gate). The ACDP 0.3.0
-        // surfaces (lineage-head receipts, RFC-ACDP-0011 §9; lifecycle,
-        // RFC-ACDP-0013 §10) require >= 0.3.0; a receipt key alone
-        // claims 0.2.0 (RFC-ACDP-0010 §11); a bare deployment keeps the
-        // 0.1.0 claim it actually honors.
-        acdp_version: if cfg.receipt.head_receipts || cfg.lifecycle.enabled || cfg.log.enabled {
+        // `with_*` builders append and version-gate). RFC-ACDP-0015 §6.1
+        // witness-cosignature aggregation is a 0.4.0 wire member
+        // (`witness_signatures`); a deployment that aggregates witnesses
+        // claims 0.4.0 — under-claiming 0.3.0 here would serve a 0.4.0
+        // wire member under a 0.3.0 banner. This rung is checked first
+        // and gated on `!cfg.witnesses.is_empty()` rather than
+        // `cfg.log.enabled`: `validate_config` refuses startup when
+        // witnesses are configured without `log.enabled` (see
+        // `witnesses_require_log_and_valid_did_and_url`), so on the real
+        // startup path the 0.4.0 rung already implies the 0.3.0 rung's
+        // preconditions and the ladder stays monotone; gating on
+        // `log.enabled` alone would over-claim 0.4.0 for every
+        // transparency-log registry that aggregates nothing. The ACDP
+        // 0.3.0 surfaces (lineage-head receipts, RFC-ACDP-0011 §9;
+        // lifecycle, RFC-ACDP-0013 §10; the transparency log itself)
+        // require >= 0.3.0; a receipt key alone claims 0.2.0
+        // (RFC-ACDP-0010 §11); a bare deployment keeps the 0.1.0 claim
+        // it actually honors.
+        acdp_version: if !cfg.witnesses.is_empty() {
+            "0.4.0".into()
+        } else if cfg.receipt.head_receipts || cfg.lifecycle.enabled || cfg.log.enabled {
             "0.3.0".into()
         } else if cfg.receipt.is_configured() {
             "0.2.0".into()
@@ -1237,7 +1282,16 @@ mod tests {
             url: "https://witness.example.org/log/witness".into(),
             poll_seconds: 300,
         }];
-        // Witnesses without a log are refused (nothing to witness).
+        // Witnesses without a log are refused (nothing to witness). This
+        // is also the invariant the `acdp_version` 0.4.0 rung in
+        // `build_capabilities` depends on: that rung is gated on
+        // `!cfg.witnesses.is_empty()` alone (not `cfg.log.enabled`), which
+        // is only monotone with the 0.3.0 rung because `validate_config`
+        // refuses to ever start a deployment with witnesses configured
+        // and `log.enabled = false` — re-asserted here explicitly rather
+        // than assumed, since `capabilities_acdp_version_ladder` calls
+        // `build_capabilities` directly and cannot observe this rejection
+        // itself.
         let err = validate_config(&cfg).expect_err("witnesses require log.enabled");
         assert!(err.to_string().contains("[[witnesses]]"), "{err}");
 
@@ -1307,5 +1361,212 @@ mod tests {
              path both verify it, so the publish gate must accept it: {:?}",
             caps.supported_signature_algorithms
         );
+    }
+
+    // RFC-ACDP-0015 §6.1 — witness aggregation is a 0.4.0 wire member
+    // (`witness_signatures`), so a deployment that aggregates witness
+    // cosignatures must advertise `acdp_version: "0.4.0"` rather than
+    // under-claim "0.3.0" (otherwise Phase 2's below-0.4.0 wire-code gate
+    // is satisfiable only vacuously, since no deployment would ever claim
+    // 0.4.0 in the first place).
+    #[test]
+    fn capabilities_acdp_version_ladder() {
+        use acdp_registry_types::config::WitnessConfig;
+
+        // Bare config: unchanged at 0.1.0.
+        let bare = RegistryConfig::defaults();
+        assert_eq!(build_capabilities(&bare).acdp_version, "0.1.0");
+
+        // Receipt key configured, nothing else: unchanged at 0.2.0.
+        let mut receipt_only = RegistryConfig::defaults();
+        receipt_only.receipt.signing_key_seed_b64 =
+            base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        assert_eq!(build_capabilities(&receipt_only).acdp_version, "0.2.0");
+
+        // Witnesses configured AND log.enabled = true — the only state
+        // `validate_config` allows on the real startup path (see
+        // `witnesses_require_log_and_valid_did_and_url`, which re-asserts
+        // that witnesses without log.enabled fail startup). Testing that
+        // combination, not just `witnesses` alone, is what proves the new
+        // rung is correct on the real reachable state rather than merely
+        // on an unvalidated config `build_capabilities` itself won't reject.
+        let mut witnessed = RegistryConfig::defaults();
+        witnessed.receipt.signing_key_seed_b64 =
+            base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        witnessed.log.enabled = true;
+        witnessed.witnesses = vec![WitnessConfig {
+            did: "did:web:witness.example.org".into(),
+            url: "https://witness.example.org/log/witness".into(),
+            poll_seconds: 300,
+        }];
+        assert_eq!(
+            build_capabilities(&witnessed).acdp_version,
+            "0.4.0",
+            "witness aggregation (RFC-ACDP-0015 §6.1) must claim 0.4.0"
+        );
+
+        // Same config with witnesses emptied: back down to 0.3.0 (the log
+        // remains enabled). Proves the new rung is both reachable and
+        // ordered FIRST — if it were ordered after the 0.3.0 branch it
+        // would be dead code, since witnesses non-empty implies
+        // log.enabled implies the 0.3.0 branch already matches, so this
+        // assertion would equally pass with a mis-ordered ladder; it is
+        // criterion 1 above (0.4.0 with witnesses present) that actually
+        // distinguishes correct ordering from dead code.
+        let mut no_witnesses = witnessed.clone();
+        no_witnesses.witnesses.clear();
+        assert_eq!(build_capabilities(&no_witnesses).acdp_version, "0.3.0");
+    }
+
+    // REG-5 — `registry.profiles` allowlist (`REGISTRY_ADVERTISABLE_PROFILES`).
+
+    #[test]
+    fn witness_profile_is_rejected_with_witness_specific_message() {
+        // A witness is NOT a registry (RFC-ACDP-0015 §6.1): a registry MAY
+        // aggregate cosignatures under acdp-registry-transparency-log
+        // without ever advertising acdp-log-witness itself. This is the
+        // false-advertisement mistake this phase specifically calls out.
+        let mut cfg = RegistryConfig::defaults();
+        cfg.registry.profiles = vec!["acdp-log-witness".into()];
+        let err = validate_config(&cfg).expect_err("acdp-log-witness must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("acdp-log-witness"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("a witness is not a registry"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn unknown_profile_is_rejected() {
+        let mut cfg = RegistryConfig::defaults();
+        cfg.registry.profiles = vec!["acdp-registry-typo".into()];
+        let err = validate_config(&cfg).expect_err("an unknown profile string must be refused");
+        assert!(
+            err.to_string().contains("acdp-registry-typo"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn unknown_profile_is_rejected_before_backing_config_guards() {
+        // An operator with BOTH a typo AND a missing backing config (here:
+        // acdp-registry-receipts with no [receipt] key) must see the typo
+        // first — the more fundamental, actionable error.
+        let mut cfg = RegistryConfig::defaults();
+        cfg.registry.profiles = vec!["acdp-registry-typo".into(), "acdp-registry-receipts".into()];
+        let err = validate_config(&cfg).expect_err("must be refused");
+        assert!(
+            err.to_string().contains("acdp-registry-typo"),
+            "the allowlist error must fire before the receipts backing-config guard: {err}"
+        );
+    }
+
+    #[test]
+    fn profile_acdp_registry_core_alone_is_accepted() {
+        let mut cfg = RegistryConfig::defaults();
+        cfg.registry.profiles = vec!["acdp-registry-core".into()];
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn profile_acdp_registry_discovery_alone_is_accepted() {
+        let mut cfg = RegistryConfig::defaults();
+        cfg.registry.profiles = vec!["acdp-registry-discovery".into()];
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn profile_acdp_registry_federated_alone_is_accepted() {
+        // No backing-config guard exists for acdp-registry-federated
+        // (explicitly out of scope for REG-5) — it only needs to clear the
+        // allowlist.
+        let mut cfg = RegistryConfig::defaults();
+        cfg.registry.profiles = vec!["acdp-registry-federated".into()];
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn profile_acdp_registry_receipts_alone_is_accepted() {
+        let mut cfg = RegistryConfig::defaults();
+        cfg.registry.profiles = vec!["acdp-registry-receipts".into()];
+        cfg.receipt.signing_key_seed_b64 =
+            base64::engine::general_purpose::STANDARD.encode([5u8; 32]);
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn profile_acdp_registry_head_receipts_alone_is_accepted() {
+        let mut cfg = RegistryConfig::defaults();
+        cfg.registry.profiles = vec!["acdp-registry-head-receipts".into()];
+        cfg.receipt.signing_key_seed_b64 =
+            base64::engine::general_purpose::STANDARD.encode([5u8; 32]);
+        cfg.receipt.head_receipts = true;
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn profile_acdp_registry_lifecycle_alone_is_accepted() {
+        let mut cfg = RegistryConfig::defaults();
+        cfg.registry.profiles = vec!["acdp-registry-lifecycle".into()];
+        cfg.lifecycle.enabled = true;
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn profile_acdp_registry_transparency_log_alone_is_accepted() {
+        let mut cfg = RegistryConfig::defaults();
+        cfg.registry.profiles = vec!["acdp-registry-transparency-log".into()];
+        cfg.receipt.signing_key_seed_b64 =
+            base64::engine::general_purpose::STANDARD.encode([5u8; 32]);
+        cfg.log.enabled = true;
+        // `RegistryConfig::defaults()` already sets a durable (sqlite)
+        // backend, which `log.enabled` requires.
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn registry_advertisable_profiles_excludes_witness_and_consumer() {
+        // Named, greppable invariant — not just an emergent property of
+        // the prefix-derivation the conformance ratchet test checks.
+        assert!(!REGISTRY_ADVERTISABLE_PROFILES.contains(&"acdp-log-witness"));
+        assert!(!REGISTRY_ADVERTISABLE_PROFILES.contains(&"acdp-consumer"));
+    }
+
+    #[test]
+    fn default_profile_list_is_advertisable() {
+        // Both places this codebase substitutes a default profile list —
+        // `RegistryConfig::defaults()` (config.rs) and `build_capabilities`'s
+        // empty -> default substitution (main.rs, for an explicitly empty
+        // `registry.profiles`) — must themselves satisfy the allowlist.
+        for p in &RegistryConfig::defaults().registry.profiles {
+            assert!(
+                REGISTRY_ADVERTISABLE_PROFILES.contains(&p.as_str()),
+                "RegistryConfig::defaults().registry.profiles advertises non-allowlisted \
+                 profile '{p}'"
+            );
+        }
+
+        let mut cfg = RegistryConfig::defaults();
+        cfg.registry.profiles = Vec::new();
+        assert!(
+            validate_config(&cfg).is_ok(),
+            "an empty registry.profiles has nothing to validate"
+        );
+        let caps = build_capabilities(&cfg);
+        assert_eq!(
+            caps.profiles,
+            vec![
+                "acdp-registry-core".to_string(),
+                "acdp-registry-discovery".to_string()
+            ]
+        );
+        for p in &caps.profiles {
+            assert!(
+                REGISTRY_ADVERTISABLE_PROFILES.contains(&p.as_str()),
+                "build_capabilities's empty-profiles default substitution advertises \
+                 non-allowlisted profile '{p}'"
+            );
+        }
     }
 }

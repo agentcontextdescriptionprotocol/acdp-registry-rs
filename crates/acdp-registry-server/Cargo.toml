@@ -46,6 +46,7 @@ playground     = ["acdp-registry-core/playground"]
 
 [dev-dependencies]
 http-body-util = "0.1"
+hex            = { workspace = true }
 serde          = { workspace = true }
 serde_json     = { workspace = true }
 sqlx           = { workspace = true }

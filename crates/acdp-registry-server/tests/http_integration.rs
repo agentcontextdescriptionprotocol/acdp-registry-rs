@@ -65,6 +65,15 @@ fn caps() -> CapabilitiesDocument {
         supported_signature_algorithms: vec!["ed25519".into(), "ecdsa-p256".into()],
         supported_did_methods: vec!["did:web".into()],
         profiles: vec!["acdp-registry-core".into()],
+        // NOTE: `build_capabilities` in the binary also has a 0.4.0 rung
+        // (RFC-ACDP-0015 §6.1 witness aggregation, gated on
+        // `!cfg.witnesses.is_empty()`) that this harness does not mirror.
+        // `config()` above sets `witnesses: Vec::new()`, so no test built
+        // on this base `caps()` claims a version above what's asserted
+        // here today — but a future test that configures `[[witnesses]]`
+        // must also bump the `acdp_version` on the `CapabilitiesDocument`
+        // it asserts against to "0.4.0", or it will silently assert a
+        // stale 0.3.0/0.1.0 claim.
         limits: Limits {
             max_payload_bytes: 1_048_576,
             max_embedded_bytes: 65_536,
@@ -3334,6 +3343,15 @@ fn receipts_caps() -> CapabilitiesDocument {
     c.supported_did_methods = vec!["did:web".into(), "did:key".into()];
     c
 }
+
+// NOTE for `log_caps()` (below, built on top of `receipts_caps()`) and any
+// future harness that configures `[[witnesses]]`: mirroring the binary's
+// `build_capabilities` means also mirroring its 0.4.0 rung — a witnessed
+// deployment (witnesses non-empty, which on the real startup path implies
+// `log.enabled`, see `witnesses_require_log_and_valid_did_and_url` in
+// `crates/acdp-registry-server/src/main.rs`) claims `acdp_version:
+// "0.4.0"`, not "0.3.0". `log_harness()` below does not configure
+// witnesses today, so `log_caps()`'s "0.3.0" claim is still correct.
 
 /// Production-path harness (playground OFF) with a receipt signer and
 /// did:key acceptance — did:key verification is pure/offline, so the full

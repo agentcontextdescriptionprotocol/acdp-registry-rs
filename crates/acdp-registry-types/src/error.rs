@@ -173,6 +173,15 @@ fn acdp_wire_code(err: &AcdpError) -> &'static str {
         // not_found (unlogged / invisible ctx_id), and not_implemented
         // (profile not advertised). There is no log_unavailable (§7.1).
         AcdpError::InvalidLogProof(_) => "invalid_log_proof",
+        // RFC-ACDP-0015 §10 — a witness cosignature that fails its §8
+        // verification procedure (bad signature, unknown witness key, a
+        // witnessed_at skew beyond the allowance, etc.) is deliberately
+        // distinct from `invalid_log_proof`: the log proof and the witness
+        // cosignature are independently verifiable artifacts, and a client
+        // MUST be able to tell which one failed even though both currently
+        // project to 502. A cosignature that verifies but is merely stale
+        // is consumer freshness policy (§8.1), never this code.
+        AcdpError::InvalidWitnessCosignature(_) => "invalid_witness_cosignature",
         AcdpError::NotImplemented(_) => "not_implemented",
         AcdpError::DuplicatePublish(_) => "duplicate_publish",
         AcdpError::SupersededTarget { .. } => "superseded_target",
@@ -224,6 +233,11 @@ fn http_status_for_acdp(err: &AcdpError) -> u16 {
         // RFC-ACDP-0012 §11: `invalid_log_proof` is HTTP 502 — the upstream
         // whose proof failed verification is at fault, not this registry.
         AcdpError::InvalidLogProof(_) => 502,
+        // A failed witness cosignature is also an upstream-artifact fault
+        // (the witness signed something that doesn't verify), so it shares
+        // the 502 status with `invalid_log_proof` while keeping its own
+        // wire code above.
+        AcdpError::InvalidWitnessCosignature(_) => 502,
         AcdpError::NotImplemented(_) => 501,
         _ => 500,
     }
@@ -403,6 +417,29 @@ mod tests {
         let e = acdp(AcdpError::InvalidLogProof("path does not fold".into()));
         assert_eq!(e.wire_code(), "invalid_log_proof");
         assert_eq!(e.http_status(), 502);
+    }
+
+    /// RFC-ACDP-0015 — `invalid_witness_cosignature` is a registered wire
+    /// code, HTTP 502 (same status family as `invalid_log_proof`: the
+    /// upstream artifact — here a witness cosignature — failed
+    /// verification, not the registry itself). The two codes MUST stay
+    /// distinct even though they share a status, so a client can tell which
+    /// artifact failed.
+    #[test]
+    fn invalid_witness_cosignature_is_502_with_registered_code() {
+        let e = acdp(AcdpError::InvalidWitnessCosignature(
+            "cosignature does not verify".into(),
+        ));
+        assert_eq!(e.wire_code(), "invalid_witness_cosignature");
+        assert_eq!(e.http_status(), 502);
+
+        let log_proof = acdp(AcdpError::InvalidLogProof("path does not fold".into()));
+        assert_eq!(log_proof.http_status(), e.http_status());
+        assert_ne!(
+            log_proof.wire_code(),
+            e.wire_code(),
+            "invalid_log_proof and invalid_witness_cosignature must stay distinct wire codes"
+        );
     }
 
     /// A failed gateway hop (federation / unreachable key resolution) is 502 —
