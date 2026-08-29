@@ -97,6 +97,17 @@
 //! dedicated test coverage for the new family, or add a spec-grounded excuse
 //! to `EXCUSED` — and the latter is mechanically rejected if the spec
 //! requires the family of `acdp-registry-core`.
+//!
+//! `wit-*` remains classified "non-HTTP fixture" by the replay harness
+//! above (`extract()`'s fallback) and is not itself `EXCUSED` — RFC-ACDP-0015
+//! §8 witness-cosignature verification is a pure library check over a
+//! witness DID document and an independently-held checkpoint, not a
+//! registry HTTP endpoint. `wit-001` (golden) and `wit-004` (wrong-key
+//! rejection) now have DIRECT non-HTTP coverage via
+//! `wit004_key_mismatch_cosignature_is_rejected_and_wit001_golden_is_accepted`,
+//! which drives `acdp::client::verify_witness_cosignature_value` and
+//! `evaluate_witness_quorum` in-process — beside, not instead of, the HTTP
+//! replayer's skip manifest below.
 
 #![cfg(feature = "storage-sqlite")]
 
@@ -113,7 +124,7 @@ use acdp_registry_sqlite::SqliteStore;
 use acdp_registry_store::ExtendedRegistryStore;
 use acdp_registry_types::{
     AuthConfig, LimitsConfig, PlaygroundConfig, RegistryConfig, RegistrySection, StorageBackend,
-    StorageConfig, WebhookConfig,
+    StorageConfig, WebhookConfig, REGISTRY_ADVERTISABLE_PROFILES,
 };
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -959,6 +970,200 @@ async fn did_key_golden_vector_accepted_and_gated() {
     assert_eq!(v["error"]["code"], "key_resolution_failed");
 }
 
+/// wit-004 (RFC-ACDP-0015 §8 step 2, §10): a witness cosignature whose
+/// `signature.value` was produced by the WRONG key must fail consumer
+/// verification with `InvalidWitnessCosignature`, and the error must name
+/// the actual signature-verification failure — not merely match the
+/// variant, since every failure mode of `verify_witness_cosignature_value`
+/// returns that same variant. The rejected cosignature must NOT count
+/// toward the N-witnessed quorum. wit-001 (the paired golden vector: same
+/// witness key, same underlying cosignature body, correct signature) is
+/// the positive control — without it, wit-004 failing would prove nothing,
+/// since a broken test can "fail correctly" for the wrong reason.
+///
+/// `wit-*` is classified "non-HTTP fixture" by the replay harness above
+/// (`extract()` / the module doc-comment's "Coverage ratchet" section) —
+/// §8 verification is a pure library check over a witness DID document
+/// and an independently-held checkpoint, not a registry HTTP endpoint.
+/// This test drives `acdp::client::verify_witness_cosignature_value` and
+/// `evaluate_witness_quorum` directly instead of going through HTTP, and
+/// deliberately does NOT use the registry's internal
+/// `verify_cosignature_against_own_log` — that path first reconstructs
+/// the checkpoint from a log store, which for a synthetic/empty store
+/// would yield `InvalidWitnessCosignature` for the WRONG reason (missing
+/// checkpoint, not bad signature).
+#[test]
+fn wit004_key_mismatch_cosignature_is_rejected_and_wit001_golden_is_accepted() {
+    use acdp::client::{evaluate_witness_quorum, verify_witness_cosignature_value, WitnessPolicy};
+    use acdp::types::log::LogCheckpoint;
+    use acdp::types::Signature;
+    use acdp::AcdpError;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+    use std::collections::{HashMap, HashSet};
+
+    let Some(fixtures) = spec_fixtures() else {
+        eprintln!(
+            "conformance: ACDP_SPEC_DIR unset or no fixtures resolvable; skipping \
+             wit-001/wit-004 (set ACDP_REQUIRE_CONFORMANCE to make this a hard failure)"
+        );
+        return;
+    };
+
+    let read_fixture = |name: &str| -> Option<Value> {
+        let path = fixtures.join(name);
+        match std::fs::read_to_string(&path) {
+            Ok(s) => Some(serde_json::from_str(&s).unwrap()),
+            Err(e) => {
+                assert!(
+                    !require_conformance(),
+                    "ACDP_REQUIRE_CONFORMANCE is set but cannot read {}: {e}",
+                    path.display()
+                );
+                eprintln!("conformance: cannot read {}: {e}; skipping", path.display());
+                None
+            }
+        }
+    };
+
+    let (Some(wit004), Some(wit001)) = (
+        read_fixture("wit-004-cosignature-key-mismatch.json"),
+        read_fixture("wit-001-cosignature-golden.json"),
+    ) else {
+        return;
+    };
+
+    // Cross-check: both fixtures are about the same witness key and the
+    // same underlying cosignature body (independent proof they pair up).
+    let wit004_key_hex = wit004["witness_did_document"]["assertion_method_key_public_hex"]
+        .as_str()
+        .expect("wit-004 carries witness_did_document.assertion_method_key_public_hex");
+    let wit001_key_hex = wit001["witness_test_keypair"]["public_key_hex"]
+        .as_str()
+        .expect("wit-001 carries witness_test_keypair.public_key_hex");
+    assert_eq!(
+        wit004_key_hex, wit001_key_hex,
+        "wit-004 and wit-001 must pin the same witness assertionMethod key"
+    );
+    let wit004_cosig_hash = wit004["expected"]["cosignature_hash"]
+        .as_str()
+        .expect("wit-004 carries expected.cosignature_hash");
+    let wit001_cosig_hash = wit001["vectors"][0]["expected"]["cosignature_hash"]
+        .as_str()
+        .expect("wit-001 carries vectors[0].expected.cosignature_hash");
+    assert_eq!(
+        wit004_cosig_hash, wit001_cosig_hash,
+        "wit-004 and wit-001 must pin the same underlying cosignature body hash"
+    );
+
+    // Build witness A's DID document from wit-004's OWN fixture data (not
+    // a hardcoded seed): witness_did_document is {note, id,
+    // assertion_method_key_public_hex}, not a full DID document.
+    let witness_id = wit004["witness_did_document"]["id"]
+        .as_str()
+        .expect("wit-004 carries witness_did_document.id");
+    let key_bytes = hex::decode(wit004_key_hex).expect("wit-004 key hex decodes");
+    let vm_id = format!("{witness_id}#witness-key-1");
+    let doc = json!({
+        "id": witness_id,
+        "verificationMethod": [{
+            "id": vm_id,
+            "type": "Ed25519VerificationKey2020",
+            "controller": witness_id,
+            "publicKeyJwk": {
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "x": URL_SAFE_NO_PAD.encode(&key_bytes),
+            }
+        }],
+        "assertionMethod": [vm_id],
+    });
+
+    // The expected checkpoint, built from the cosignature's own
+    // `witnessed_checkpoint` tuple. Deliberately NOT
+    // `LogCheckpoint::from_value` — it enforces a closed parse requiring
+    // `signature.key_id` under the log_id's registry DID, which this
+    // synthetic checkpoint has no reason to satisfy. The verification
+    // function below only cross-checks the tuple, never the checkpoint's
+    // own signature, so the placeholder `signature` field is harmless.
+    let wc = &wit004["cosignature"]["witnessed_checkpoint"];
+    let checkpoint = LogCheckpoint {
+        checkpoint_version: "acdp-log/1".to_string(),
+        log_id: wc["log_id"].as_str().unwrap().to_string(),
+        tree_size: wc["tree_size"].as_u64().unwrap(),
+        root_hash: wc["root_hash"].as_str().unwrap().to_string(),
+        timestamp: chrono::Utc::now(),
+        signature: Signature {
+            algorithm: "ed25519".to_string(),
+            key_id: "did:web:registry.example.com#placeholder".to_string(),
+            value: String::new(),
+        },
+    };
+
+    // wit-004: the wrong-key cosignature MUST fail verification, and the
+    // error MUST name the actual §8 step 2 signature-verification
+    // failure — not merely match the variant.
+    let err =
+        verify_witness_cosignature_value(&wit004["cosignature"], &doc, &checkpoint, None, None)
+            .expect_err("wit-004: wrong-key cosignature must fail verification");
+    assert!(
+        matches!(err, AcdpError::InvalidWitnessCosignature(_)),
+        "wit-004 error must be InvalidWitnessCosignature, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("signature verification failed"),
+        "wit-004 error must name the actual signature-verification failure (§8 step 2), \
+         got: {err}"
+    );
+
+    // Positive control: wit-001's golden cosignature — nested at
+    // vectors[0].expected.log_cosignature, a DIFFERENT JSON path than
+    // wit-004's top-level `cosignature` — verified under the SAME DID
+    // document and checkpoint → Ok. Without this, wit-004 failing proves
+    // nothing: the test could pass because everything fails.
+    let wit001_cosig = &wit001["vectors"][0]["expected"]["log_cosignature"];
+    verify_witness_cosignature_value(wit001_cosig, &doc, &checkpoint, None, None)
+        .expect("wit-001: golden cosignature must verify under the same witness key");
+
+    // The rejected wit-004 cosignature does NOT count toward the
+    // N-witnessed quorum; the accepted wit-001 one does, and the
+    // witnessed DID reported is the witness that actually verified.
+    let mut docs = HashMap::new();
+    docs.insert(witness_id.to_string(), doc.clone());
+    let trusted: HashSet<String> = [witness_id.to_string()].into_iter().collect();
+
+    let report_alone = evaluate_witness_quorum(
+        &[wit004["cosignature"].clone()],
+        &docs,
+        &trusted,
+        &checkpoint,
+        &WitnessPolicy::default(),
+        None,
+    );
+    assert_eq!(
+        report_alone.witnessed_count, 0,
+        "wit-004 alone must not count toward N-witnessed"
+    );
+
+    let report_both = evaluate_witness_quorum(
+        &[wit001_cosig.clone(), wit004["cosignature"].clone()],
+        &docs,
+        &trusted,
+        &checkpoint,
+        &WitnessPolicy::default(),
+        None,
+    );
+    assert_eq!(
+        report_both.witnessed_count, 1,
+        "only wit-001's cosignature counts toward N-witnessed"
+    );
+    assert_eq!(
+        report_both.witnesses,
+        vec![witness_id.to_string()],
+        "the witnessed DID must be wit-001's witness, not wit-004's"
+    );
+}
+
 // ─── Phase 1: harness fidelity gates ───
 
 /// A fixture whose `applies_to_profiles` is disjoint from `HARNESS_PROFILES`
@@ -1272,6 +1477,37 @@ fn core_profile(root: &Path) -> Value {
             )
         })
         .clone()
+}
+
+/// Returns every `profiles[].id` in `registries/profiles.json` under `root`
+/// whose id starts with `acdp-registry-` — i.e. the *registry* profiles the
+/// pinned spec defines, as opposed to the two non-registry profile ids it
+/// also declares (`acdp-log-witness`, `acdp-consumer`). Panics (naming the
+/// checked path) if the file is unreadable/malformed, `profiles` isn't an
+/// array, or any entry's `id` is missing/non-string — same "malformed spec
+/// data is a hard failure, not a skip" discipline as `core_profile`.
+fn spec_registry_profile_ids(root: &Path) -> Vec<String> {
+    let profiles_path = root.join("registries/profiles.json");
+    let doc = read_json(&profiles_path);
+    let profiles = doc
+        .get("profiles")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("{} missing 'profiles' array", profiles_path.display()));
+    profiles
+        .iter()
+        .map(|p| {
+            p.get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} has a profiles[] entry with a missing/non-string 'id': {p}",
+                        profiles_path.display()
+                    )
+                })
+                .to_string()
+        })
+        .filter(|id| id.starts_with("acdp-registry-"))
+        .collect()
 }
 
 /// Reads `acdp-registry-core`'s `required_fixtures` array, panicking (naming
@@ -1597,5 +1833,60 @@ async fn no_excused_family_is_required_by_our_profile() {
         &spec_fam_refs,
         &excused_families,
         "conditional_fixtures",
+    );
+}
+
+/// REG-5: `REGISTRY_ADVERTISABLE_PROFILES` (`acdp-registry-types`'s
+/// `registry.profiles` allowlist, enforced at startup by
+/// `acdp-registry-server`'s `validate_config`) must equal — exactly, as a
+/// set — every `profiles[].id` in the pinned spec's `registries/
+/// profiles.json` that starts with `acdp-registry-`. This is the property
+/// that makes the allowlist "derived by rule, not hand-maintained": if the
+/// spec adds an eighth registry profile, or renames/removes one of the
+/// current seven, this test goes red rather than the allowlist silently
+/// drifting. Skips when the pinned spec isn't reachable (`ACDP_SPEC_DIR`
+/// unset/nonexistent) in default mode; panics in require mode (via
+/// `spec_root()`).
+#[tokio::test(flavor = "multi_thread")]
+async fn registry_advertisable_profiles_matches_spec_derived_set() {
+    let Some(root) = spec_root() else {
+        eprintln!(
+            "conformance: ACDP_SPEC_DIR unset or nonexistent; skipping \
+             registry_advertisable_profiles_matches_spec_derived_set"
+        );
+        return;
+    };
+
+    let mut spec_ids = spec_registry_profile_ids(&root);
+    spec_ids.sort();
+    spec_ids.dedup();
+
+    let mut const_ids: Vec<String> = REGISTRY_ADVERTISABLE_PROFILES
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    const_ids.sort();
+    const_ids.dedup();
+
+    assert_eq!(
+        const_ids, spec_ids,
+        "REGISTRY_ADVERTISABLE_PROFILES must equal exactly the pinned spec's \
+         acdp-registry-* profile ids (registries/profiles.json). If the spec added, \
+         removed, or renamed a registry profile, update REGISTRY_ADVERTISABLE_PROFILES \
+         in crates/acdp-registry-types/src/config.rs to match."
+    );
+
+    // Named invariant, not just an emergent property of the prefix filter
+    // both sides apply: the two non-registry profile ids the spec also
+    // declares must not sneak into either side.
+    assert!(
+        !const_ids.iter().any(|id| id == "acdp-log-witness"),
+        "a witness is not a registry (RFC-ACDP-0015 §6.1) -- acdp-log-witness must never \
+         appear in REGISTRY_ADVERTISABLE_PROFILES"
+    );
+    assert!(
+        !const_ids.iter().any(|id| id == "acdp-consumer"),
+        "acdp-consumer is not a registry profile -- it must never appear in \
+         REGISTRY_ADVERTISABLE_PROFILES"
     );
 }

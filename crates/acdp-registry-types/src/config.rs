@@ -222,6 +222,38 @@ impl RegistrySection {
     }
 }
 
+/// Registry profiles the pinned ACDP spec actually defines for a
+/// *registry* — i.e. every `profiles[].id` entry in the spec's
+/// `registries/profiles.json` whose id starts with `acdp-registry-`. This is
+/// the allowlist `registry.profiles` (and `RegistrySection::profiles`) is
+/// checked against at startup (`validate_config` in
+/// `acdp-registry-server/src/main.rs`) — anything outside it is refused
+/// rather than served in the capabilities document.
+///
+/// Deliberately excludes `acdp-log-witness`: a witness is NOT a registry
+/// (RFC-ACDP-0015 §6.1) — a registry MAY aggregate cosignatures under
+/// `acdp-registry-transparency-log` without ever advertising
+/// `acdp-log-witness` itself. Also excludes `acdp-consumer`, the other
+/// non-registry profile id the spec defines.
+///
+/// This list is a literal copy of the spec-derived set as of the pinned SHA
+/// (a `const` can't read `registries/profiles.json` at compile time); the
+/// conformance test `registry_advertisable_profiles_matches_spec`
+/// (`acdp-registry-server/tests/conformance.rs`) is what keeps it honest —
+/// it recomputes the same prefix-derived set directly from the pinned
+/// spec's `registries/profiles.json` and asserts exact equality, so a
+/// future spec change (e.g. an eighth registry profile) turns CI red
+/// instead of silently drifting out of sync with this list.
+pub const REGISTRY_ADVERTISABLE_PROFILES: &[&str] = &[
+    "acdp-registry-core",
+    "acdp-registry-discovery",
+    "acdp-registry-federated",
+    "acdp-registry-receipts",
+    "acdp-registry-head-receipts",
+    "acdp-registry-transparency-log",
+    "acdp-registry-lifecycle",
+];
+
 fn default_bind() -> String {
     "127.0.0.1".into()
 }

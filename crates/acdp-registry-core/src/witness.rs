@@ -307,6 +307,35 @@ mod tests {
     const REGISTRY_DID: &str = "did:web:reg.test";
     const WITNESS_DID: &str = "did:web:witness.example.org";
 
+    // ── Scope note for the tests below (REG-5) ─────────────────────────
+    //
+    // `wit-002` (`wit-002-consistency-refusal.json`) describes a WITNESS's
+    // obligation: a witness MUST refuse to cosign a checkpoint whose root
+    // was rewritten, BEFORE signing, and MUST persist evidence of that
+    // refusal (`witness_action: "refuse"`, `evidence_persisted: true`).
+    // This crate is a REGISTRY, not a witness — it never cosigns anything,
+    // has no `GET /log/witness` route, and structurally cannot exhibit
+    // that half of wit-002's behavior.
+    //
+    // What `cosignature_over_wrong_root_is_rejected` below actually covers
+    // is the mirror-image defense the registry DOES own: refusing to
+    // STORE/AGGREGATE a cosignature whose `root_hash` doesn't match this
+    // registry's own recomputed root at that `tree_size` (RFC-ACDP-0015
+    // §6.1, §8 step 4). This is **the registry-side fork-refusal test,
+    // pinned to wit-002's forged root value** — it is NOT wit-002
+    // coverage, and no claim of full wit-002 coverage is made anywhere.
+
+    /// wit-002's own root-rewrite vector: `presented_checkpoint.root_hash`
+    /// in `wit-002-consistency-refusal.json`. A fabricated,
+    /// non-cryptographic hex string (unlike a real signature), so it is
+    /// hardcoded here with this citing comment rather than plumbed through
+    /// `ACDP_SPEC_DIR` fixture loading — this crate has no
+    /// `spec_root()`-equivalent helper, and adding spec-dir plumbing to a
+    /// library crate's unit tests just to fetch one fixed constant would
+    /// be pure cost for zero benefit.
+    const WIT_002_FORGED_ROOT: &str =
+        "sha256:deadbeef00000000000000000000000000000000000000000000000000000000";
+
     fn log_state() -> LogState {
         LogState::for_test(receipt_signer(), format!("{REGISTRY_DID}/log/1"))
     }
@@ -415,11 +444,13 @@ mod tests {
     async fn cosignature_over_wrong_root_is_rejected() {
         let (store, _tmp) = store_with_size(5).await;
         let log = log_state();
-        // A checkpoint at OUR size 5 but a FORGED root, cosigned by the witness.
-        let forged_root = encode_sha256_hex(&[0xabu8; 32]);
+        // A checkpoint at OUR size 5 but a FORGED root, cosigned by the
+        // witness — wit-002's own root-rewrite vector. See
+        // `WIT_002_FORGED_ROOT` doc comment for the fixture citation and
+        // the registry-vs-witness scope note.
         let forged_cp = log
             .signer
-            .mint_log_checkpoint(&log.log_id, 5, &forged_root, Utc::now())
+            .mint_log_checkpoint(&log.log_id, 5, WIT_002_FORGED_ROOT, Utc::now())
             .unwrap();
         let cosig = witness_signer().mint(&forged_cp, Utc::now()).unwrap();
         let wire = serde_json::to_value(&cosig).unwrap();
@@ -430,6 +461,30 @@ mod tests {
         assert!(
             matches!(err, AcdpError::InvalidWitnessCosignature(_)),
             "got {err:?}"
+        );
+        // Discriminate from the beyond-head rejection below: this must be
+        // the §8 step 4 checkpoint/root-mismatch, not some other
+        // `InvalidWitnessCosignature` cause (see the module-level mutation
+        // note in the doc comment above `WIT_002_FORGED_ROOT`).
+        let msg = err.to_string();
+        assert!(
+            msg.contains("root_hash") && msg.contains("evaluated checkpoint"),
+            "wrong-root rejection must name the root_hash/checkpoint mismatch, got: {msg}"
+        );
+
+        // And nothing was persisted: the store holds zero cosignatures for
+        // this exact checkpoint tuple after the rejection — a guard against
+        // this verification path ever gaining a persist-before-verify write
+        // (the actual store call lives in verify_and_store, untested here),
+        // so a forged cosignature can never later be served as though it
+        // had been aggregated (§6.1).
+        let stored = store
+            .witness_cosignatures_for(&log.log_id, 5, WIT_002_FORGED_ROOT)
+            .await
+            .unwrap();
+        assert!(
+            stored.is_empty(),
+            "a rejected wrong-root cosignature must not be persisted, got {stored:?}"
         );
     }
 
@@ -446,11 +501,27 @@ mod tests {
         let cosig = witness_signer().mint(&cp5, Utc::now()).unwrap();
         let wire = serde_json::to_value(&cosig).unwrap();
 
-        assert!(matches!(
-            verify_cosignature_against_own_log(&store, &log, &witness_doc(), &wire)
-                .await
-                .unwrap_err(),
-            AcdpError::InvalidWitnessCosignature(_)
-        ));
+        let err = verify_cosignature_against_own_log(&store, &log, &witness_doc(), &wire)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AcdpError::InvalidWitnessCosignature(_)));
+        // Discriminate from the wrong-root rejection above: this must be
+        // the beyond-head refusal specifically, not the §8 step 4
+        // root-mismatch (see the mutation note above `WIT_002_FORGED_ROOT`).
+        let msg = err.to_string();
+        assert!(
+            msg.contains("beyond this registry's current head"),
+            "beyond-head rejection must name the beyond-head reason, got: {msg}"
+        );
+
+        // And nothing was persisted for this tuple either.
+        let stored = store
+            .witness_cosignatures_for(&log.log_id, 5, &root5)
+            .await
+            .unwrap();
+        assert!(
+            stored.is_empty(),
+            "a rejected beyond-head cosignature must not be persisted, got {stored:?}"
+        );
     }
 }

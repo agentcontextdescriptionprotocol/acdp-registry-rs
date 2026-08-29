@@ -120,6 +120,99 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `unmatched-source` warning. The one behavioral consequence: any
   future git dependency on `acdp-rs` is now a `cargo deny` finding
   instead of a silent allowance.
+- **Wire-code mapping for `invalid_witness_cosignature`** (`REG-2`):
+  `AcdpError::InvalidWitnessCosignature` now maps to wire code
+  `invalid_witness_cosignature` / HTTP 502 in
+  `acdp-registry-types::error::{acdp_wire_code, http_status_for_acdp}`,
+  instead of falling through to the `internal_error`/500 catch-all.
+  Deliberately kept distinct from `invalid_log_proof` even though both
+  are 502, so a client can tell which upstream artifact failed
+  verification. No handler emits this error yet (`grep -rn
+  InvalidWitnessCosignature crates/acdp-registry-core/src/handlers/`
+  returns zero hits) — this only closes the wire-mapping gap ahead of
+  emission, which is a separate later change.
+- **`acdp_version` claims 0.4.0 when witnesses are configured** (`REG-2`):
+  `main::build_capabilities`'s version ladder gains a new rung, checked
+  first, `!cfg.witnesses.is_empty() => "0.4.0"`. RFC-ACDP-0015 §6.1 witness
+  cosignature aggregation — already implemented in full by
+  `acdp-registry-core::witness` — is the sole registry-side 0.4.0
+  obligation, so a deployment that aggregates witnesses was serving a
+  0.4.0 wire member (`witness_signatures`) under a 0.3.0 `acdp_version`
+  banner; this closes that under-claim and makes the prior `REG-2`
+  wire-code entry's below-0.4.0 gate satisfiable rather than vacuously
+  true (no deployment could ever have claimed 0.4.0 before this). Gated
+  on `!cfg.witnesses.is_empty()` rather than `cfg.log.enabled`, since
+  `validate_config` already refuses startup with witnesses configured and
+  `log.enabled = false` — the new rung stays monotone with the existing
+  0.3.0 rung on the real startup path without over-claiming 0.4.0 for
+  every transparency-log registry that aggregates nothing. Does **not**
+  advertise the `acdp-log-witness` profile — the spec forbids that for a
+  registry (a witness is not a registry); only the version string
+  changes.
+- **Fixture-driven `wit-004`/`wit-001` coverage** (`REG-2`):
+  `acdp-registry-server/tests/conformance.rs` gains
+  `wit004_key_mismatch_cosignature_is_rejected_and_wit001_golden_is_accepted`,
+  the first genuine coverage of the `wit-*` family against real pinned
+  fixture data. Drives `acdp::client::verify_witness_cosignature_value`
+  and `evaluate_witness_quorum` directly (not HTTP — RFC-ACDP-0015 §8
+  witness-cosignature verification is a pure library check): the pinned
+  wrong-key `wit-004` cosignature is rejected with
+  `InvalidWitnessCosignature` naming the actual signature-verification
+  failure, the paired `wit-001` golden verifies under the same witness
+  key as a positive control, and the rejected cosignature does not count
+  toward the N-witnessed quorum while the golden one does. `wit-*`
+  remains classified "non-HTTP fixture" by the HTTP replay harness — this
+  adds coverage beside it, not a reclassification.
+- **Strengthened registry-side fork-refusal tests** (`REG-2`):
+  `acdp-registry-core::witness`'s existing
+  `cosignature_over_wrong_root_is_rejected` and
+  `cosignature_beyond_current_head_is_rejected` previously asserted
+  only `matches!(err, AcdpError::InvalidWitnessCosignature(_))` — a
+  variant shared by the log-id mismatch, the beyond-head case, and every
+  §8 verification failure, so `cosignature_over_wrong_root_is_rejected`
+  could not tell a real root-mismatch rejection from an accidental
+  beyond-head one. Both tests now additionally assert on their own
+  distinct error MESSAGE wording (root_hash/checkpoint-mismatch vs.
+  "beyond this registry's current head"), and both now assert the store
+  holds zero cosignatures for the checkpoint tuple after the rejection —
+  the property that actually matters operationally, since a rejected
+  forged cosignature must never be stored or the aggregator could later
+  serve a bogus one. `cosignature_over_wrong_root_is_rejected`'s forged
+  root is now hardcoded to wit-002's own pinned root-rewrite vector
+  (`sha256:deadbeef00000000000000000000000000000000000000000000000000000000`
+  from `wit-002-consistency-refusal.json`) instead of an arbitrary byte
+  pattern. **Scope note:** `wit-002` describes a WITNESS's obligation (a
+  witness refuses to cosign a root-rewrite BEFORE signing and persists
+  evidence of the refusal). This repo is a REGISTRY, not a witness — it
+  never cosigns anything and structurally cannot exhibit that half of
+  wit-002's behavior. This change covers only the mirror-image defense
+  the registry DOES own: refusing to STORE/AGGREGATE a cosignature that
+  doesn't match its own recomputed root, pinned to wit-002's forged root
+  value. It is **not** a claim of wit-002 coverage.
+- **BREAKING: `registry.profiles` allowlist** (`REG-5`):
+  `main::validate_config` now refuses to boot if `registry.profiles`
+  contains anything other than the seven *registry* profiles the pinned
+  ACDP spec defines (`REGISTRY_ADVERTISABLE_PROFILES`, new in
+  `acdp-registry-types::config`: `acdp-registry-core`,
+  `acdp-registry-discovery`, `acdp-registry-federated`,
+  `acdp-registry-receipts`, `acdp-registry-head-receipts`,
+  `acdp-registry-transparency-log`, `acdp-registry-lifecycle`) — derived
+  by rule (every `profiles[].id` in the spec's `registries/profiles.json`
+  prefixed `acdp-registry-`), not hand-maintained, and checked by a new
+  conformance test against the pinned spec so a future spec change turns
+  CI red rather than drifting silently. The allowlist check runs BEFORE
+  the existing per-profile backing-config guards (receipts key,
+  head-receipts, lifecycle, transparency-log), so a typo is reported
+  before an unrelated missing-config complaint. `acdp-log-witness`
+  specifically is rejected with a dedicated message: a witness is not a
+  registry (RFC-ACDP-0015 §6.1) — a registry MAY aggregate cosignatures
+  under `acdp-registry-transparency-log` without ever advertising
+  `acdp-log-witness` itself. This is a breaking change for any deployment
+  that had an unknown or `acdp-log-witness` string in `registry.profiles`
+  — this repo's own shipped examples and tests (`config/
+  registry.example.toml`, `docker/config.docker.toml`, and every
+  in-repo test config) were audited and only ever set allowlisted
+  values, so none of them are affected.
 - **BREAKING** (`SEC-07`): `auth.anonymous_public_reads` now defaults
   to `false`, matching `CLAUDE.md`. Operators upgrading who rely on
   world-readable public contexts MUST set the field explicitly:

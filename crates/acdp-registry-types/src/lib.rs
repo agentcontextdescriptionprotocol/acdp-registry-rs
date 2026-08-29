@@ -13,7 +13,7 @@ pub use config::{
     AuthConfig, CorsConfig, LifecycleConfig, LimitsConfig, LogConfig, MetricsConfig,
     PlaygroundConfig, RateLimitConfig, ReceiptConfig, RegistryConfig, RegistrySection,
     RetiredReceiptKey, StorageBackend, StorageConfig, TenantAgentBinding, WebhookConfig,
-    WitnessConfig,
+    WitnessConfig, REGISTRY_ADVERTISABLE_PROFILES,
 };
 pub use error::RegistryError;
 pub use event::WebhookEvent;
