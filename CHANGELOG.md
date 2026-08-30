@@ -71,6 +71,45 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Bumped `acdp` 0.8.1 → 0.8.2** (`REG-3` Phase 2), pulling all twelve
+  `acdp-*` workspace crates in lockstep. This inherits `AnchorEntry`,
+  `PublishRequest::anchors`, `Body::anchors`, `validate_anchors`, and
+  anchors-in-preimage hashing (RFC-ACDP-0016) as plain library types — this
+  repo adds no local struct or validation code for them in this commit. The
+  crypto dependency graph moved with it, not just `acdp` itself: major
+  version bumps across `base16ct` (0.2→1.0), `crypto-bigint` (0.5→0.7),
+  `ecdsa` (0.16→0.17), `elliptic-curve` (0.13→0.14), `ff`, `group`, `p256`,
+  `primeorder`, `rfc6979`, `sec1`, plus new dependencies
+  `curve25519-dalek` 5.0, `ed25519-dalek` 3.0, `der`, `digest` 0.11,
+  `sha2` 0.11, and `signature` 3.0 (`hashbrown` 0.16 dropped). This repo's
+  own direct `ed25519-dalek = "2.2"` dev/runtime dependency
+  (`acdp-registry-auth`, `acdp-registry-server`) now coexists with `acdp`'s
+  transitive `ed25519-dalek` 3.0 as two separate major-version instances in
+  the graph; it previously relied on feature unification with `acdp`
+  0.8.1's own (then-matching) `ed25519-dalek 2.x` dependency to enable the
+  `rand_core` feature (`SigningKey::generate`), which the 0.8.2 bump broke
+  by moving `acdp`'s own dependency to `ed25519-dalek` 3.0. Fixed by moving
+  `acdp-registry-auth`'s `ed25519-dalek = "2.2"` dependency to
+  `[dev-dependencies]` with `features = ["rand_core"]` (its production use,
+  `jwt.rs`'s PEM decoding, never calls `generate`) rather than widening the
+  production feature set for a test-only need; `acdp-registry-server`'s own
+  `ed25519-dalek` dependency was already a dev-dependency and needed no
+  change beyond the explicit `rand_core` feature it already carried. Neither
+  fix bumps this repo's own dependency to 3.0 or pins `acdp` back — both are
+  manifest-only, no production source changed. `cargo deny check` stays green (advisories,
+  licenses, bans, sources all `ok`) with `deny.toml`'s `ignore = []`
+  unchanged; the expanded graph's ~30 new/duplicated transitive crates
+  (`base64`, `block-buffer`, `cmov`, `const-oid`, `cpubits`, `crypto-common`,
+  `ctutils`, `curve25519-dalek`, `der`, `digest`, `ed25519`, `ed25519-dalek`,
+  `fiat-crypto`, `hmac`, `hybrid-array`, `pkcs8`, `primefield`, `serdect`,
+  `sha2`, `signature`, `spki`, `wnaf`, plus a `lru` 0.16→0.18 bump not
+  previously called out) all license-clear under the existing allow-list and
+  raise no new advisory; `[bans] multiple-versions = "warn"` accepts the
+  resulting duplicate-major-version crates (including the `ed25519-dalek`
+  2.x/3.x split) as warnings, not failures. **This commit alone would let a
+  publish carry `anchors` with no version gate whatsoever** — it ships only
+  combined with the RFC-ACDP-0016 §10/§14 version gate (`REG-3` Phase 3) in
+  the same PR, and must not reach `main` on its own.
 - **Pinned conformance spec SHA bumped to `417211f6a13aeceef4db00eb67f98ed0ed13761b`**
   (`REG-3`) in `.github/workflows/ci.yml`. The only substantive delta since the
   prior pin is RFC-ACDP-0016's draft and its conformance pack (the new `anc-*`

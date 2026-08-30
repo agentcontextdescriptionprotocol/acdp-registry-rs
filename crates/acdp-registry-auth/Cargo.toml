@@ -27,5 +27,8 @@ tracing        = { workspace = true }
 uuid           = { workspace = true }
 sqlx           = { workspace = true }
 http           = "1"
-ed25519-dalek  = "2.2"
+ed25519-dalek  = { version = "2.2" }
 reqwest        = { workspace = true }
+
+[dev-dependencies]
+ed25519-dalek  = { version = "2.2", features = ["rand_core"] }

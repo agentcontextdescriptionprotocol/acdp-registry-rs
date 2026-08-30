@@ -5245,3 +5245,45 @@ async fn cosignature_for_other_tuple_is_not_served_on_current_checkpoint() {
         .expect("size-2 embedded checkpoint carries its cosignature");
     assert_eq!(sigs.len(), 1);
 }
+
+/// REG-3 Phase 2 compile-proof: `acdp` 0.8.2 inherits `AnchorEntry` /
+/// `PublishRequest::anchors` (RFC-ACDP-0016) as plain types, with no local
+/// struct or validation code in this repo. This test asserts nothing about
+/// registry *behavior* — there is deliberately no version gate yet (that is
+/// REG-3 Phase 3, landing in the same PR) — it exists solely to prove that
+/// a `PublishRequest` struct literal carrying `anchors: Some(vec![AnchorEntry
+/// { .. }])` compiles against the bumped `acdp` types. If this test stops
+/// compiling, the 0.8.1 -> 0.8.2 bump did not deliver what REG-3 assumes.
+#[test]
+fn publish_request_literal_with_anchors_compiles() {
+    use acdp::types::publish::PublishRequest;
+    use acdp::{AnchorEntry, ContentHash};
+
+    let base = producer(200)
+        .publish_request()
+        .title("anchors-compile-proof")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+
+    let anchor = AnchorEntry {
+        scheme: "macp.commitment".to_string(),
+        content_hash: ContentHash::parse(format!("sha256:{}", "a".repeat(64))).unwrap(),
+        uri: Some("https://example.test/commitments/1".to_string()),
+        extensions: Default::default(),
+    };
+
+    let req = PublishRequest {
+        anchors: Some(vec![anchor]),
+        ..base
+    };
+
+    let anchors = req.anchors.expect("anchors field survives the literal");
+    assert_eq!(anchors.len(), 1);
+    assert_eq!(anchors[0].scheme, "macp.commitment");
+    assert_eq!(
+        anchors[0].content_hash.as_str(),
+        format!("sha256:{}", "a".repeat(64))
+    );
+}
