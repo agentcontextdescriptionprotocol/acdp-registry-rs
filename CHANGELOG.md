@@ -310,15 +310,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the graph; it previously relied on feature unification with `acdp`
   0.8.1's own (then-matching) `ed25519-dalek 2.x` dependency to enable the
   `rand_core` feature (`SigningKey::generate`), which the 0.8.2 bump broke
-  by moving `acdp`'s own dependency to `ed25519-dalek` 3.0. Fixed by moving
-  `acdp-registry-auth`'s `ed25519-dalek = "2.2"` dependency to
-  `[dev-dependencies]` with `features = ["rand_core"]` (its production use,
-  `jwt.rs`'s PEM decoding, never calls `generate`) rather than widening the
-  production feature set for a test-only need; `acdp-registry-server`'s own
-  `ed25519-dalek` dependency was already a dev-dependency and needed no
-  change beyond the explicit `rand_core` feature it already carried. Neither
-  fix bumps this repo's own dependency to 3.0 or pins `acdp` back — both are
-  manifest-only, no production source changed. `cargo deny check` stays green (advisories,
+  by moving `acdp`'s own dependency to `ed25519-dalek` 3.0. Fixed by
+  splitting `acdp-registry-auth`'s `ed25519-dalek = "2.2"` dependency: kept
+  featureless under `[dependencies]` (its actual production use, `jwt.rs`'s
+  PEM decoding, never calls `generate`) and added a new
+  `[dev-dependencies] ed25519-dalek = { version = "2.2", features =
+  ["rand_core"] }` for tests that do call `generate` — rather than widening
+  the production feature set for a test-only need. `acdp-registry-server`'s
+  own `[dev-dependencies]` `ed25519-dalek` entry gains the same explicit
+  `rand_core` feature for the same reason (it did not carry the feature
+  before this commit; feature unification with `acdp`'s own then-2.x
+  dependency supplied it implicitly). Neither fix bumps this repo's own
+  dependency to 3.0 or pins `acdp` back — both are manifest-only, no
+  production source changed. `cargo deny check` stays green (advisories,
   licenses, bans, sources all `ok`) with `deny.toml`'s `ignore = []`
   unchanged; the expanded graph's ~30 new/duplicated transitive crates
   (`base64`, `block-buffer`, `cmov`, `const-oid`, `cpubits`, `crypto-common`,

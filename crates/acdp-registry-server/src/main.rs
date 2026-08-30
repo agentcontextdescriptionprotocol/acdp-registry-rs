@@ -227,16 +227,16 @@ fn validate_config(cfg: &RegistryConfig) -> anyhow::Result<()> {
     }
 
     // RFC-ACDP-0010 §7/§11: advertising `acdp-registry-receipts` is a hard
-    // commitment to ALWAYS mint and serve receipts (and to claim
-    // acdp_version >= 0.2.0). An operator who lists the profile in
-    // `registry.profiles` but configures no `[receipt]` key would advertise a
-    // capability the registry can't honor: `build_capabilities` keeps the
-    // 0.1.0 version claim, no signer is attached so no receipt is ever minted,
-    // and `/.well-known/did.json` 404s — yet capabilities still promise
-    // receipts, which consumers treat as a registry fault (§7, no degraded
-    // mode). Refuse the inconsistent config at startup rather than ship a
-    // false advertisement. (The reverse — a receipt key with the profile
-    // omitted — is safe: `with_receipt_signer` appends the profile itself.)
+    // commitment to ALWAYS mint and serve receipts. An operator who lists the
+    // profile in `registry.profiles` but configures no `[receipt]` key would
+    // advertise a capability the registry can't honor: no signer is attached
+    // so no receipt is ever minted, and `/.well-known/did.json` 404s — yet
+    // capabilities still promise receipts, which consumers treat as a
+    // registry fault (§7, no degraded mode). Refuse the inconsistent config
+    // at startup rather than ship a false advertisement. (The reverse — a
+    // receipt key with the profile omitted — is safe: `with_receipt_signer`
+    // appends the profile itself. `acdp_version` itself is unaffected either
+    // way — see `acdp_version_claim` below.)
     if cfg
         .registry
         .profiles
@@ -958,11 +958,13 @@ fn acdp_version_claim(cfg: &RegistryConfig) -> &'static str {
 
 fn build_capabilities(cfg: &RegistryConfig) -> CapabilitiesDocument {
     CapabilitiesDocument {
-        // Plan A4 / REG-3 Phase 4: the version claim is gated on what the
-        // deployment actually honors, exactly like the profiles (which the
-        // `with_*` builders append and version-gate). See
+        // Plan A4 / REG-3 Phase 4: each rung of the claim is gated on what
+        // the deployment actually honors, exactly like the profiles (which
+        // the `with_*` builders append and version-gate) — but the top-level
+        // anchors claim folded in by `acdp_version_claim` is unconditional,
+        // so this always advertises >= 0.5.0 regardless of config. See
         // `acdp_version_claim`'s doc comment for the full max()-over-claims
-        // design and why it now always advertises >= 0.5.0.
+        // design.
         acdp_version: acdp_version_claim(cfg).into(),
         registry_did: authority_to_did_web(&cfg.registry.authority),
         // Advertise exactly the set the registry actually verifies. Every

@@ -6,7 +6,7 @@
 
 Reference **registry** implementation for the
 [Agent Context Distribution Protocol](https://github.com/agentcontextdistributionprotocol/agentcontextdistributionprotocol)
-v0.1.0 through v0.4.0. Implements the `acdp-registry-core` and
+v0.1.0 through v0.5.0. Implements the `acdp-registry-core` and
 `acdp-registry-discovery` profiles on top of
 [`acdp`](https://github.com/agentcontextdistributionprotocol/acdp-rs) —
 plus, as the corresponding config sections are enabled: the ACDP 0.2.0
@@ -15,7 +15,10 @@ atomically-persisted publish receipts, RFC-ACDP-0010 — self-certifying
 `did:key` producers, and a self-hosted `/.well-known/did.json`,
 see [docs/RECEIPTS.md](docs/RECEIPTS.md)), the 0.3.0 lifecycle,
 transparency-log, and head-receipt profiles, and 0.4.0 witness cosignature
-aggregation (RFC-ACDP-0015).
+aggregation (RFC-ACDP-0015). Version-gated `anchors` acceptance
+(RFC-ACDP-0016, Draft) is unconditional — every deployment advertises
+`acdp_version >= 0.5.0` and accepts well-formed anchors on every publish,
+see [docs/HTTP-API.md](docs/HTTP-API.md).
 
 ## What you get
 

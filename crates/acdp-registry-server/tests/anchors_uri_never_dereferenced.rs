@@ -31,11 +31,14 @@ const EXPECTED_SEND_SITES: &[&str] = &[
     "crates/acdp-registry-core/src/witness.rs",
 ];
 
-/// This file's own path relative to the workspace root. The `.send()`
-/// literal is deliberately never spelled out verbatim in this file's own
-/// source (it's assembled by concatenation) so this exclusion is
-/// belt-and-braces, not load-bearing — kept in case a future edit to this
-/// file's own doc comments or assertions ever writes the literal out.
+/// This file's own path relative to the workspace root. This exclusion
+/// IS load-bearing: this file's own doc comments spell out `.send()`
+/// verbatim (see the module doc above), so without excluding `SELF_PATH`
+/// this test would match itself and fail. `contains_outbound_http_dispatch_call`
+/// checks the assembled-pattern form specifically so that *code* using the
+/// zero-argument dispatch idiom is what's being detected, not doc prose —
+/// but doc prose containing the same substring still matches, hence the
+/// exclusion.
 const SELF_PATH: &str = "crates/acdp-registry-server/tests/anchors_uri_never_dereferenced.rs";
 
 fn workspace_root() -> PathBuf {
