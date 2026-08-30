@@ -170,6 +170,21 @@ did:key producers (ACDP 0.2.0) are verified **offline** — no DID-document
 fetch — when `"did:key"` is in `supported_did_methods`; otherwise the publish
 is rejected with `key_resolution_failed` (400, permanent).
 
+`anchors` (RFC-ACDP-0016, still **Draft**) is an optional array of typed,
+content-addressed references from the body to external, non-ACDP artifacts.
+It follows the same absent-when-empty convention as every other optional
+array field — omit it entirely rather than sending `[]`. A publish carrying
+`anchors` is rejected with `schema_violation` (400) unless **both**: the
+registry's own advertised `acdp_version` (the value served at
+`GET /.well-known/acdp.json`) is `>= 0.5.0` (RFC-ACDP-0016 §10), **and** the
+request's own declared `acdp_version` is `>= 0.5.0` (RFC-ACDP-0016 §14; an
+absent `acdp_version` is treated as `0.1.0` and therefore also rejected).
+The check runs before signature verification and applies uniformly to every
+publish path (`did:key`, playground pinned-key, and the default `did:web`
+pipeline). Each anchor's `uri` is an advisory locator hint only — it is
+never dereferenced by any verification code path; the binding is each
+anchor's own `content_hash`, not `uri`.
+
 ### `GET /contexts/{ctx_id}`
 
 Retrieve a full context. Optional `Authorization: Bearer <jwt>` identifies the

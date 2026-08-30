@@ -5287,3 +5287,470 @@ fn publish_request_literal_with_anchors_compiles() {
         format!("sha256:{}", "a".repeat(64))
     );
 }
+
+// ─── REG-3 Phase 3: the RFC-ACDP-0016 §10 + §14 version gate ───
+
+use acdp::{AnchorEntry, ContentHash};
+
+/// A minimal, valid anchor entry for gate tests — the specific scheme/hash
+/// values are irrelevant to the version gate, which runs before any anchor
+/// content is inspected.
+fn gate_test_anchor() -> AnchorEntry {
+    AnchorEntry {
+        scheme: "macp.commitment".to_string(),
+        content_hash: ContentHash::parse(format!("sha256:{}", "b".repeat(64))).unwrap(),
+        uri: Some("https://example.test/commitments/gate".to_string()),
+        extensions: Default::default(),
+    }
+}
+
+/// 0.5.0 capabilities: the §10 half of the gate is satisfied by a registry
+/// built on this document. Mirrors `caps_030()`'s shape — did:key is
+/// advertised too so the same document doubles as the did:key gate test's
+/// fixture (plan §"Edge cases": the did:key path needs its own dedicated
+/// test proving the gate applies there, not just the default did:web path).
+fn caps_050() -> CapabilitiesDocument {
+    let mut c = caps();
+    c.acdp_version = "0.5.0".into();
+    c.supported_did_methods = vec!["did:web".into(), "did:key".into()];
+    c
+}
+
+/// Playground-on harness advertising `acdp_version: "0.5.0"` (the §10 half
+/// of the gate). did:key is enabled at the auth layer too, so this harness
+/// doubles as the did:key gate fixture.
+async fn harness_050(playground: bool) -> Harness {
+    let mut cfg = config(playground);
+    cfg.auth.did_methods = vec!["did:web".into(), "did:key".into()];
+    build_harness_with_caps(cfg, caps_050(), None).await
+}
+
+/// POST an arbitrary raw JSON `Value` to `/contexts` — for edge cases (a
+/// literal `null` anchors, an empty-array anchors) that the typed
+/// `RequestBuilder` cannot express directly.
+async fn publish_raw(app: &axum::Router, body: &Value) -> (StatusCode, Value) {
+    let bytes = serde_json::to_vec(body).unwrap();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/contexts")
+                .header("content-type", "application/json")
+                .body(Body::from(bytes))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let v = body_to_json(resp).await;
+    (status, v)
+}
+
+/// Acceptance criterion 1: registry advertising `0.1.0` + request declaring
+/// `0.5.0` + `anchors` present -> 400 `schema_violation`. The §10 (registry)
+/// half of the gate fires even though the §14 (request) half would pass on
+/// its own — proving §10 is independently enforced.
+#[tokio::test]
+async fn gate_rejects_when_registry_advertises_below_0_5_0() {
+    let h = harness(true).await; // default caps(): acdp_version "0.1.0"
+    let req = producer(210)
+        .publish_request()
+        .title("registry below 0.5.0")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .acdp_version("0.5.0")
+        .anchors(vec![gate_test_anchor()])
+        .build()
+        .unwrap();
+    let (status, v) = publish(&h.router, &req, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {v}");
+    assert_eq!(v["error"]["code"], "schema_violation");
+    let msg = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("\u{a7}10") && msg.contains("0.1.0"),
+        "message should name the failed §10 predicate: {msg}"
+    );
+}
+
+/// Acceptance criterion 2: registry advertising `0.5.0` + request declaring
+/// `0.1.0` + `anchors` present -> 400 `schema_violation`. The §14
+/// (declared-version) half fires on its own even though §10 passes —
+/// proving §14 is independently enforced, not just implied by §10.
+#[tokio::test]
+async fn gate_rejects_when_request_declares_below_0_5_0() {
+    let h = harness_050(true).await; // caps_050(): acdp_version "0.5.0"
+    let req = producer(211)
+        .publish_request()
+        .title("request below 0.5.0")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .acdp_version("0.1.0")
+        .anchors(vec![gate_test_anchor()])
+        .build()
+        .unwrap();
+    let (status, v) = publish(&h.router, &req, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {v}");
+    assert_eq!(v["error"]["code"], "schema_violation");
+    let msg = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("\u{a7}14") && msg.contains("0.1.0"),
+        "message should name the failed §14 predicate: {msg}"
+    );
+}
+
+/// Acceptance criterion 3: registry advertising `0.5.0` + request
+/// **omitting** `acdp_version` + `anchors` present -> 400 `schema_violation`.
+/// VERSIONING.md: absent body version => `0.1.0`, so an omitted field must
+/// reject exactly like an explicit `"0.1.0"` (criterion 2) — not pass.
+#[tokio::test]
+async fn gate_rejects_when_request_omits_acdp_version() {
+    let h = harness_050(true).await;
+    let req = producer(212)
+        .publish_request()
+        .title("request omits acdp_version")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .omit_acdp_version()
+        .anchors(vec![gate_test_anchor()])
+        .build()
+        .unwrap();
+    assert!(
+        req.acdp_version.is_none(),
+        "sanity: builder actually omitted the field"
+    );
+    let (status, v) = publish(&h.router, &req, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {v}");
+    assert_eq!(v["error"]["code"], "schema_violation");
+    let msg = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("\u{a7}14") && msg.contains("0.1.0"),
+        "absent acdp_version must be treated as 0.1.0: {msg}"
+    );
+}
+
+/// Acceptance criterion 4: registry advertising `0.5.0` + request declaring
+/// `0.5.0` + `anchors` present -> success. Both halves of the gate pass and
+/// the publish proceeds through the full pipeline.
+#[tokio::test]
+async fn gate_accepts_when_both_registry_and_request_are_0_5_0() {
+    let h = harness_050(true).await;
+    let req = producer(213)
+        .publish_request()
+        .title("both at 0.5.0")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .acdp_version("0.5.0")
+        .anchors(vec![gate_test_anchor()])
+        .build()
+        .unwrap();
+    let (status, v) = publish(&h.router, &req, None).await;
+    assert_eq!(status, StatusCode::OK, "body = {v}");
+    assert!(v["ctx_id"].as_str().is_some_and(|s| !s.is_empty()));
+}
+
+/// Acceptance criterion 6: the comparison is `>=`, not `==` — a registry
+/// advertising `0.6.0` and a request declaring `1.0.0` must both clear the
+/// gate.
+#[tokio::test]
+async fn gate_accepts_higher_versions_not_just_exact_0_5_0() {
+    let mut caps = caps_050();
+    caps.acdp_version = "0.6.0".into();
+    let mut cfg = config(true);
+    cfg.auth.did_methods = vec!["did:web".into(), "did:key".into()];
+    let h = build_harness_with_caps(cfg, caps, None).await;
+
+    let req = producer(214)
+        .publish_request()
+        .title("higher than 0.5.0 both sides")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .acdp_version("1.0.0")
+        .anchors(vec![gate_test_anchor()])
+        .build()
+        .unwrap();
+    let (status, v) = publish(&h.router, &req, None).await;
+    assert_eq!(status, StatusCode::OK, "body = {v}");
+}
+
+/// Acceptance criterion 5 (the single most important negative test): a
+/// publish that omits `anchors` entirely must be completely unaffected by
+/// the gate, at any advertised or declared version — including a registry
+/// that already advertises `0.5.0`. A bug here would break every existing
+/// deployment, since no producer in the wild sets `anchors` yet.
+#[tokio::test]
+async fn gate_leaves_anchors_absent_publishes_unaffected() {
+    // Sub-0.5.0 registry, default (0.4.0-explicit) declared version, no anchors.
+    let h01 = harness(true).await;
+    let req01 = producer(215)
+        .publish_request()
+        .title("no anchors on 0.1.0 registry")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    assert!(req01.anchors.is_none());
+    let (status, v) = publish(&h01.router, &req01, None).await;
+    assert_eq!(status, StatusCode::OK, "body = {v}");
+
+    // 0.5.0 registry, explicit 0.5.0 declared version, no anchors.
+    let h05 = harness_050(true).await;
+    let req05 = producer(216)
+        .publish_request()
+        .title("no anchors on 0.5.0 registry")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .acdp_version("0.5.0")
+        .build()
+        .unwrap();
+    assert!(req05.anchors.is_none());
+    let (status, v) = publish(&h05.router, &req05, None).await;
+    assert_eq!(status, StatusCode::OK, "body = {v}");
+
+    // 0.5.0 registry, request declares 0.1.0 (would fail the gate if
+    // anchors were present, per criterion 2) — but with anchors absent
+    // the gate must never even look at the declared version.
+    let req_low = producer(217)
+        .publish_request()
+        .title("no anchors, low declared version, 0.5.0 registry")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .acdp_version("0.1.0")
+        .build()
+        .unwrap();
+    assert!(req_low.anchors.is_none());
+    let (status, v) = publish(&h05.router, &req_low, None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "anchors-absent publish must be unaffected by declared version: {v}"
+    );
+}
+
+/// Acceptance criterion 7: the did:key publish branch (`publish_inner`'s
+/// `starts_with("did:key:")` arm, checked BEFORE the playground gate) is
+/// subject to the same version gate as the default did:web path — the gate
+/// sits above the branch. Exercises both the reject and accept sides
+/// through this specific branch so a gate that only guards did:web would be
+/// caught here.
+#[tokio::test]
+async fn gate_applies_to_did_key_publish_path() {
+    let h = harness_050(false).await; // production path (playground off)
+
+    // Reject side: registry advertises 0.5.0, but the did:key request
+    // declares 0.1.0 -> the §14 half must still fire on this branch.
+    let reject_req = did_key_producer(218)
+        .publish_request()
+        .title("did:key below 0.5.0")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .acdp_version("0.1.0")
+        .anchors(vec![gate_test_anchor()])
+        .build()
+        .unwrap();
+    let (status, v) = publish(&h.router, &reject_req, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {v}");
+    assert_eq!(v["error"]["code"], "schema_violation");
+
+    // Accept side: both halves at 0.5.0 -> the did:key pipeline (pure
+    // offline verification) runs and the publish succeeds.
+    let accept_req = did_key_producer(219)
+        .publish_request()
+        .title("did:key at 0.5.0")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .acdp_version("0.5.0")
+        .anchors(vec![gate_test_anchor()])
+        .build()
+        .unwrap();
+    let (status, v) = publish(&h.router, &accept_req, None).await;
+    assert_eq!(status, StatusCode::OK, "body = {v}");
+}
+
+/// Edge case: `anchors: []` on a sub-0.5.0 registry. Two rules could fire —
+/// this gate (§10) and the SDK's own empty-vec rejection (`validate_anchors`,
+/// the absent-when-empty convention) — and both produce `schema_violation`/
+/// 400, so the HTTP-visible outcome is identical either way. This test pins
+/// *which* fires first: the version gate runs at the very top of
+/// `publish_inner`, before the SDK validator ever sees the body, so the
+/// error message must be this gate's own wording, not the SDK's "anchors
+/// MUST be omitted entirely" message.
+#[tokio::test]
+async fn gate_fires_before_sdk_empty_vec_check_on_sub_0_5_0_registry() {
+    use acdp::types::publish::PublishRequest;
+
+    let h = harness(true).await; // 0.1.0 registry
+                                 // The typed `RequestBuilder::build()` itself refuses an empty `anchors`
+                                 // vec (it runs the SDK's own `validate_publish_request` before
+                                 // returning), so an empty-but-present anchors array has to be
+                                 // constructed via a patched struct literal instead — same technique as
+                                 // the Phase 2 `publish_request_literal_with_anchors_compiles` compile
+                                 // proof above. The resulting content_hash no longer matches the patched
+                                 // body, but that's irrelevant here: this is a reject-path test and the
+                                 // version gate returns before hash recomputation is ever reached.
+    let base = producer(220)
+        .publish_request()
+        .title("empty anchors, sub-0.5.0 registry")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let req = PublishRequest {
+        anchors: Some(vec![]),
+        ..base
+    };
+    let (status, v) = publish(&h.router, &req, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {v}");
+    assert_eq!(v["error"]["code"], "schema_violation");
+    let msg = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("\u{a7}10"),
+        "the version gate, not the SDK's empty-vec check, must fire first: {msg}"
+    );
+    assert!(
+        !msg.contains("MUST be omitted entirely"),
+        "the SDK's empty-vec message must not be the one surfaced here: {msg}"
+    );
+}
+
+/// Companion to the above: once BOTH halves of the version gate pass,
+/// `anchors: []` must still be rejected — by the SDK's own downstream
+/// validator this time. Confirms the version gate doesn't swallow or
+/// bypass that separate, pre-existing MUST.
+#[tokio::test]
+async fn empty_anchors_still_rejected_downstream_once_gate_passes() {
+    use acdp::types::publish::PublishRequest;
+
+    let h = harness_050(true).await;
+    // See the comment in `gate_fires_before_sdk_empty_vec_check_on_sub_0_5_0_registry`:
+    // `.anchors(vec![])` cannot survive `RequestBuilder::build()`, so patch
+    // it onto an already-built request. `validate_publish_request` (which
+    // runs `validate_anchors`) executes before hash recomputation inside
+    // `validate_post_schema`, so the empty-vec rejection fires before the
+    // now-mismatched content_hash would ever be checked.
+    let base = producer(221)
+        .publish_request()
+        .title("empty anchors, both sides at 0.5.0")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .acdp_version("0.5.0")
+        .build()
+        .unwrap();
+    let req = PublishRequest {
+        anchors: Some(vec![]),
+        ..base
+    };
+    let (status, v) = publish(&h.router, &req, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {v}");
+    assert_eq!(v["error"]["code"], "schema_violation");
+    let msg = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("MUST be omitted entirely"),
+        "once the gate passes, the SDK's own empty-vec check must fire: {msg}"
+    );
+}
+
+/// Edge case: `anchors: null` is rejected at *deserialize* time by
+/// `de_present` — before this gate (or anything else in `publish_inner`)
+/// ever runs. Not a duplicate of that helper's own tests: this pins that
+/// the wire-level outcome through the real router stays `schema_violation`/
+/// 400, i.e. that nothing in this phase's gate changed that pre-existing
+/// behavior.
+#[tokio::test]
+async fn anchors_null_still_rejected_at_deserialize_before_gate_runs() {
+    let h = harness_050(true).await; // even on a 0.5.0 registry...
+    let req = producer(222)
+        .publish_request()
+        .title("null anchors")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .acdp_version("0.5.0")
+        .build()
+        .unwrap();
+    let mut raw = serde_json::to_value(&req).unwrap();
+    raw["anchors"] = Value::Null;
+    let (status, v) = publish_raw(&h.router, &raw).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {v}");
+    assert_eq!(v["error"]["code"], "schema_violation");
+}
+
+/// §10 gates *publish* only. A body stored while the registry advertised
+/// `0.5.0` must still be served byte-exactly on retrieve even if the
+/// registry is later "downgraded" to a lower advertised version — dropping
+/// a signed field (or any byte) on read would break the content hash, and
+/// the RFC text is explicit that the MUST is a publish-time rejection, not
+/// a read-time filter.
+#[tokio::test]
+async fn retrieve_path_is_not_gated_and_serves_anchors_byte_exact_after_downgrade() {
+    let h = harness_050(true).await;
+    let req = producer(223)
+        .publish_request()
+        .title("retrieve unaffected by later downgrade")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .acdp_version("0.5.0")
+        .anchors(vec![gate_test_anchor()])
+        .build()
+        .unwrap();
+    let (status, v) = publish(&h.router, &req, None).await;
+    assert_eq!(status, StatusCode::OK, "publish body = {v}");
+    let ctx_id = v["ctx_id"].as_str().unwrap().to_string();
+
+    async fn body_bytes(app: &axum::Router, ctx_id: &str) -> Vec<u8> {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/contexts/{}/body",
+                        pct_encode_path_segment(ctx_id)
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        resp.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec()
+    }
+
+    let bytes_before = body_bytes(&h.router, &ctx_id).await;
+    let before: Value = serde_json::from_slice(&bytes_before).unwrap();
+    assert!(
+        before["anchors"].is_array() && !before["anchors"].as_array().unwrap().is_empty(),
+        "sanity: the stored body actually carries anchors: {before}"
+    );
+
+    // Open a second router over the SAME underlying SQLite file, but built
+    // with a "downgraded" capabilities document (below 0.5.0) — simulating
+    // an operator rolling the registry's advertised version back after the
+    // anchors-carrying context was already published.
+    let downgraded_store = SqliteStore::connect(h.db_path(), 1).await.unwrap();
+    let downgraded_server =
+        Arc::new(RegistryServer::try_new(downgraded_store, caps(), AUTHORITY).unwrap());
+    let challenges: Arc<dyn ChallengeStore> = Arc::new(InMemoryChallengeStore::new());
+    let secret = JwtSecret::from_bytes(&[42u8; 32]);
+    let signer = JwtSigner::new(secret, format!("did:web:{AUTHORITY}"), AUTHORITY.into(), 30);
+    let resolver = Arc::new(WebResolver::new());
+    let auth = Arc::new(AuthService::new(
+        AuthConfig::default(),
+        challenges,
+        signer,
+        resolver,
+        AUTHORITY.into(),
+    ));
+    let downgraded_state = AppStateInner::new(downgraded_server, auth, None, config(true), None);
+    let downgraded_router = build_router(downgraded_state);
+
+    let bytes_after = body_bytes(&downgraded_router, &ctx_id).await;
+    assert_eq!(
+        bytes_before, bytes_after,
+        "read path must serve the stored body byte-exactly regardless of the \
+         registry's currently-advertised acdp_version"
+    );
+}

@@ -8,6 +8,45 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **RFC-ACDP-0016 §10/§14 version gate** (`REG-3` Phase 3). RFC-ACDP-0016
+  (typed external `anchors`) is still **Draft**, not Final — this repo
+  implements the two MUST-reject rules the spec defines for that field
+  while the rest of the RFC remains a plain-library-type pass-through (see
+  the Phase 2 `acdp` 0.8.1 → 0.8.2 bump below). A publish request carrying
+  `anchors` is now rejected with `schema_violation` / HTTP 400 unless
+  **both**: (§10) the registry's own **advertised** `acdp_version` — the
+  exact string served at `GET /.well-known/acdp.json` — is `>= 0.5.0`, and
+  (§14) the request's own **declared** `body.acdp_version` is `>= 0.5.0`
+  (absent ⇒ `0.1.0` per `VERSIONING.md`'s layers table, so an omitted
+  field is rejected exactly like an explicit `"0.1.0"`). The check runs in
+  `publish_inner` (`crates/acdp-registry-core/src/handlers/context.rs`)
+  immediately after the request body deserializes and before the per-agent
+  rate limiter, so a version-rejected publish never consumes a producer's
+  publish budget, and it sits above the `did:key` / playground-pinned /
+  test-only / default `did:web` branch, covering all four publish paths
+  with one gate. No new error variant or wire code was minted — both
+  predicates reuse the existing `RegistryError::Acdp(AcdpError::SchemaViolation(..))`
+  → `schema_violation` / 400 idiom, with the rejection message naming which
+  of the two predicates failed. A private `version_at_least(v, major, minor)`
+  helper (with its own unit tests, including the numeric-vs-lexical
+  `"0.10.0" >= 0.5.0` case) is reimplemented in `context.rs` rather than
+  reusing `acdp-validation`'s own version of the same name, which is
+  private and not re-exported by the `acdp` facade crate; it fails closed
+  on any version string that isn't plain `MAJOR.MINOR.PATCH`. `anchors: []`
+  on a sub-0.5.0 registry is caught by this gate before the SDK's own
+  empty-vec rejection ever runs (both produce the same wire outcome, but
+  this gate fires first); `anchors: null` continues to be rejected at
+  deserialize time, unrelated to this gate. The read path
+  (`GET /contexts/{ctx_id}`, `/body`) is untouched — §10 gates publish
+  only, and a body stored while the registry advertised `0.5.0` is served
+  byte-exactly even if the registry's advertised version later changes.
+  This phase does **not** make `acdp_version: "0.5.0"` reachable from any
+  shipped configuration — the gate is exercised only via
+  `crates/acdp-registry-server/tests/http_integration.rs`'s explicit
+  `CapabilitiesDocument` override harness (`caps_050()`); making 0.5.0
+  actually reachable in production config is a separate, later, one-way-door
+  change.
+
 - **JWT revocation** (`SEC-01`, `FEAT-02`): new `RevocationStore` trait with
   in-memory, SQLite, and Postgres backends; `issued_tokens` migrations
   (Sqlite 006, Postgres 005); `AuthService::issue_token` records every
