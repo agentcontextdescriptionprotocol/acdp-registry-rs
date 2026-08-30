@@ -45,6 +45,12 @@ storage-memory = []
 playground     = ["acdp-registry-core/playground"]
 
 [dev-dependencies]
+# REG-3 Phase 6: `SsrfPolicy::allow_test_loopback()` is gated behind
+# `test-transport` (same idiom `acdp-registry-webhook`'s own dev-dependency
+# uses) so the loopback-permissive policy used by
+# `anchors_uri_never_dereferenced_publish_and_retrieve` (http_integration.rs)
+# is only reachable from test builds, never from the production binary.
+acdp           = { workspace = true, features = ["test-transport"] }
 http-body-util = "0.1"
 hex            = { workspace = true }
 serde          = { workspace = true }

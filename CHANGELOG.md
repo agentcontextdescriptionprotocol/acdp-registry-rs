@@ -8,6 +8,40 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Behavioral and structural proof that `anchors[].uri` is never
+  dereferenced** (`REG-3` Phase 6). Proves RFC-ACDP-0016 §6's NORMATIVE
+  rule — stricter than the DataRef SSRF posture — that "there is no code
+  path in core verification that ever reads `anchors[].uri`". Two tests,
+  because neither alone is sufficient:
+  `anchors_uri_never_dereferenced_publish_and_retrieve`
+  (`crates/acdp-registry-server/tests/http_integration.rs`) binds a
+  loopback `TcpListener`, publishes a context whose `anchors[0].uri`
+  targets it, retrieves the context back, and asserts (after a bounded
+  drain window, not an immediate check) that the listener observed **zero**
+  connections at every point — while webhook delivery (the one subsystem
+  near the publish path that *does* make a real outbound call) is
+  deliberately wired live against a *second*, independent listener, so
+  "zero" is a discriminating claim rather than an artifact of a harness
+  that makes no outbound calls at all. The SSRF guard is configured with
+  `SsrfPolicy::allow_test_loopback()` throughout so the guard is provably
+  not what keeps the anchor listener silent — the claim under test is
+  "nothing attempts the connection," not "a guard blocked it."
+  `crates/acdp-registry-server/tests/anchors_uri_never_dereferenced.rs`
+  adds the structural half: it enumerates every outbound-HTTP call site in
+  the whole `crates/` tree (scoped to the zero-argument HTTP-client dispatch
+  idiom, which cannot collide with channel `.send(msg)` calls that always
+  take an argument) and asserts the set is *exactly* the three audited,
+  legitimate ones (`acdp-registry-webhook/src/lib.rs`,
+  `acdp-registry-auth/src/revocation_poller.rs`,
+  `acdp-registry-core/src/witness.rs`) — failing loudly if a fourth ever
+  appears — and that none of those three files mentions "anchor" in any
+  form. Both live mutation checks were performed and confirmed: temporarily
+  adding a throwaway fetch of `anchors[0].uri` to the publish path turned
+  the behavioral test red (`left: 1, right: 0` on the zero-connections
+  assertion); temporarily corrupting the structural test's expected-file
+  set turned both structural assertions red with a clear drift diff. Both
+  mutations were reverted before landing.
+
 - **Byte-exact `anchors` round-trip proof, both storage backends** (`REG-3`
   Phase 5). Proves RFC-ACDP-0016 §5's normative requirement and anc-001's
   stated post-publish invariant: `anchors` survives publish → store →

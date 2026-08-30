@@ -189,6 +189,22 @@ async fn build_harness_with_caps(
     caps: CapabilitiesDocument,
     cross_registry: Option<Arc<acdp::client::CrossRegistryResolver>>,
 ) -> Harness {
+    build_harness_with_webhook(cfg, caps, cross_registry, None).await
+}
+
+/// Like [`build_harness_with_caps`] but lets the caller wire a real,
+/// already-spawned `WebhookEmitter` instead of always disabling webhook
+/// delivery. REG-3 Phase 6 (`plans/reg3-anchors.md`) needs this: proving
+/// `anchors[].uri` is never dereferenced is only meaningful if the one
+/// subsystem that *does* make outbound HTTP calls near the publish path
+/// (webhook delivery) is actually live during the test, rather than off
+/// (the harness default via [`harness`]/[`harness_from_config`]).
+async fn build_harness_with_webhook(
+    cfg: RegistryConfig,
+    caps: CapabilitiesDocument,
+    cross_registry: Option<Arc<acdp::client::CrossRegistryResolver>>,
+    webhook: Option<acdp_registry_webhook::WebhookEmitter>,
+) -> Harness {
     let db = tempfile::Builder::new()
         .prefix("acdp-test-")
         .suffix(".sqlite")
@@ -240,7 +256,7 @@ async fn build_harness_with_caps(
         resolver,
         AUTHORITY.into(),
     ));
-    let state = AppStateInner::new(server, auth, None, cfg, cross_registry);
+    let state = AppStateInner::new(server, auth, webhook, cfg, cross_registry);
     Harness {
         router: build_router(state),
         db,
@@ -6066,5 +6082,161 @@ async fn anchors_two_entries_preserve_order_sqlite() {
         "second anchor must stay second — a 'helpful' sort would silently reorder this \
          (its scheme sorts alphabetically BEFORE the first anchor's, so an ascending sort \
          would actually move it and get caught here)"
+    );
+}
+
+// ─── REG-3 Phase 6: RFC-ACDP-0016 §6 — `anchors[].uri` is never dereferenced ───
+//
+// Behavioral half. The companion structural ratchet
+// (`crates/acdp-registry-server/tests/anchors_uri_never_dereferenced.rs`)
+// enumerates every outbound-HTTP call site in the workspace and pins the
+// set to exactly the three legitimate ones — this test instead proves the
+// specific publish/retrieve path never dials `anchors[0].uri`, with the
+// webhook subsystem (the one thing near the publish path that *does* make
+// a real outbound call) live at the same time, so "zero connections on the
+// anchor listener" is a discriminating claim rather than an artifact of a
+// harness that makes no outbound calls at all.
+
+/// Accepts connections on `listener` until it is dropped, bumping `conns`
+/// for every one accepted and replying `200 OK` so a real client on the
+/// other end (the webhook worker, below) completes a delivery attempt
+/// instead of retrying against a socket that never answers. Mirrors the
+/// accept-loop idiom in `acdp-registry-webhook/src/lib.rs`'s own test
+/// module (`respond_with_statuses`).
+async fn count_connections_and_reply_ok(
+    listener: tokio::net::TcpListener,
+    conns: Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        conns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut buf = [0u8; 1024];
+        let _ = socket.read(&mut buf).await;
+        let _ = socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await;
+    }
+}
+
+/// Acceptance criteria 1-3: publish a context whose `anchors[0].uri` targets
+/// a live loopback listener, retrieve it back, and assert the listener
+/// observed zero connections at every point — while webhook delivery
+/// (pointed at a *second*, independent loopback listener) is live and
+/// actually fires, proving this isn't a vacuous "nothing makes outbound
+/// calls at all" harness.
+///
+/// CRITICAL (acceptance criterion 3): both the webhook target and the SSRF
+/// guard itself are configured with `SsrfPolicy::allow_test_loopback()`, so
+/// the guard is provably *not* what keeps the anchor listener silent. The
+/// claim under test is "nothing attempts the connection" — not "a guard
+/// blocked it". A test that only passed because the strict default guard
+/// rejects loopback URIs would keep passing even after someone wired a real
+/// anchor fetch behind a policy that allow-lists the target host.
+#[tokio::test]
+async fn anchors_uri_never_dereferenced_publish_and_retrieve() {
+    let anchor_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind anchor listener");
+    let anchor_port = anchor_listener.local_addr().expect("addr").port();
+    let anchor_conns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    tokio::spawn(count_connections_and_reply_ok(
+        anchor_listener,
+        anchor_conns.clone(),
+    ));
+
+    // Deliberately a *different* listener from the anchor target above, so
+    // a webhook delivery connection can never be mistaken for (or mask) a
+    // connection to the anchor listener.
+    let webhook_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind webhook listener");
+    let webhook_addr = webhook_listener.local_addr().expect("addr");
+    let webhook_conns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    tokio::spawn(count_connections_and_reply_ok(
+        webhook_listener,
+        webhook_conns.clone(),
+    ));
+
+    let mut cfg = config(true);
+    cfg.webhook = WebhookConfig {
+        enabled: true,
+        url: format!("http://{webhook_addr}/hook"),
+        secret: "phase6-webhook-secret".into(),
+        ..WebhookConfig::default()
+    };
+    // See the CRITICAL note on the test doc comment: the guard is opened up
+    // on purpose. This harness's webhook target is a loopback address the
+    // strict default `SsrfPolicy` would reject outright, so leaving the
+    // guard strict here would make the *guard* the reason nothing reaches
+    // the anchor listener either, defeating the point of this test.
+    let webhook = acdp_registry_webhook::WebhookEmitter::spawn_with_policy(
+        cfg.webhook.clone(),
+        acdp::safe_http::SsrfPolicy::allow_test_loopback(),
+    );
+    let h = build_harness_with_webhook(cfg, caps_050(), None, Some(webhook)).await;
+
+    let anchor = AnchorEntry {
+        scheme: "macp.commitment".to_string(),
+        content_hash: ContentHash::parse(format!("sha256:{}", "c".repeat(64))).unwrap(),
+        uri: Some(format!("http://127.0.0.1:{anchor_port}/anchor")),
+        extensions: Default::default(),
+    };
+    let req = producer(240)
+        .publish_request()
+        .title("anchors uri never dereferenced")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .acdp_version("0.5.0")
+        .anchors(vec![anchor])
+        .build()
+        .unwrap();
+
+    // Criterion 1: publish returns 200, and — after a bounded drain window,
+    // not an immediate check — the anchor listener saw nothing.
+    let (status, v) = publish(&h.router, &req, None).await;
+    assert_eq!(status, StatusCode::OK, "publish body = {v}");
+    let ctx_id = v["ctx_id"].as_str().unwrap().to_string();
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        anchor_conns.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "publish must not have dialed anchors[0].uri"
+    );
+
+    // Criterion 2: retrieve returns 200 with anchors[0].uri intact, and the
+    // anchor listener is still silent.
+    let (status, full) = get_json(
+        &h.router,
+        &format!("/contexts/{}", pct_encode_path_segment(&ctx_id)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{full}");
+    assert_eq!(
+        full["body"]["anchors"][0]["uri"],
+        format!("http://127.0.0.1:{anchor_port}/anchor"),
+        "anchors[0].uri must be served back intact: {full}"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        anchor_conns.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "retrieve must not have dialed anchors[0].uri either"
+    );
+
+    // Sanity check that this harness genuinely exercises a live
+    // outbound-HTTP subsystem near the publish path (webhook delivery) —
+    // without this, "anchor_conns == 0" would be equally true of a
+    // harness that makes no outbound calls whatsoever, which would prove
+    // nothing about anchors specifically.
+    assert!(
+        webhook_conns.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "sanity: webhook delivery should have reached webhook_listener at least once — if it \
+         didn't, this test isn't exercising a live outbound-HTTP subsystem and the \
+         anchor_conns == 0 assertions above would hold even for a broken harness"
     );
 }

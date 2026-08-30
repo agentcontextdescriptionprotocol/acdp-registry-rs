@@ -189,7 +189,8 @@ The check runs before signature verification and applies uniformly to every
 publish path (`did:key`, playground pinned-key, and the default `did:web`
 pipeline). Each anchor's `uri` is an advisory locator hint only — it is
 never dereferenced by any verification code path; the binding is each
-anchor's own `content_hash`, not `uri`.
+anchor's own `content_hash`, not `uri`. `uri` is stored and re-served
+verbatim and is never dereferenced by this registry.
 
 ### `GET /contexts/{ctx_id}`
 
