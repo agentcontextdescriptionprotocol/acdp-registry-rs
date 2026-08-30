@@ -845,10 +845,12 @@ impl PlaygroundConfig {
 ///
 /// When a signing key is configured the registry mints a signed receipt
 /// for every publish, persists it atomically with the context row, and
-/// advertises `acdp_version: 0.2.0` plus the `acdp-registry-receipts`
-/// profile. When NO key is configured neither is advertised — a registry
-/// without a signing key must not claim the profile (RFC-ACDP-0010 §7:
-/// no degraded mode).
+/// advertises the `acdp-registry-receipts` profile. When NO key is
+/// configured the profile is not advertised — a registry without a
+/// signing key must not claim it (RFC-ACDP-0010 §7: no degraded mode).
+/// (`acdp_version` itself is a separate, flat advertisement — see
+/// `acdp_version_claim` in `acdp-registry-server`'s `main.rs` — and since
+/// REG-3 always reads `>= "0.5.0"` regardless of this config.)
 ///
 /// The key is an Ed25519 seed supplied through exactly one of two
 /// sources, mirroring the "file / env seed" split used for JWT secrets:

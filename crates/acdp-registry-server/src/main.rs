@@ -227,16 +227,16 @@ fn validate_config(cfg: &RegistryConfig) -> anyhow::Result<()> {
     }
 
     // RFC-ACDP-0010 §7/§11: advertising `acdp-registry-receipts` is a hard
-    // commitment to ALWAYS mint and serve receipts (and to claim
-    // acdp_version >= 0.2.0). An operator who lists the profile in
-    // `registry.profiles` but configures no `[receipt]` key would advertise a
-    // capability the registry can't honor: `build_capabilities` keeps the
-    // 0.1.0 version claim, no signer is attached so no receipt is ever minted,
-    // and `/.well-known/did.json` 404s — yet capabilities still promise
-    // receipts, which consumers treat as a registry fault (§7, no degraded
-    // mode). Refuse the inconsistent config at startup rather than ship a
-    // false advertisement. (The reverse — a receipt key with the profile
-    // omitted — is safe: `with_receipt_signer` appends the profile itself.)
+    // commitment to ALWAYS mint and serve receipts. An operator who lists the
+    // profile in `registry.profiles` but configures no `[receipt]` key would
+    // advertise a capability the registry can't honor: no signer is attached
+    // so no receipt is ever minted, and `/.well-known/did.json` 404s — yet
+    // capabilities still promise receipts, which consumers treat as a
+    // registry fault (§7, no degraded mode). Refuse the inconsistent config
+    // at startup rather than ship a false advertisement. (The reverse — a
+    // receipt key with the profile omitted — is safe: `with_receipt_signer`
+    // appends the profile itself. `acdp_version` itself is unaffected either
+    // way — see `acdp_version_claim` below.)
     if cfg
         .registry
         .profiles
@@ -844,37 +844,128 @@ fn spawn_shutdown_watcher(handle: axum_server::Handle<SocketAddr>) {
     });
 }
 
+/// REG-3 Phase 4: the registry's independent, order-independent
+/// per-feature `acdp_version` claims — replacing the four-rung ordered
+/// if/else ladder that predated this phase, per OQ2's own recorded
+/// follow-up (`DECISIONS.md`, 2026-08-29 entry for
+/// `plans/reg2-reg5-reg6-reg8-reg9-wave4.md`'s OQ2): *"if a 5th
+/// acdp_version rung is ever added, consider replacing the ordered
+/// if/else ladder with an order-independent max() over per-feature
+/// version claims"*. REG-3 (RFC-ACDP-0016 anchors) is that 5th rung, so
+/// this phase discharges that follow-up rather than superseding OQ2's
+/// decision — OQ2's conditional 0.4.0-ahead-of-0.3.0 ordering is
+/// unchanged; it is simply re-expressed as one candidate claim among
+/// several.
+///
+/// Each list entry stands entirely on its own predicate: deleting any
+/// one claim only changes which OTHER still-applicable claim `max()`
+/// picks next; it can never change whether a REMAINING claim's own
+/// predicate fires. The base floor (`(1, "0.1.0")`) is always
+/// applicable, so this list — and therefore `max_by_key` in
+/// `ladder_rung_claim` / `acdp_version_claim` below — is never empty.
+fn ladder_claims(cfg: &RegistryConfig) -> Vec<(u32, &'static str)> {
+    [
+        // RFC-ACDP-0015 §6.1: witness-cosignature aggregation is a
+        // 0.4.0 wire member (`witness_signatures`); a deployment that
+        // aggregates witnesses claims 0.4.0 — under-claiming 0.3.0 here
+        // would serve a 0.4.0 wire member under a 0.3.0 banner. Gated on
+        // `!cfg.witnesses.is_empty()` rather than `cfg.log.enabled`:
+        // `validate_config` refuses startup when witnesses are
+        // configured without `log.enabled` (see
+        // `witnesses_require_log_and_valid_did_and_url`), so on the real
+        // startup path this claim already implies the 0.3.0 claim's own
+        // precondition and the ladder stays monotone; gating on
+        // `log.enabled` alone would over-claim 0.4.0 for every
+        // transparency-log registry that aggregates nothing.
+        (!cfg.witnesses.is_empty()).then_some((4u32, "0.4.0")),
+        // Lineage-head receipts (RFC-ACDP-0011 §9), lifecycle
+        // (RFC-ACDP-0013 §10), and the transparency log itself all
+        // require >= 0.3.0.
+        (cfg.receipt.head_receipts || cfg.lifecycle.enabled || cfg.log.enabled)
+            .then_some((3, "0.3.0")),
+        // A receipt signing key alone claims 0.2.0 (RFC-ACDP-0010 §11).
+        cfg.receipt.is_configured().then_some((2, "0.2.0")),
+        // Base floor: what a bare deployment actually honors.
+        Some((1, "0.1.0")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// The pre-`anchors` ladder's own winner — i.e. what `acdp_version_claim`
+/// below would return without the unconditional 0.5.0 anchors claim
+/// folded in. Exposed as its own function *only* so
+/// `capabilities_acdp_version_ladder` can keep independently falsifying
+/// each of the four pre-existing rungs: once the anchors claim is folded
+/// into `acdp_version_claim`, that function's own return value is
+/// `"0.5.0"` for every configuration (anchors is unconditional and the
+/// largest claim, so it always wins the max()) — so testing the four
+/// older rungs against `build_capabilities`/`acdp_version_claim`
+/// directly could no longer distinguish a correctly-implemented ladder
+/// from a broken one. Testing this function instead keeps that
+/// distinction alive without changing what `build_capabilities` actually
+/// serves.
+#[cfg(test)]
+fn ladder_rung_claim(cfg: &RegistryConfig) -> &'static str {
+    ladder_claims(cfg)
+        .into_iter()
+        .max_by_key(|(minor, _)| *minor)
+        .expect("the 0.1.0 base floor claim is always present")
+        .1
+}
+
+/// RFC-ACDP-0016 §10's anchors claim: `anchors` is "a body field, not a
+/// registry surface" — there is **no new profile or admin-config gate**
+/// to check, because unlike witness aggregation the accept / reject /
+/// store / serve handling for `anchors` runs on every publish
+/// unconditionally, regardless of any `[receipt]` / `[lifecycle]` /
+/// `[log]` / `[[witnesses]]` setting. There is therefore no
+/// "claimed-but-unexercised" state this claim could over-claim into.
+///
+/// Because the claim is unconditional *and* the largest value among all
+/// claims, it wins `max()` for every configuration: every reachable
+/// deployment of the shipped binary now advertises `acdp_version >=
+/// "0.5.0"`, and the four pre-existing rungs no longer surface through
+/// `build_capabilities`'s own return value (see `ladder_rung_claim`
+/// above for where they remain independently observable).
+///
+/// This is REG-3 Phase 4's single flagged one-way-door decision
+/// (`plans/reg3-anchors.md` Phase 4) — logged `UNCONFIRMED` in
+/// `ASSUMPTIONS.md` pending `/reconcile` sign-off. It is cheap to
+/// reverse in code (delete this constant and its use below, one
+/// commit) but not cheap to reverse in the world: consumers read
+/// `acdp_version` and change behavior on it, and an advertised version
+/// that goes up and back down is a worse signal than one that never
+/// moved.
+const ANCHORS_VERSION_CLAIM: (u32, &str) = (5, "0.5.0");
+
+/// The final advertised `acdp_version`: the max of every applicable
+/// claim, pre-existing ladder rungs plus the unconditional anchors
+/// floor. "Deleting the anchors claim from the max() set" (the
+/// falsifiability check `capabilities_acdp_version_ladder` documents)
+/// means removing `ANCHORS_VERSION_CLAIM` from the `claims` vec below,
+/// which makes this function identical to `ladder_rung_claim`.
+fn acdp_version_claim(cfg: &RegistryConfig) -> &'static str {
+    let mut claims = ladder_claims(cfg);
+    claims.push(ANCHORS_VERSION_CLAIM);
+    claims
+        .into_iter()
+        .max_by_key(|(minor, _)| *minor)
+        .expect("the 0.1.0 base floor claim is always present")
+        .1
+}
+
 fn build_capabilities(cfg: &RegistryConfig) -> CapabilitiesDocument {
     CapabilitiesDocument {
-        // Plan A4: the version claim is gated on what the deployment
-        // actually honors, exactly like the profiles (which the
-        // `with_*` builders append and version-gate). RFC-ACDP-0015 §6.1
-        // witness-cosignature aggregation is a 0.4.0 wire member
-        // (`witness_signatures`); a deployment that aggregates witnesses
-        // claims 0.4.0 — under-claiming 0.3.0 here would serve a 0.4.0
-        // wire member under a 0.3.0 banner. This rung is checked first
-        // and gated on `!cfg.witnesses.is_empty()` rather than
-        // `cfg.log.enabled`: `validate_config` refuses startup when
-        // witnesses are configured without `log.enabled` (see
-        // `witnesses_require_log_and_valid_did_and_url`), so on the real
-        // startup path the 0.4.0 rung already implies the 0.3.0 rung's
-        // preconditions and the ladder stays monotone; gating on
-        // `log.enabled` alone would over-claim 0.4.0 for every
-        // transparency-log registry that aggregates nothing. The ACDP
-        // 0.3.0 surfaces (lineage-head receipts, RFC-ACDP-0011 §9;
-        // lifecycle, RFC-ACDP-0013 §10; the transparency log itself)
-        // require >= 0.3.0; a receipt key alone claims 0.2.0
-        // (RFC-ACDP-0010 §11); a bare deployment keeps the 0.1.0 claim
-        // it actually honors.
-        acdp_version: if !cfg.witnesses.is_empty() {
-            "0.4.0".into()
-        } else if cfg.receipt.head_receipts || cfg.lifecycle.enabled || cfg.log.enabled {
-            "0.3.0".into()
-        } else if cfg.receipt.is_configured() {
-            "0.2.0".into()
-        } else {
-            "0.1.0".into()
-        },
+        // Plan A4 / REG-3 Phase 4: each rung of the claim is gated on what
+        // the deployment actually honors, exactly like the profiles (which
+        // the `with_*` builders append and version-gate) — but the top-level
+        // anchors claim folded in by `acdp_version_claim` is unconditional,
+        // so this always advertises >= 0.5.0 regardless of config. See
+        // `acdp_version_claim`'s doc comment for the full max()-over-claims
+        // design.
+        acdp_version: acdp_version_claim(cfg).into(),
         registry_did: authority_to_did_web(&cfg.registry.authority),
         // Advertise exactly the set the registry actually verifies. Every
         // publish path runs `acdp-server`'s validator step-5 gate, which
@@ -1284,7 +1375,7 @@ mod tests {
         }];
         // Witnesses without a log are refused (nothing to witness). This
         // is also the invariant the `acdp_version` 0.4.0 rung in
-        // `build_capabilities` depends on: that rung is gated on
+        // `ladder_claims` depends on: that rung is gated on
         // `!cfg.witnesses.is_empty()` alone (not `cfg.log.enabled`), which
         // is only monotone with the 0.3.0 rung because `validate_config`
         // refuses to ever start a deployment with witnesses configured
@@ -1365,31 +1456,45 @@ mod tests {
 
     // RFC-ACDP-0015 §6.1 — witness aggregation is a 0.4.0 wire member
     // (`witness_signatures`), so a deployment that aggregates witness
-    // cosignatures must advertise `acdp_version: "0.4.0"` rather than
+    // cosignatures must independently claim "0.4.0" rather than
     // under-claim "0.3.0" (otherwise Phase 2's below-0.4.0 wire-code gate
     // is satisfiable only vacuously, since no deployment would ever claim
     // 0.4.0 in the first place).
+    //
+    // REG-3 Phase 4: the four assertions below test `ladder_rung_claim`
+    // rather than `build_capabilities`/`acdp_version_claim` directly.
+    // This is a deliberate, necessary change from how this test read
+    // before Phase 4 — see `ladder_rung_claim`'s doc comment for why:
+    // once the unconditional RFC-ACDP-0016 §10 anchors claim is folded
+    // into `acdp_version_claim`, `build_capabilities(&cfg).acdp_version`
+    // is `"0.5.0"` for every `cfg`, so it can no longer distinguish a
+    // correct four-rung ladder from a broken one. `ladder_rung_claim`
+    // is the pre-anchors max() this test needs to keep probing to prove
+    // each of the four older rungs is still independently falsifiable.
+    // The fifth assertion below is what proves the anchors claim itself
+    // is wired up and reachable through the full `build_capabilities`
+    // path.
     #[test]
     fn capabilities_acdp_version_ladder() {
         use acdp_registry_types::config::WitnessConfig;
 
         // Bare config: unchanged at 0.1.0.
         let bare = RegistryConfig::defaults();
-        assert_eq!(build_capabilities(&bare).acdp_version, "0.1.0");
+        assert_eq!(ladder_rung_claim(&bare), "0.1.0");
 
         // Receipt key configured, nothing else: unchanged at 0.2.0.
         let mut receipt_only = RegistryConfig::defaults();
         receipt_only.receipt.signing_key_seed_b64 =
             base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
-        assert_eq!(build_capabilities(&receipt_only).acdp_version, "0.2.0");
+        assert_eq!(ladder_rung_claim(&receipt_only), "0.2.0");
 
         // Witnesses configured AND log.enabled = true — the only state
         // `validate_config` allows on the real startup path (see
         // `witnesses_require_log_and_valid_did_and_url`, which re-asserts
         // that witnesses without log.enabled fail startup). Testing that
-        // combination, not just `witnesses` alone, is what proves the new
+        // combination, not just `witnesses` alone, is what proves the
         // rung is correct on the real reachable state rather than merely
-        // on an unvalidated config `build_capabilities` itself won't reject.
+        // on an unvalidated config `ladder_rung_claim` itself won't reject.
         let mut witnessed = RegistryConfig::defaults();
         witnessed.receipt.signing_key_seed_b64 =
             base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
@@ -1400,22 +1505,56 @@ mod tests {
             poll_seconds: 300,
         }];
         assert_eq!(
-            build_capabilities(&witnessed).acdp_version,
+            ladder_rung_claim(&witnessed),
             "0.4.0",
             "witness aggregation (RFC-ACDP-0015 §6.1) must claim 0.4.0"
         );
 
         // Same config with witnesses emptied: back down to 0.3.0 (the log
-        // remains enabled). Proves the new rung is both reachable and
-        // ordered FIRST — if it were ordered after the 0.3.0 branch it
-        // would be dead code, since witnesses non-empty implies
-        // log.enabled implies the 0.3.0 branch already matches, so this
-        // assertion would equally pass with a mis-ordered ladder; it is
-        // criterion 1 above (0.4.0 with witnesses present) that actually
-        // distinguishes correct ordering from dead code.
+        // remains enabled). Proves the rung is both reachable and truly
+        // independent — since each claim in `ladder_claims` now stands on
+        // its own predicate rather than living in an ordered if/else,
+        // this also proves removing the 0.4.0 claim can't accidentally
+        // resurrect it via some other branch: with witnesses empty the
+        // 0.4.0 predicate is false regardless of what order claims are
+        // considered in, so the max() naturally falls through to the
+        // next-highest applicable claim, 0.3.0.
         let mut no_witnesses = witnessed.clone();
         no_witnesses.witnesses.clear();
-        assert_eq!(build_capabilities(&no_witnesses).acdp_version, "0.3.0");
+        assert_eq!(ladder_rung_claim(&no_witnesses), "0.3.0");
+
+        // REG-3 Phase 4 (plans/reg3-anchors.md): `anchors` support
+        // (RFC-ACDP-0016 §10) is unconditional — no admin-config gate —
+        // so it is the largest applicable claim for EVERY configuration,
+        // including the completely bare one above (no receipt key, no
+        // log, no witnesses, nothing configured). `build_capabilities`
+        // therefore now always advertises >= "0.5.0": this is the one
+        // new assertion this phase adds, and it is what proves "0.5.0"
+        // is reachable by *some* configuration of the shipped binary
+        // (acceptance criterion 1) — trivially by every configuration,
+        // in fact, which is the whole point of the claim being
+        // unconditional.
+        //
+        // Falsifiability: temporarily deleting `ANCHORS_VERSION_CLAIM`'s
+        // use in `acdp_version_claim` turns ONLY this assertion red —
+        // the four assertions above call `ladder_rung_claim`, which
+        // never references the anchors claim, so they stay green.
+        assert_eq!(build_capabilities(&bare).acdp_version, "0.5.0");
+    }
+
+    // REG-3 Phase 4 acceptance criterion 4 (plans/reg3-anchors.md): the
+    // capabilities document `build_capabilities` produces for the 0.5.0
+    // configuration must still pass the ACDP wire validator's own
+    // `validate_capabilities`, not just informally look right. A bare
+    // config is enough — Phase 4's anchors claim is unconditional, so
+    // `build_capabilities(&RegistryConfig::defaults())` already advertises
+    // "0.5.0" (proved above by `capabilities_acdp_version_ladder`); this
+    // test is what proves that document is actually schema-valid rather
+    // than merely equal to the string "0.5.0".
+    #[test]
+    fn capabilities_at_0_5_0_pass_validate_capabilities() {
+        acdp::validation::validate_capabilities(&build_capabilities(&RegistryConfig::defaults()))
+            .unwrap();
     }
 
     // REG-5 — `registry.profiles` allowlist (`REGISTRY_ADVERTISABLE_PROFILES`).

@@ -33,8 +33,11 @@ Env-only deployments set `ACDP_REGISTRY_RECEIPT__SIGNING_KEY_SEED_B64`.
 
 With a key configured the registry:
 
-- advertises `acdp_version: "0.2.0"` and the `acdp-registry-receipts` profile
-  in `/.well-known/acdp.json`;
+- advertises the `acdp-registry-receipts` profile in `/.well-known/acdp.json`
+  (`acdp_version` itself is unconditionally `"0.5.0"` as of REG-3 —
+  RFC-ACDP-0016 §10's anchors claim always wins the version max() — so it no
+  longer moves with `[receipt]`; the receipts profile is what actually
+  signals this capability is active);
 - mints a receipt for **every** publish, **atomically** with the context row
   (one INSERT, one transaction — a context can never exist without its
   receipt, and a failed mint aborts the publish);
@@ -65,9 +68,10 @@ head_receipts        = true              # ACDP 0.3.0 / RFC-ACDP-0011
 
 With `head_receipts = true` the registry:
 
-- advertises `acdp_version: "0.3.0"` and the `acdp-registry-head-receipts`
-  profile (prerequisite: `acdp-registry-receipts` — startup validation
-  refuses the flag without a signing key);
+- advertises the `acdp-registry-head-receipts` profile (prerequisite:
+  `acdp-registry-receipts` — startup validation refuses the flag without a
+  signing key); `acdp_version` itself is unconditionally `"0.5.0"` as of
+  REG-3 (see above) and no longer moves with `head_receipts`;
 - mints a **fresh** receipt on every `GET /lineages/{id}/current` response,
   attached as the top-level `lineage_head_receipt` envelope member. `as_of`
   is the registry clock at response time, millisecond-truncated; the head

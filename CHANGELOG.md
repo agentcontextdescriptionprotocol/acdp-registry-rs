@@ -8,6 +8,191 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`anc-001`/`anc-002`/`anc-003` move from "skipped as non-HTTP by the
+  generic replayer" to direct, fixture-driven coverage, and require-mode CI
+  is confirmed green at spec pin `417211f`** (`REG-3` Phase 7 — the closing
+  phase of `plans/reg3-anchors.md`). None of `anc-001/002/003` is replayable
+  through `crates/acdp-registry-server/tests/conformance.rs`'s generic
+  `extract_shapes` at any pin: `anc-001` expects a *positive* (2xx) publish
+  outcome carrying a `content_hash`/`signature` its own `input.notes` calls
+  placeholders that don't recompute over the fixture's own body (Shape A
+  refuses any non-400 publish outcome by design), and `anc-002`/`anc-003`
+  carry only an `input.anchor_under_test` fragment, not a full body. So,
+  following the same precedent already established for `wit-001`/`wit-004`
+  and the did:key golden vector, three new in-process tests —
+  `anc001_well_formed_anchor_is_accepted_and_round_trips`,
+  `anc002_malformed_anchor_content_hash_is_rejected`,
+  `anc003_empty_anchors_array_is_rejected_with_established_ordering` — read
+  each fixture's own data via the existing `spec_fixtures()`/`read_json`
+  helpers (resolved by the fixture's own `id` field through a directory
+  scan, not a hardcoded filename), splice it into a freshly-signed body
+  built with the same producer/`RequestBuilder` technique REG-3 Phase 5
+  uses, and publish it against a **locally-built** capabilities document
+  advertising `acdp_version: "0.5.0"` (`anc_caps_050`/`anc_harness_050` —
+  the shared `caps()`, which stays `"0.1.0"` for
+  `replays_spec_fixtures_when_present`, is never mutated). `anc-001`
+  asserts HTTP 200 (this repo's actual publish success code, not the
+  fixture's own literal `201`) plus both of the fixture's stated
+  post-publish invariants (anchors served byte-identical; recomputed
+  `content_hash` matches). `anc-002` asserts 400 `schema_violation` and its
+  doc-comment states plainly that this exercises the *upstream*
+  `acdp_validation::validate_anchors` shape check inherited from the `acdp`
+  0.8.2 bump, not this repo's own Phase 3 version gate. `anc-003` asserts
+  400 `schema_violation` on both a sub-`0.5.0` and a `0.5.0`-advertising
+  registry, and additionally pins the ordering Phase 3 already established:
+  on the sub-`0.5.0` registry this repo's own §10 version gate fires first
+  (message names §10, not the SDK's "MUST be omitted entirely" wording); on
+  the `0.5.0` registry the gate passes and the SDK's own empty-array rule
+  fires instead. `anc`'s classification is unchanged by this phase — it was
+  never `EXCUSED` and still isn't (`KNOWN_FAMILIES`'s doc-comment now
+  records the added direct coverage) — and the skip manifest in
+  `replays_spec_fixtures_when_present` still correctly shows
+  `anc: 5 (non-HTTP fixture ...)`, since the replayer itself still doesn't
+  replay any `anc-*` fixture; the three new tests run beside it, not in
+  place of it. `MIN_REPLAYED_EXCHANGES` stays at exactly 4.
+
+  `anc-004` and `anc-005` are deliberately OUT OF SCOPE: `anc-004` is a pure
+  hash-computation golden vector (no endpoint, no request) over
+  `acdp-crypto`'s JCS/hash pipeline, which this repo delegates to via the
+  `acdp` dependency and does not own — Phase 5's
+  `anchors_round_trip_byte_exact_sqlite` / `pg_anchors_round_trip_byte_exact`
+  already prove that pipeline handles anchors correctly *through this
+  repo's own storage*, which is what this repo is accountable for.
+  `anc-005` is consumer-side behavioral (a scheme-unaware verifier
+  tolerating an unknown scheme) — a registry has no verifier role, and the
+  pinned spec places all five `anc-*` fixtures in `acdp-consumer`'s
+  `required_fixtures`, never in any `acdp-registry-*` profile's.
+
+  Confirmed green: `ACDP_REQUIRE_CONFORMANCE=1 ACDP_SPEC_DIR=<pinned
+  417211f checkout> cargo test -p acdp-registry-server --features
+  storage-sqlite,playground --test conformance --test conformance_gate`
+  exits 0, with `replayed 4 exchange(s); failures=0` and zero
+  `ACDP_SPEC_DIR unset` lines.
+
+- **Behavioral and structural proof that `anchors[].uri` is never
+  dereferenced** (`REG-3` Phase 6). Proves RFC-ACDP-0016 §6's NORMATIVE
+  rule — stricter than the DataRef SSRF posture — that "there is no code
+  path in core verification that ever reads `anchors[].uri`". Two tests,
+  because neither alone is sufficient:
+  `anchors_uri_never_dereferenced_publish_and_retrieve`
+  (`crates/acdp-registry-server/tests/http_integration.rs`) binds a
+  loopback `TcpListener`, publishes a context whose `anchors[0].uri`
+  targets it, retrieves the context back, and asserts (after a bounded
+  drain window, not an immediate check) that the listener observed **zero**
+  connections at every point — while webhook delivery (the one subsystem
+  near the publish path that *does* make a real outbound call) is
+  deliberately wired live against a *second*, independent listener, so
+  "zero" is a discriminating claim rather than an artifact of a harness
+  that makes no outbound calls at all. The SSRF guard is configured with
+  `SsrfPolicy::allow_test_loopback()` throughout so the guard is provably
+  not what keeps the anchor listener silent — the claim under test is
+  "nothing attempts the connection," not "a guard blocked it."
+  `crates/acdp-registry-server/tests/anchors_uri_never_dereferenced.rs`
+  adds the structural half: it enumerates every outbound-HTTP call site in
+  the whole `crates/` tree (scoped to the zero-argument HTTP-client dispatch
+  idiom, which cannot collide with channel `.send(msg)` calls that always
+  take an argument) and asserts the set is *exactly* the three audited,
+  legitimate ones (`acdp-registry-webhook/src/lib.rs`,
+  `acdp-registry-auth/src/revocation_poller.rs`,
+  `acdp-registry-core/src/witness.rs`) — failing loudly if a fourth ever
+  appears — and that none of those three files mentions "anchor" in any
+  form. Both live mutation checks were performed and confirmed: temporarily
+  adding a throwaway fetch of `anchors[0].uri` to the publish path turned
+  the behavioral test red (`left: 1, right: 0` on the zero-connections
+  assertion); temporarily corrupting the structural test's expected-file
+  set turned both structural assertions red with a clear drift diff. Both
+  mutations were reverted before landing.
+
+- **Byte-exact `anchors` round-trip proof, both storage backends** (`REG-3`
+  Phase 5). Proves RFC-ACDP-0016 §5's normative requirement and anc-001's
+  stated post-publish invariant: `anchors` survives publish → store →
+  retrieve byte-exactly, such that `acdp::crypto::compute_content_hash`
+  over the retrieved body reproduces the published `content_hash`. No test
+  in this repo recomputed `content_hash` from a retrieved body at all
+  before this (`grep -rn compute_content_hash crates/` was zero hits) —
+  this is a first for the repo, not just for anchors.
+  `anchors_round_trip_byte_exact_sqlite` /
+  `anchors_two_entries_preserve_order_sqlite`
+  (`crates/acdp-registry-server/tests/http_integration.rs`) and
+  `pg_anchors_round_trip_byte_exact` / `pg_anchors_two_entries_preserve_order`
+  (`crates/acdp-registry-server/tests/pg_integration.rs`) publish a
+  **freshly-signed, self-consistent** request through the real router
+  (`RequestBuilder::build()` computes its own `content_hash` — anc-001's
+  own placeholder `content_hash`/`signature` are never replayed; anc-001 is
+  used only as the shape reference for the first anchor's
+  `scheme`/`content_hash`), fetch both `GET /contexts/{ctx_id}` and
+  `GET /contexts/{ctx_id}/body`, and assert against both: the served
+  `anchors` array is order-sensitive deep-equal (raw `serde_json::Value`,
+  since `AnchorEntry` has no `Eq`/`Hash`) to what was sent, AND the
+  recomputed hash matches. The two-anchor test body carries a `uri`, a
+  flattened extension key holding a plain integer
+  (`AnchorEntry.extensions`, `#[serde(flatten)]`) and a second flattened
+  key holding `1e-7` — a value Postgres's `jsonb` type is known to
+  re-render differently (in text form) from `serde_json`'s own output,
+  unlike the plain integer, which round-trips through JSONB unchanged
+  either way — on the first entry, and a structurally different second
+  entry whose `scheme` sorts alphabetically *before* the first entry's (so
+  a "helpful" ascending sort would visibly reorder the pair rather than
+  being a no-op on the fixture). Array ORDER is therefore genuinely
+  exercised (reordering changes the JCS preimage, and an accidental sort
+  would now be caught), and Postgres's JSONB storage
+  (`serde_json::to_value`, a normalizing representation — number
+  re-rendering, key dedup/reorder) has real surface to diverge from
+  SQLite's `TEXT` storage (`serde_json::to_string`) if it were going to. It
+  doesn't: both backends reproduce the published `content_hash`
+  byte-exactly — including across the `1e-7` re-rendering — run against a
+  real `postgres:16-alpine` container — **no cross-backend JSONB
+  normalization divergence found**. The PRIMARY proof of byte-exactness is
+  the hash-recomputation assertion itself: because JCS canonicalization is
+  sensitive to field drop, field mutation, and array reorder alike, a
+  passing recompute on its own already rules out all three. Each
+  round-trip test additionally runs a narrower, supplementary regression
+  guard (`assert_ne!`) that simulates `anchors` being dropped from the
+  served value and confirms the hash-recompute assertion would go red in
+  that specific case — this guard only exercises the drop case, not
+  reorder or mutation, so it does not by itself establish byte-exactness;
+  it exists to catch a regression where the recompute assertion above
+  stops actually depending on `anchors` (e.g. a future refactor that reads
+  `content_hash` from a cached field instead of recomputing it).
+- **RFC-ACDP-0016 §10/§14 version gate** (`REG-3` Phase 3). RFC-ACDP-0016
+  (typed external `anchors`) is still **Draft**, not Final — this repo
+  implements the two MUST-reject rules the spec defines for that field
+  while the rest of the RFC remains a plain-library-type pass-through (see
+  the Phase 2 `acdp` 0.8.1 → 0.8.2 bump below). A publish request carrying
+  `anchors` is now rejected with `schema_violation` / HTTP 400 unless
+  **both**: (§10) the registry's own **advertised** `acdp_version` — the
+  exact string served at `GET /.well-known/acdp.json` — is `>= 0.5.0`, and
+  (§14) the request's own **declared** `body.acdp_version` is `>= 0.5.0`
+  (absent ⇒ `0.1.0` per `VERSIONING.md`'s layers table, so an omitted
+  field is rejected exactly like an explicit `"0.1.0"`). The check runs in
+  `publish_inner` (`crates/acdp-registry-core/src/handlers/context.rs`)
+  immediately after the request body deserializes and before the per-agent
+  rate limiter, so a version-rejected publish never consumes a producer's
+  publish budget, and it sits above the `did:key` / playground-pinned /
+  test-only / default `did:web` branch, covering all four publish paths
+  with one gate. No new error variant or wire code was minted — both
+  predicates reuse the existing `RegistryError::Acdp(AcdpError::SchemaViolation(..))`
+  → `schema_violation` / 400 idiom, with the rejection message naming which
+  of the two predicates failed. A private `version_at_least(v, major, minor)`
+  helper (with its own unit tests, including the numeric-vs-lexical
+  `"0.10.0" >= 0.5.0` case) is reimplemented in `context.rs` rather than
+  reusing `acdp-validation`'s own version of the same name, which is
+  private and not re-exported by the `acdp` facade crate; it fails closed
+  on any version string that isn't plain `MAJOR.MINOR.PATCH`. `anchors: []`
+  on a sub-0.5.0 registry is caught by this gate before the SDK's own
+  empty-vec rejection ever runs (both produce the same wire outcome, but
+  this gate fires first); `anchors: null` continues to be rejected at
+  deserialize time, unrelated to this gate. The read path
+  (`GET /contexts/{ctx_id}`, `/body`) is untouched — §10 gates publish
+  only, and a body stored while the registry advertised `0.5.0` is served
+  byte-exactly even if the registry's advertised version later changes.
+  This phase does **not** make `acdp_version: "0.5.0"` reachable from any
+  shipped configuration — the gate is exercised only via
+  `crates/acdp-registry-server/tests/http_integration.rs`'s explicit
+  `CapabilitiesDocument` override harness (`caps_050()`); making 0.5.0
+  actually reachable in production config is a separate, later, one-way-door
+  change.
+
 - **JWT revocation** (`SEC-01`, `FEAT-02`): new `RevocationStore` trait with
   in-memory, SQLite, and Postgres backends; `issued_tokens` migrations
   (Sqlite 006, Postgres 005); `AuthService::issue_token` records every
@@ -71,6 +256,86 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`acdp_version` capability advertisement now reaches `"0.5.0"`** (`REG-3`
+  Phase 4 — **one-way-door**). Phase 3's RFC-ACDP-0016 §10/§14 version gate
+  shipped with no reachable configuration of the shipped binary that could
+  ever clear it — the ladder topped out at `"0.4.0"`, so every anchored
+  publish was rejected forever. `crates/acdp-registry-server/src/main.rs`'s
+  `build_capabilities` is refactored from the four-rung ordered if/else
+  ladder into an order-independent `max()` over independent per-feature
+  version claims (`ladder_claims` / `acdp_version_claim`): witnesses
+  configured still contributes `"0.4.0"`, lifecycle/log/head-receipts still
+  contributes `"0.3.0"`, a configured receipt key still contributes
+  `"0.2.0"`, the base floor is still `"0.1.0"` — and a fifth,
+  **unconditional** claim of `"0.5.0"` is added for `anchors` support,
+  since RFC-ACDP-0016 §10 is explicit that anchors is "a body field, not a
+  registry surface" with no new profile or admin-config gate to check (the
+  accept/reject/store/serve handling runs on every publish regardless of
+  config). Because that claim is both unconditional and the largest value
+  in the `max()`, it wins for every configuration: **every reachable
+  deployment of the shipped binary now advertises `acdp_version >=
+  "0.5.0"`**, including a completely bare one with no receipt key, log, or
+  witnesses configured. This is a deliberate, acknowledged trade-off, not
+  an oversight — the previous four rungs no longer distinguish themselves
+  in what `build_capabilities` actually serves (a consumer can no longer
+  infer "does this registry aggregate witness signatures" from
+  `acdp_version` alone), which is exactly the cost the plan names for this
+  option. `RegistryServer::try_new`'s `validate_capabilities` startup check
+  still passes for every existing config permutation (its only
+  version-conditioned guard is `>= 0.3.0` requiring
+  `supports_idempotency_key: true`, which is unconditionally `true` here
+  regardless of version). This phase **executes the follow-up OQ2's own
+  `DECISIONS.md` entry (2026-08-29) already recorded** — "if a 5th
+  `acdp_version` rung is ever added, consider replacing the ordered if/else
+  ladder with an order-independent `max()` over per-feature version
+  claims" — rather than superseding OQ2's decision; OQ2's conditional
+  0.4.0-ahead-of-0.3.0 ordering is unchanged, just re-expressed as one
+  candidate among several. Logged `UNCONFIRMED` in `ASSUMPTIONS.md` pending
+  `/reconcile` sign-off, per this repo's standing practice for one-way-door
+  decisions.
+- **Bumped `acdp` 0.8.1 → 0.8.2** (`REG-3` Phase 2), pulling all twelve
+  `acdp-*` workspace crates in lockstep. This inherits `AnchorEntry`,
+  `PublishRequest::anchors`, `Body::anchors`, `validate_anchors`, and
+  anchors-in-preimage hashing (RFC-ACDP-0016) as plain library types — this
+  repo adds no local struct or validation code for them in this commit. The
+  crypto dependency graph moved with it, not just `acdp` itself: major
+  version bumps across `base16ct` (0.2→1.0), `crypto-bigint` (0.5→0.7),
+  `ecdsa` (0.16→0.17), `elliptic-curve` (0.13→0.14), `ff`, `group`, `p256`,
+  `primeorder`, `rfc6979`, `sec1`, plus new dependencies
+  `curve25519-dalek` 5.0, `ed25519-dalek` 3.0, `der`, `digest` 0.11,
+  `sha2` 0.11, and `signature` 3.0 (`hashbrown` 0.16 dropped). This repo's
+  own direct `ed25519-dalek = "2.2"` dev/runtime dependency
+  (`acdp-registry-auth`, `acdp-registry-server`) now coexists with `acdp`'s
+  transitive `ed25519-dalek` 3.0 as two separate major-version instances in
+  the graph; it previously relied on feature unification with `acdp`
+  0.8.1's own (then-matching) `ed25519-dalek 2.x` dependency to enable the
+  `rand_core` feature (`SigningKey::generate`), which the 0.8.2 bump broke
+  by moving `acdp`'s own dependency to `ed25519-dalek` 3.0. Fixed by
+  splitting `acdp-registry-auth`'s `ed25519-dalek = "2.2"` dependency: kept
+  featureless under `[dependencies]` (its actual production use, `jwt.rs`'s
+  PEM decoding, never calls `generate`) and added a new
+  `[dev-dependencies] ed25519-dalek = { version = "2.2", features =
+  ["rand_core"] }` for tests that do call `generate` — rather than widening
+  the production feature set for a test-only need. `acdp-registry-server`'s
+  own `[dev-dependencies]` `ed25519-dalek` entry gains the same explicit
+  `rand_core` feature for the same reason (it did not carry the feature
+  before this commit; feature unification with `acdp`'s own then-2.x
+  dependency supplied it implicitly). Neither fix bumps this repo's own
+  dependency to 3.0 or pins `acdp` back — both are manifest-only, no
+  production source changed. `cargo deny check` stays green (advisories,
+  licenses, bans, sources all `ok`) with `deny.toml`'s `ignore = []`
+  unchanged; the expanded graph's ~30 new/duplicated transitive crates
+  (`base64`, `block-buffer`, `cmov`, `const-oid`, `cpubits`, `crypto-common`,
+  `ctutils`, `curve25519-dalek`, `der`, `digest`, `ed25519`, `ed25519-dalek`,
+  `fiat-crypto`, `hmac`, `hybrid-array`, `pkcs8`, `primefield`, `serdect`,
+  `sha2`, `signature`, `spki`, `wnaf`, plus a `lru` 0.16→0.18 bump not
+  previously called out) all license-clear under the existing allow-list and
+  raise no new advisory; `[bans] multiple-versions = "warn"` accepts the
+  resulting duplicate-major-version crates (including the `ed25519-dalek`
+  2.x/3.x split) as warnings, not failures. **This commit alone would let a
+  publish carry `anchors` with no version gate whatsoever** — it ships only
+  combined with the RFC-ACDP-0016 §10/§14 version gate (`REG-3` Phase 3) in
+  the same PR, and must not reach `main` on its own.
 - **Pinned conformance spec SHA bumped to `417211f6a13aeceef4db00eb67f98ed0ed13761b`**
   (`REG-3`) in `.github/workflows/ci.yml`. The only substantive delta since the
   prior pin is RFC-ACDP-0016's draft and its conformance pack (the new `anc-*`

@@ -74,6 +74,18 @@ fn caps() -> CapabilitiesDocument {
         // must also bump the `acdp_version` on the `CapabilitiesDocument`
         // it asserts against to "0.4.0", or it will silently assert a
         // stale 0.3.0/0.1.0 claim.
+        //
+        // REG-3 Phase 4 (plans/reg3-anchors.md): the binary's
+        // `acdp_version_claim` also folds in an UNCONDITIONAL "0.5.0"
+        // anchors claim (RFC-ACDP-0016 §10 — no admin-config gate), so
+        // in the real binary EVERY reachable config, including this
+        // harness's plain `config()`, now advertises >= "0.5.0". This
+        // `caps()` helper deliberately does *not* mirror that either —
+        // keeping the pre-anchors "0.1.0" claim here is what lets the
+        // §10 reject-side tests (`gate_rejects_when_registry_advertises_below_0_5_0`
+        // and friends) exercise a below-0.5.0 registry at all. See
+        // `caps_050()` below for the harness that mirrors the real,
+        // post-Phase-4 shape.
         limits: Limits {
             max_payload_bytes: 1_048_576,
             max_embedded_bytes: 65_536,
@@ -177,6 +189,22 @@ async fn build_harness_with_caps(
     caps: CapabilitiesDocument,
     cross_registry: Option<Arc<acdp::client::CrossRegistryResolver>>,
 ) -> Harness {
+    build_harness_with_webhook(cfg, caps, cross_registry, None).await
+}
+
+/// Like [`build_harness_with_caps`] but lets the caller wire a real,
+/// already-spawned `WebhookEmitter` instead of always disabling webhook
+/// delivery. REG-3 Phase 6 (`plans/reg3-anchors.md`) needs this: proving
+/// `anchors[].uri` is never dereferenced is only meaningful if the one
+/// subsystem that *does* make outbound HTTP calls near the publish path
+/// (webhook delivery) is actually live during the test, rather than off
+/// (the harness default via [`harness`]/[`harness_from_config`]).
+async fn build_harness_with_webhook(
+    cfg: RegistryConfig,
+    caps: CapabilitiesDocument,
+    cross_registry: Option<Arc<acdp::client::CrossRegistryResolver>>,
+    webhook: Option<acdp_registry_webhook::WebhookEmitter>,
+) -> Harness {
     let db = tempfile::Builder::new()
         .prefix("acdp-test-")
         .suffix(".sqlite")
@@ -228,7 +256,7 @@ async fn build_harness_with_caps(
         resolver,
         AUTHORITY.into(),
     ));
-    let state = AppStateInner::new(server, auth, None, cfg, cross_registry);
+    let state = AppStateInner::new(server, auth, webhook, cfg, cross_registry);
     Harness {
         router: build_router(state),
         db,
@@ -5244,4 +5272,971 @@ async fn cosignature_for_other_tuple_is_not_served_on_current_checkpoint() {
         .as_array()
         .expect("size-2 embedded checkpoint carries its cosignature");
     assert_eq!(sigs.len(), 1);
+}
+
+/// REG-3 Phase 2 compile-proof: `acdp` 0.8.2 inherits `AnchorEntry` /
+/// `PublishRequest::anchors` (RFC-ACDP-0016) as plain types, with no local
+/// struct or validation code in this repo. This test asserts nothing about
+/// registry *behavior* — there is deliberately no version gate yet (that is
+/// REG-3 Phase 3, landing in the same PR) — it exists solely to prove that
+/// a `PublishRequest` struct literal carrying `anchors: Some(vec![AnchorEntry
+/// { .. }])` compiles against the bumped `acdp` types. If this test stops
+/// compiling, the 0.8.1 -> 0.8.2 bump did not deliver what REG-3 assumes.
+#[test]
+fn publish_request_literal_with_anchors_compiles() {
+    use acdp::types::publish::PublishRequest;
+    use acdp::{AnchorEntry, ContentHash};
+
+    let base = producer(200)
+        .publish_request()
+        .title("anchors-compile-proof")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+
+    let anchor = AnchorEntry {
+        scheme: "macp.commitment".to_string(),
+        content_hash: ContentHash::parse(format!("sha256:{}", "a".repeat(64))).unwrap(),
+        uri: Some("https://example.test/commitments/1".to_string()),
+        extensions: Default::default(),
+    };
+
+    let req = PublishRequest {
+        anchors: Some(vec![anchor]),
+        ..base
+    };
+
+    let anchors = req.anchors.expect("anchors field survives the literal");
+    assert_eq!(anchors.len(), 1);
+    assert_eq!(anchors[0].scheme, "macp.commitment");
+    assert_eq!(
+        anchors[0].content_hash.as_str(),
+        format!("sha256:{}", "a".repeat(64))
+    );
+}
+
+// ─── REG-3 Phase 3: the RFC-ACDP-0016 §10 + §14 version gate ───
+
+use acdp::{AnchorEntry, ContentHash};
+
+/// A minimal, valid anchor entry for gate tests — the specific scheme/hash
+/// values are irrelevant to the version gate, which runs before any anchor
+/// content is inspected.
+fn gate_test_anchor() -> AnchorEntry {
+    AnchorEntry {
+        scheme: "macp.commitment".to_string(),
+        content_hash: ContentHash::parse(format!("sha256:{}", "b".repeat(64))).unwrap(),
+        uri: Some("https://example.test/commitments/gate".to_string()),
+        extensions: Default::default(),
+    }
+}
+
+/// 0.5.0 capabilities: the §10 half of the gate is satisfied by a registry
+/// built on this document. Mirrors `caps_030()`'s shape — did:key is
+/// advertised too so the same document doubles as the did:key gate test's
+/// fixture (plan §"Edge cases": the did:key path needs its own dedicated
+/// test proving the gate applies there, not just the default did:web path).
+fn caps_050() -> CapabilitiesDocument {
+    let mut c = caps();
+    c.acdp_version = "0.5.0".into();
+    c.supported_did_methods = vec!["did:web".into(), "did:key".into()];
+    c
+}
+
+/// Playground-on harness advertising `acdp_version: "0.5.0"` (the §10 half
+/// of the gate). did:key is enabled at the auth layer too, so this harness
+/// doubles as the did:key gate fixture.
+async fn harness_050(playground: bool) -> Harness {
+    let mut cfg = config(playground);
+    cfg.auth.did_methods = vec!["did:web".into(), "did:key".into()];
+    build_harness_with_caps(cfg, caps_050(), None).await
+}
+
+/// POST an arbitrary raw JSON `Value` to `/contexts` — for edge cases (a
+/// literal `null` anchors, an empty-array anchors) that the typed
+/// `RequestBuilder` cannot express directly.
+async fn publish_raw(app: &axum::Router, body: &Value) -> (StatusCode, Value) {
+    let bytes = serde_json::to_vec(body).unwrap();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/contexts")
+                .header("content-type", "application/json")
+                .body(Body::from(bytes))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let v = body_to_json(resp).await;
+    (status, v)
+}
+
+/// Acceptance criterion 1: registry advertising `0.1.0` + request declaring
+/// `0.5.0` + `anchors` present -> 400 `schema_violation`. The §10 (registry)
+/// half of the gate fires even though the §14 (request) half would pass on
+/// its own — proving §10 is independently enforced.
+#[tokio::test]
+async fn gate_rejects_when_registry_advertises_below_0_5_0() {
+    let h = harness(true).await; // default caps(): acdp_version "0.1.0"
+    let req = producer(210)
+        .publish_request()
+        .title("registry below 0.5.0")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .acdp_version("0.5.0")
+        .anchors(vec![gate_test_anchor()])
+        .build()
+        .unwrap();
+    let (status, v) = publish(&h.router, &req, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {v}");
+    assert_eq!(v["error"]["code"], "schema_violation");
+    let msg = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("\u{a7}10") && msg.contains("0.1.0"),
+        "message should name the failed §10 predicate: {msg}"
+    );
+}
+
+/// Acceptance criterion 2: registry advertising `0.5.0` + request declaring
+/// `0.1.0` + `anchors` present -> 400 `schema_violation`. The §14
+/// (declared-version) half fires on its own even though §10 passes —
+/// proving §14 is independently enforced, not just implied by §10.
+#[tokio::test]
+async fn gate_rejects_when_request_declares_below_0_5_0() {
+    let h = harness_050(true).await; // caps_050(): acdp_version "0.5.0"
+    let req = producer(211)
+        .publish_request()
+        .title("request below 0.5.0")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .acdp_version("0.1.0")
+        .anchors(vec![gate_test_anchor()])
+        .build()
+        .unwrap();
+    let (status, v) = publish(&h.router, &req, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {v}");
+    assert_eq!(v["error"]["code"], "schema_violation");
+    let msg = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("\u{a7}14") && msg.contains("0.1.0"),
+        "message should name the failed §14 predicate: {msg}"
+    );
+}
+
+/// Acceptance criterion 3: registry advertising `0.5.0` + request
+/// **omitting** `acdp_version` + `anchors` present -> 400 `schema_violation`.
+/// VERSIONING.md: absent body version => `0.1.0`, so an omitted field must
+/// reject exactly like an explicit `"0.1.0"` (criterion 2) — not pass.
+#[tokio::test]
+async fn gate_rejects_when_request_omits_acdp_version() {
+    let h = harness_050(true).await;
+    let req = producer(212)
+        .publish_request()
+        .title("request omits acdp_version")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .omit_acdp_version()
+        .anchors(vec![gate_test_anchor()])
+        .build()
+        .unwrap();
+    assert!(
+        req.acdp_version.is_none(),
+        "sanity: builder actually omitted the field"
+    );
+    let (status, v) = publish(&h.router, &req, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {v}");
+    assert_eq!(v["error"]["code"], "schema_violation");
+    let msg = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("\u{a7}14") && msg.contains("0.1.0"),
+        "absent acdp_version must be treated as 0.1.0: {msg}"
+    );
+}
+
+/// Acceptance criterion 4: registry advertising `0.5.0` + request declaring
+/// `0.5.0` + `anchors` present -> success. Both halves of the gate pass and
+/// the publish proceeds through the full pipeline.
+#[tokio::test]
+async fn gate_accepts_when_both_registry_and_request_are_0_5_0() {
+    let h = harness_050(true).await;
+    let req = producer(213)
+        .publish_request()
+        .title("both at 0.5.0")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .acdp_version("0.5.0")
+        .anchors(vec![gate_test_anchor()])
+        .build()
+        .unwrap();
+    let (status, v) = publish(&h.router, &req, None).await;
+    assert_eq!(status, StatusCode::OK, "body = {v}");
+    assert!(v["ctx_id"].as_str().is_some_and(|s| !s.is_empty()));
+}
+
+/// Acceptance criterion 6: the comparison is `>=`, not `==` — a registry
+/// advertising `0.6.0` and a request declaring `1.0.0` must both clear the
+/// gate.
+#[tokio::test]
+async fn gate_accepts_higher_versions_not_just_exact_0_5_0() {
+    let mut caps = caps_050();
+    caps.acdp_version = "0.6.0".into();
+    let mut cfg = config(true);
+    cfg.auth.did_methods = vec!["did:web".into(), "did:key".into()];
+    let h = build_harness_with_caps(cfg, caps, None).await;
+
+    let req = producer(214)
+        .publish_request()
+        .title("higher than 0.5.0 both sides")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .acdp_version("1.0.0")
+        .anchors(vec![gate_test_anchor()])
+        .build()
+        .unwrap();
+    let (status, v) = publish(&h.router, &req, None).await;
+    assert_eq!(status, StatusCode::OK, "body = {v}");
+}
+
+/// Acceptance criterion 5 (the single most important negative test): a
+/// publish that omits `anchors` entirely must be completely unaffected by
+/// the gate, at any advertised or declared version — including a registry
+/// that already advertises `0.5.0`. A bug here would break every existing
+/// deployment, since no producer in the wild sets `anchors` yet.
+#[tokio::test]
+async fn gate_leaves_anchors_absent_publishes_unaffected() {
+    // Sub-0.5.0 registry, default (0.4.0-explicit) declared version, no anchors.
+    let h01 = harness(true).await;
+    let req01 = producer(215)
+        .publish_request()
+        .title("no anchors on 0.1.0 registry")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    assert!(req01.anchors.is_none());
+    let (status, v) = publish(&h01.router, &req01, None).await;
+    assert_eq!(status, StatusCode::OK, "body = {v}");
+
+    // 0.5.0 registry, explicit 0.5.0 declared version, no anchors.
+    let h05 = harness_050(true).await;
+    let req05 = producer(216)
+        .publish_request()
+        .title("no anchors on 0.5.0 registry")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .acdp_version("0.5.0")
+        .build()
+        .unwrap();
+    assert!(req05.anchors.is_none());
+    let (status, v) = publish(&h05.router, &req05, None).await;
+    assert_eq!(status, StatusCode::OK, "body = {v}");
+
+    // 0.5.0 registry, request declares 0.1.0 (would fail the gate if
+    // anchors were present, per criterion 2) — but with anchors absent
+    // the gate must never even look at the declared version.
+    let req_low = producer(217)
+        .publish_request()
+        .title("no anchors, low declared version, 0.5.0 registry")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .acdp_version("0.1.0")
+        .build()
+        .unwrap();
+    assert!(req_low.anchors.is_none());
+    let (status, v) = publish(&h05.router, &req_low, None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "anchors-absent publish must be unaffected by declared version: {v}"
+    );
+}
+
+/// Acceptance criterion 7: the did:key publish branch (`publish_inner`'s
+/// `starts_with("did:key:")` arm, checked BEFORE the playground gate) is
+/// subject to the same version gate as the default did:web path — the gate
+/// sits above the branch. Exercises both the reject and accept sides
+/// through this specific branch so a gate that only guards did:web would be
+/// caught here.
+#[tokio::test]
+async fn gate_applies_to_did_key_publish_path() {
+    let h = harness_050(false).await; // production path (playground off)
+
+    // Reject side: registry advertises 0.5.0, but the did:key request
+    // declares 0.1.0 -> the §14 half must still fire on this branch.
+    let reject_req = did_key_producer(218)
+        .publish_request()
+        .title("did:key below 0.5.0")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .acdp_version("0.1.0")
+        .anchors(vec![gate_test_anchor()])
+        .build()
+        .unwrap();
+    let (status, v) = publish(&h.router, &reject_req, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {v}");
+    assert_eq!(v["error"]["code"], "schema_violation");
+
+    // Accept side: both halves at 0.5.0 -> the did:key pipeline (pure
+    // offline verification) runs and the publish succeeds.
+    let accept_req = did_key_producer(219)
+        .publish_request()
+        .title("did:key at 0.5.0")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .acdp_version("0.5.0")
+        .anchors(vec![gate_test_anchor()])
+        .build()
+        .unwrap();
+    let (status, v) = publish(&h.router, &accept_req, None).await;
+    assert_eq!(status, StatusCode::OK, "body = {v}");
+}
+
+/// Edge case: `anchors: []` on a sub-0.5.0 registry. Two rules could fire —
+/// this gate (§10) and the SDK's own empty-vec rejection (`validate_anchors`,
+/// the absent-when-empty convention) — and both produce `schema_violation`/
+/// 400, so the HTTP-visible outcome is identical either way. This test pins
+/// *which* fires first: the version gate runs at the very top of
+/// `publish_inner`, before the SDK validator ever sees the body, so the
+/// error message must be this gate's own wording, not the SDK's "anchors
+/// MUST be omitted entirely" message.
+#[tokio::test]
+async fn gate_fires_before_sdk_empty_vec_check_on_sub_0_5_0_registry() {
+    use acdp::types::publish::PublishRequest;
+
+    let h = harness(true).await; // 0.1.0 registry
+                                 // The typed `RequestBuilder::build()` itself refuses an empty `anchors`
+                                 // vec (it runs the SDK's own `validate_publish_request` before
+                                 // returning), so an empty-but-present anchors array has to be
+                                 // constructed via a patched struct literal instead — same technique as
+                                 // the Phase 2 `publish_request_literal_with_anchors_compiles` compile
+                                 // proof above. The resulting content_hash no longer matches the patched
+                                 // body, but that's irrelevant here: this is a reject-path test and the
+                                 // version gate returns before hash recomputation is ever reached.
+    let base = producer(220)
+        .publish_request()
+        .title("empty anchors, sub-0.5.0 registry")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let req = PublishRequest {
+        anchors: Some(vec![]),
+        ..base
+    };
+    let (status, v) = publish(&h.router, &req, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {v}");
+    assert_eq!(v["error"]["code"], "schema_violation");
+    let msg = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("\u{a7}10"),
+        "the version gate, not the SDK's empty-vec check, must fire first: {msg}"
+    );
+    assert!(
+        !msg.contains("MUST be omitted entirely"),
+        "the SDK's empty-vec message must not be the one surfaced here: {msg}"
+    );
+}
+
+/// Companion to the above: once BOTH halves of the version gate pass,
+/// `anchors: []` must still be rejected — by the SDK's own downstream
+/// validator this time. Confirms the version gate doesn't swallow or
+/// bypass that separate, pre-existing MUST.
+#[tokio::test]
+async fn empty_anchors_still_rejected_downstream_once_gate_passes() {
+    use acdp::types::publish::PublishRequest;
+
+    let h = harness_050(true).await;
+    // See the comment in `gate_fires_before_sdk_empty_vec_check_on_sub_0_5_0_registry`:
+    // `.anchors(vec![])` cannot survive `RequestBuilder::build()`, so patch
+    // it onto an already-built request. `validate_publish_request` (which
+    // runs `validate_anchors`) executes before hash recomputation inside
+    // `validate_post_schema`, so the empty-vec rejection fires before the
+    // now-mismatched content_hash would ever be checked.
+    let base = producer(221)
+        .publish_request()
+        .title("empty anchors, both sides at 0.5.0")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .acdp_version("0.5.0")
+        .build()
+        .unwrap();
+    let req = PublishRequest {
+        anchors: Some(vec![]),
+        ..base
+    };
+    let (status, v) = publish(&h.router, &req, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {v}");
+    assert_eq!(v["error"]["code"], "schema_violation");
+    let msg = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("MUST be omitted entirely"),
+        "once the gate passes, the SDK's own empty-vec check must fire: {msg}"
+    );
+}
+
+/// Edge case: `anchors: null` is rejected at *deserialize* time by
+/// `de_present` — before this gate (or anything else in `publish_inner`)
+/// ever runs. Not a duplicate of that helper's own tests: this pins that
+/// the wire-level outcome through the real router stays `schema_violation`/
+/// 400, i.e. that nothing in this phase's gate changed that pre-existing
+/// behavior.
+#[tokio::test]
+async fn anchors_null_still_rejected_at_deserialize_before_gate_runs() {
+    let h = harness_050(true).await; // even on a 0.5.0 registry...
+    let req = producer(222)
+        .publish_request()
+        .title("null anchors")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .acdp_version("0.5.0")
+        .build()
+        .unwrap();
+    let mut raw = serde_json::to_value(&req).unwrap();
+    raw["anchors"] = Value::Null;
+    let (status, v) = publish_raw(&h.router, &raw).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {v}");
+    assert_eq!(v["error"]["code"], "schema_violation");
+}
+
+/// §10 gates *publish* only. A body stored while the registry advertised
+/// `0.5.0` must still be served byte-exactly on retrieve even if the
+/// registry is later "downgraded" to a lower advertised version — dropping
+/// a signed field (or any byte) on read would break the content hash, and
+/// the RFC text is explicit that the MUST is a publish-time rejection, not
+/// a read-time filter.
+#[tokio::test]
+async fn retrieve_path_is_not_gated_and_serves_anchors_byte_exact_after_downgrade() {
+    let h = harness_050(true).await;
+    let req = producer(223)
+        .publish_request()
+        .title("retrieve unaffected by later downgrade")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .acdp_version("0.5.0")
+        .anchors(vec![gate_test_anchor()])
+        .build()
+        .unwrap();
+    let (status, v) = publish(&h.router, &req, None).await;
+    assert_eq!(status, StatusCode::OK, "publish body = {v}");
+    let ctx_id = v["ctx_id"].as_str().unwrap().to_string();
+
+    async fn body_bytes(app: &axum::Router, ctx_id: &str) -> Vec<u8> {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/contexts/{}/body",
+                        pct_encode_path_segment(ctx_id)
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        resp.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec()
+    }
+
+    let bytes_before = body_bytes(&h.router, &ctx_id).await;
+    let before: Value = serde_json::from_slice(&bytes_before).unwrap();
+    assert!(
+        before["anchors"].is_array() && !before["anchors"].as_array().unwrap().is_empty(),
+        "sanity: the stored body actually carries anchors: {before}"
+    );
+
+    // Open a second router over the SAME underlying SQLite file, but built
+    // with a "downgraded" capabilities document (below 0.5.0) — simulating
+    // an operator rolling the registry's advertised version back after the
+    // anchors-carrying context was already published.
+    let downgraded_store = SqliteStore::connect(h.db_path(), 1).await.unwrap();
+    let downgraded_server =
+        Arc::new(RegistryServer::try_new(downgraded_store, caps(), AUTHORITY).unwrap());
+    let challenges: Arc<dyn ChallengeStore> = Arc::new(InMemoryChallengeStore::new());
+    let secret = JwtSecret::from_bytes(&[42u8; 32]);
+    let signer = JwtSigner::new(secret, format!("did:web:{AUTHORITY}"), AUTHORITY.into(), 30);
+    let resolver = Arc::new(WebResolver::new());
+    let auth = Arc::new(AuthService::new(
+        AuthConfig::default(),
+        challenges,
+        signer,
+        resolver,
+        AUTHORITY.into(),
+    ));
+    let downgraded_state = AppStateInner::new(downgraded_server, auth, None, config(true), None);
+    let downgraded_router = build_router(downgraded_state);
+
+    let bytes_after = body_bytes(&downgraded_router, &ctx_id).await;
+    assert_eq!(
+        bytes_before, bytes_after,
+        "read path must serve the stored body byte-exactly regardless of the \
+         registry's currently-advertised acdp_version"
+    );
+}
+
+// ─── REG-3 Phase 4: anchors reachable in the capability ladder ───
+//
+// `plans/reg3-anchors.md` Phase 4 makes the binary's own `build_capabilities`
+// advertise `acdp_version >= "0.5.0"` unconditionally (RFC-ACDP-0016 §10 —
+// anchors handling has no admin-config gate, so its version claim is folded
+// into the ladder's max() unconditionally too; see `main.rs`'s
+// `acdp_version_claim`). Practically, that means EVERY reachable
+// configuration of the shipped binary — including a completely bare one,
+// with no receipt key, no log, no witnesses configured — now reaches 0.5.0.
+// The test below proves that composes correctly with Phase 3's version gate:
+// a router built on the plain, unmodified `config()`/`caps_050()` pairing
+// used throughout this file (which is exactly the shape a real, upgraded
+// deployment now has) accepts an anchored publish; a router still on the
+// pre-Phase-4 shape (`caps()`, "0.1.0" — what every deployment served before
+// this phase shipped) rejects one, exactly as Phase 3 alone already proved.
+// This is the one test in this file added specifically for Phase 4 — the
+// gate's own accept/reject behavior is already exhaustively covered above.
+
+#[tokio::test]
+async fn config_reaching_0_5_0_composes_with_the_anchors_gate() {
+    // Accept side: the plain `config()`/`caps_050()` pairing this file
+    // already uses everywhere else. Nothing about it is special-cased for
+    // anchors — no receipt key, no log, no witnesses — which is the point:
+    // under REG-3 Phase 4's unconditional anchors claim, this ordinary
+    // config is now exactly what a real 0.5.0 deployment looks like.
+    let accept = harness_050(true).await;
+    let accept_req = producer(224)
+        .publish_request()
+        .title("phase 3+4 composition: accept")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .acdp_version("0.5.0")
+        .anchors(vec![gate_test_anchor()])
+        .build()
+        .unwrap();
+    let (accept_status, accept_body) = publish(&accept.router, &accept_req, None).await;
+    assert_eq!(accept_status, StatusCode::OK, "body = {accept_body}");
+    assert!(
+        accept_body["ctx_id"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "accepted publish must yield a ctx_id: {accept_body}"
+    );
+
+    // Reject side: the pre-Phase-4-shaped capabilities document (what every
+    // deployment served before this phase). Same publish shape, same
+    // anchors payload — only the registry's advertised version differs.
+    let reject = harness(true).await;
+    let reject_req = producer(225)
+        .publish_request()
+        .title("phase 3+4 composition: reject")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .acdp_version("0.5.0")
+        .anchors(vec![gate_test_anchor()])
+        .build()
+        .unwrap();
+    let (reject_status, reject_body) = publish(&reject.router, &reject_req, None).await;
+    assert_eq!(
+        reject_status,
+        StatusCode::BAD_REQUEST,
+        "body = {reject_body}"
+    );
+    assert_eq!(reject_body["error"]["code"], "schema_violation");
+}
+
+// ─── REG-3 Phase 5: byte-exact round-trip (sqlite) ───
+//
+// `plans/reg3-anchors.md` Phase 5: proof that `anchors` survives
+// publish -> store -> retrieve byte-exactly, such that
+// `compute_content_hash` over the retrieved body reproduces the stored
+// `content_hash` (RFC-ACDP-0016 §5, anc-001's stated post-publish
+// invariant). No test in this repo recomputed `content_hash` from a
+// retrieved body before this (`grep -rn compute_content_hash crates/` was
+// zero hits) — this is a first for the repo, not just for anchors.
+//
+// The publish request below is FRESHLY SIGNED by `RequestBuilder::build()`
+// (which computes `content_hash` itself via `acdp_crypto::compute_content_hash`
+// over this exact body) — it does NOT replay anc-001's own placeholder
+// `content_hash`/`signature` values, which that fixture's own `input.notes`
+// says are copied from an unrelated template and do not recompute over
+// anc-001's actual body. anc-001 is used only as the reference for the
+// first anchor's SHAPE (`scheme: "macp.commitment"`, its `content_hash`
+// literal) — RFC-ACDP-0016's own conformance fixture, not a golden hash to
+// reproduce here.
+
+/// Two anchors: the first mirrors anc-001's shape but adds a `uri` and a
+/// flattened extension key (`AnchorEntry.extensions`) so Postgres's JSONB
+/// normalization — number re-rendering, key dedup/reorder — has real
+/// surface to bite on if it bites at all; the second has a different
+/// scheme/hash and no optional fields, so array ORDER is meaningfully
+/// exercised (reordering changes the JCS preimage and would break the
+/// hash — acceptance criterion 3).
+fn anchors_for_round_trip() -> Vec<AnchorEntry> {
+    let mut ext = serde_json::Map::new();
+    ext.insert("commitment_id".into(), json!("cmt-782"));
+    ext.insert("sealed_amount".into(), json!(478231));
+    // Numeric-normalization probe: `1e-7` is a value Postgres's `jsonb` type
+    // is known to re-render differently (in text form) from what
+    // `serde_json` produces — unlike the plain positive integer above,
+    // which round-trips through JSONB unchanged either way. Without this,
+    // the round-trip proof only demonstrates field *presence*, not
+    // resilience to JSONB's number normalization, which is the actual risk
+    // this phase is about.
+    ext.insert("normalization_probe".into(), json!(1e-7));
+    let first = AnchorEntry {
+        scheme: "macp.commitment".to_string(),
+        // Shape reference only: anc-001's anchor content_hash literal
+        // (spec schemas/conformance/anc-001-well-formed-anchor.json,
+        // not present in this repo), reused here as an arbitrary-but-valid
+        // external digest — not recomputed over anything in this test, and
+        // unrelated to this request's own (freshly computed) top-level
+        // `content_hash`.
+        content_hash: ContentHash::parse(
+            "sha256:fa8fe6b9143b469866d31de09b81928cc44d226ed935162cd346ae80d14fd200",
+        )
+        .unwrap(),
+        uri: Some("https://example.test/commitments/782".to_string()),
+        extensions: ext,
+    };
+    let second = AnchorEntry {
+        // Deliberately sorts BEFORE `first.scheme` ("macp.commitment")
+        // alphabetically, so a "helpful" ascending sort by `scheme` (or by
+        // the first serialized field) is not a no-op on this fixture and
+        // would actually change the served order — which the
+        // order-preservation tests below would then catch.
+        scheme: "aaa.artifact".to_string(),
+        content_hash: ContentHash::parse(format!("sha256:{}", "9".repeat(64))).unwrap(),
+        uri: None,
+        extensions: Default::default(),
+    };
+    vec![first, second]
+}
+
+/// Publish an `anchors_for_round_trip()`-carrying body through `app`
+/// (which must be a 0.5.0-advertising harness), returning the ctx_id and
+/// the self-consistent request that was actually sent (its `content_hash`
+/// is the value the round trip must reproduce).
+async fn publish_anchored_round_trip(
+    app: &axum::Router,
+    seed: u8,
+) -> (String, acdp::types::publish::PublishRequest) {
+    let anchors = anchors_for_round_trip();
+    let req = producer(seed)
+        .publish_request()
+        .title("anchors byte-exact round trip")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .acdp_version("0.5.0")
+        .anchors(anchors)
+        .build()
+        .unwrap();
+    let (status, v) = publish(app, &req, None).await;
+    assert_eq!(status, StatusCode::OK, "publish body = {v}");
+    let ctx_id = v["ctx_id"].as_str().unwrap().to_string();
+    (ctx_id, req)
+}
+
+/// Assert the byte-exact round trip against an already-served body value
+/// (either the nested `full["body"]` from `GET /contexts/{ctx_id}` or the
+/// bare `GET /contexts/{ctx_id}/body` response): served `anchors` deep-equal
+/// to what was sent (order-sensitive, on the raw `Value` — `AnchorEntry` has
+/// no `Eq`/`Hash`), AND `compute_content_hash` over the served body
+/// reproduces the published `content_hash`.
+fn assert_anchors_round_trip_byte_exact(
+    label: &str,
+    served_body: &Value,
+    sent_anchors: &[AnchorEntry],
+    expected_content_hash: &ContentHash,
+) {
+    let sent_anchors_json = serde_json::to_value(sent_anchors).unwrap();
+    assert_eq!(
+        served_body["anchors"], sent_anchors_json,
+        "{label}: served anchors must be order-preserving deep-equal (raw JSON) to what was sent"
+    );
+    let served_anchors: Vec<AnchorEntry> =
+        serde_json::from_value(served_body["anchors"].clone()).unwrap();
+    assert_eq!(
+        &served_anchors, sent_anchors,
+        "{label}: served anchors must be deep-equal on the typed struct too"
+    );
+
+    // The assertion that actually proves byte-exactness: PartialEq on a
+    // deserialized struct is not enough (rejected explicitly by the plan) —
+    // recompute content_hash over the served body and confirm it
+    // reproduces the content_hash that was actually published.
+    let recomputed = acdp::crypto::compute_content_hash(served_body).unwrap();
+    assert_eq!(
+        &recomputed, expected_content_hash,
+        "{label}: compute_content_hash over the served body must reproduce the published content_hash"
+    );
+}
+
+/// Acceptance criteria 1 + 3 (sqlite): publish -> retrieve (both
+/// `/contexts/{ctx_id}` and `/contexts/{ctx_id}/body`) -> recompute ->
+/// matches. Also runs the live mutation check (criterion 4): stripping
+/// `anchors` from the served value before recomputing MUST turn the
+/// hash-recompute assertion red, proving the test actually measures what
+/// it claims.
+#[tokio::test]
+async fn anchors_round_trip_byte_exact_sqlite() {
+    let h = harness_050(true).await;
+    let (ctx_id, req) = publish_anchored_round_trip(&h.router, 230).await;
+    let sent_anchors = req.anchors.clone().expect("anchors were sent");
+
+    let (status, full) = get_json(
+        &h.router,
+        &format!("/contexts/{}", pct_encode_path_segment(&ctx_id)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{full}");
+    let served_full_body = full["body"].clone();
+
+    let (status, bare) = get_json(
+        &h.router,
+        &format!("/contexts/{}/body", pct_encode_path_segment(&ctx_id)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{bare}");
+
+    assert_anchors_round_trip_byte_exact(
+        "GET /contexts/{ctx_id} (nested body)",
+        &served_full_body,
+        &sent_anchors,
+        &req.content_hash,
+    );
+    assert_anchors_round_trip_byte_exact(
+        "GET /contexts/{ctx_id}/body (bare)",
+        &bare,
+        &sent_anchors,
+        &req.content_hash,
+    );
+
+    // ── Live mutation check (criterion 4) ──
+    // Simulate `anchors` being dropped by the serving path and confirm the
+    // hash-recompute assertion actually goes RED — otherwise the assertion
+    // above would pass vacuously and the test would not be measuring
+    // byte-exactness at all.
+    let mut mutated = served_full_body.clone();
+    mutated
+        .as_object_mut()
+        .expect("served body is a JSON object")
+        .remove("anchors");
+    let mutated_hash = acdp::crypto::compute_content_hash(&mutated).unwrap();
+    assert_ne!(
+        &mutated_hash, &req.content_hash,
+        "mutation check: dropping anchors from the served body must change the recomputed \
+         hash — if it doesn't, the round-trip assertion above is not exercising anchors"
+    );
+    // (mutated is a local copy; nothing to restore — the actual served
+    // response above was never touched by this check.)
+}
+
+/// Acceptance criterion 3, isolated (sqlite): a two-anchor body preserves
+/// array ORDER specifically across a fresh publish -> retrieve, independent
+/// of the byte-exactness assertions above — reordering changes the JCS
+/// preimage (and therefore the recomputed hash), which is exactly what
+/// `anchors_round_trip_byte_exact_sqlite` already proves; this test pins
+/// the order check on its own so a future refactor of that combined test
+/// can't silently drop order coverage. Mirrors
+/// `pg_integration.rs`'s `pg_anchors_two_entries_preserve_order`.
+#[tokio::test]
+async fn anchors_two_entries_preserve_order_sqlite() {
+    let h = harness_050(true).await;
+
+    let anchors = anchors_for_round_trip();
+    assert_eq!(anchors[0].scheme, "macp.commitment");
+    assert_eq!(anchors[1].scheme, "aaa.artifact");
+
+    let req = producer(232)
+        .publish_request()
+        .title("anchors order preserved sqlite")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .acdp_version("0.5.0")
+        .anchors(anchors.clone())
+        .build()
+        .unwrap();
+    let (status, v) = publish(&h.router, &req, None).await;
+    assert_eq!(status, StatusCode::OK, "publish body = {v}");
+    let ctx_id = v["ctx_id"].as_str().unwrap().to_string();
+
+    let (status, bare) = get_json(
+        &h.router,
+        &format!("/contexts/{}/body", pct_encode_path_segment(&ctx_id)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{bare}");
+    let served = bare["anchors"].as_array().expect("anchors array served");
+    assert_eq!(served.len(), 2, "both anchors served");
+    assert_eq!(
+        served[0]["scheme"], "macp.commitment",
+        "first anchor must stay first (order-sensitive, not a set)"
+    );
+    assert_eq!(
+        served[1]["scheme"], "aaa.artifact",
+        "second anchor must stay second — a 'helpful' sort would silently reorder this \
+         (its scheme sorts alphabetically BEFORE the first anchor's, so an ascending sort \
+         would actually move it and get caught here)"
+    );
+}
+
+// ─── REG-3 Phase 6: RFC-ACDP-0016 §6 — `anchors[].uri` is never dereferenced ───
+//
+// Behavioral half. The companion structural ratchet
+// (`crates/acdp-registry-server/tests/anchors_uri_never_dereferenced.rs`)
+// enumerates every outbound-HTTP call site in the workspace and pins the
+// set to exactly the three legitimate ones — this test instead proves the
+// specific publish/retrieve path never dials `anchors[0].uri`, with the
+// webhook subsystem (the one thing near the publish path that *does* make
+// a real outbound call) live at the same time, so "zero connections on the
+// anchor listener" is a discriminating claim rather than an artifact of a
+// harness that makes no outbound calls at all.
+
+/// Accepts connections on `listener` until it is dropped, bumping `conns`
+/// for every one accepted and replying `200 OK` so a real client on the
+/// other end (the webhook worker, below) completes a delivery attempt
+/// instead of retrying against a socket that never answers. Mirrors the
+/// accept-loop idiom in `acdp-registry-webhook/src/lib.rs`'s own test
+/// module (`respond_with_statuses`).
+async fn count_connections_and_reply_ok(
+    listener: tokio::net::TcpListener,
+    conns: Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        conns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut buf = [0u8; 1024];
+        let _ = socket.read(&mut buf).await;
+        let _ = socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await;
+    }
+}
+
+/// Acceptance criteria 1-3: publish a context whose `anchors[0].uri` targets
+/// a live loopback listener, retrieve it back, and assert the listener
+/// observed zero connections at every point — while webhook delivery
+/// (pointed at a *second*, independent loopback listener) is live and
+/// actually fires, proving this isn't a vacuous "nothing makes outbound
+/// calls at all" harness.
+///
+/// CRITICAL (acceptance criterion 3): both the webhook target and the SSRF
+/// guard itself are configured with `SsrfPolicy::allow_test_loopback()`, so
+/// the guard is provably *not* what keeps the anchor listener silent. The
+/// claim under test is "nothing attempts the connection" — not "a guard
+/// blocked it". A test that only passed because the strict default guard
+/// rejects loopback URIs would keep passing even after someone wired a real
+/// anchor fetch behind a policy that allow-lists the target host.
+#[tokio::test]
+async fn anchors_uri_never_dereferenced_publish_and_retrieve() {
+    let anchor_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind anchor listener");
+    let anchor_port = anchor_listener.local_addr().expect("addr").port();
+    let anchor_conns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    tokio::spawn(count_connections_and_reply_ok(
+        anchor_listener,
+        anchor_conns.clone(),
+    ));
+
+    // Deliberately a *different* listener from the anchor target above, so
+    // a webhook delivery connection can never be mistaken for (or mask) a
+    // connection to the anchor listener.
+    let webhook_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind webhook listener");
+    let webhook_addr = webhook_listener.local_addr().expect("addr");
+    let webhook_conns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    tokio::spawn(count_connections_and_reply_ok(
+        webhook_listener,
+        webhook_conns.clone(),
+    ));
+
+    let mut cfg = config(true);
+    cfg.webhook = WebhookConfig {
+        enabled: true,
+        url: format!("http://{webhook_addr}/hook"),
+        secret: "phase6-webhook-secret".into(),
+        ..WebhookConfig::default()
+    };
+    // See the CRITICAL note on the test doc comment: the guard is opened up
+    // on purpose. This harness's webhook target is a loopback address the
+    // strict default `SsrfPolicy` would reject outright, so leaving the
+    // guard strict here would make the *guard* the reason nothing reaches
+    // the anchor listener either, defeating the point of this test.
+    let webhook = acdp_registry_webhook::WebhookEmitter::spawn_with_policy(
+        cfg.webhook.clone(),
+        acdp::safe_http::SsrfPolicy::allow_test_loopback(),
+    );
+    let h = build_harness_with_webhook(cfg, caps_050(), None, Some(webhook)).await;
+
+    let anchor = AnchorEntry {
+        scheme: "macp.commitment".to_string(),
+        content_hash: ContentHash::parse(format!("sha256:{}", "c".repeat(64))).unwrap(),
+        uri: Some(format!("http://127.0.0.1:{anchor_port}/anchor")),
+        extensions: Default::default(),
+    };
+    let req = producer(240)
+        .publish_request()
+        .title("anchors uri never dereferenced")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .acdp_version("0.5.0")
+        .anchors(vec![anchor])
+        .build()
+        .unwrap();
+
+    // Criterion 1: publish returns 200, and — after a bounded drain window,
+    // not an immediate check — the anchor listener saw nothing.
+    let (status, v) = publish(&h.router, &req, None).await;
+    assert_eq!(status, StatusCode::OK, "publish body = {v}");
+    let ctx_id = v["ctx_id"].as_str().unwrap().to_string();
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        anchor_conns.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "publish must not have dialed anchors[0].uri"
+    );
+
+    // Criterion 2: retrieve returns 200 with anchors[0].uri intact, and the
+    // anchor listener is still silent.
+    let (status, full) = get_json(
+        &h.router,
+        &format!("/contexts/{}", pct_encode_path_segment(&ctx_id)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{full}");
+    assert_eq!(
+        full["body"]["anchors"][0]["uri"],
+        format!("http://127.0.0.1:{anchor_port}/anchor"),
+        "anchors[0].uri must be served back intact: {full}"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        anchor_conns.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "retrieve must not have dialed anchors[0].uri either"
+    );
+
+    // Sanity check that this harness genuinely exercises a live
+    // outbound-HTTP subsystem near the publish path (webhook delivery) —
+    // without this, "anchor_conns == 0" would be equally true of a
+    // harness that makes no outbound calls whatsoever, which would prove
+    // nothing about anchors specifically.
+    assert!(
+        webhook_conns.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "sanity: webhook delivery should have reached webhook_listener at least once — if it \
+         didn't, this test isn't exercising a live outbound-HTTP subsystem and the \
+         anchor_conns == 0 assertions above would hold even for a broken harness"
+    );
 }

@@ -265,17 +265,20 @@ Hot-reload the `[playground]` section with `POST /admin/pinned-keys/reload`
 ### `[receipt]` *(ACDP 0.2.0)*
 
 Registry-receipt signing identity (RFC-ACDP-0010). Configuring a key enables
-receipt minting, the `acdp-registry-receipts` profile, the `acdp_version:
-0.2.0` capability claim, and `GET /.well-known/did.json`. Leave unset to stay
-a 0.1.0 receipt-less registry. See [RECEIPTS.md](RECEIPTS.md) for the
-operator runbook (rotation, retention, backfill policy).
+receipt minting, the `acdp-registry-receipts` profile, and
+`GET /.well-known/did.json`. Leave unset to stay a receipt-less registry.
+(`acdp_version` itself is unconditionally `"0.5.0"` as of REG-3 —
+RFC-ACDP-0016 §10's anchors claim always wins the version max() — so it no
+longer moves with `[receipt]`; the `acdp-registry-receipts` profile is what
+actually signals receipt minting is active.) See [RECEIPTS.md](RECEIPTS.md)
+for the operator runbook (rotation, retention, backfill policy).
 
 | Key | Type | Default | Notes |
 |-----|------|---------|-------|
 | `signing_key_seed_b64` | string | `""` | Standard base64 of the raw 32-byte Ed25519 seed. Exactly one of the two key sources may be set. |
 | `signing_key_path` | path | — | File (e.g. mounted secret) whose contents are that base64 string. |
 | `key_id_fragment` | string | `receipt-key-1` | Fragment under the registry DID; `signature.key_id = did:web:<authority>#<fragment>`. Pick a fresh fragment per rotation. |
-| `head_receipts` | bool | `false` | *(ACDP 0.3.0)* Mint a lineage-head receipt on every `GET /lineages/{id}/current` response (RFC-ACDP-0011). Requires a configured signing key (the same receipt key signs — no new key role); advertises `acdp-registry-head-receipts` and bumps the capability claim to `0.3.0`. |
+| `head_receipts` | bool | `false` | *(ACDP 0.3.0)* Mint a lineage-head receipt on every `GET /lineages/{id}/current` response (RFC-ACDP-0011). Requires a configured signing key (the same receipt key signs — no new key role); advertises `acdp-registry-head-receipts` (`acdp_version` itself is unconditionally `"0.5.0"` as of REG-3 and no longer moves with this flag). |
 
 #### `[[receipt.retired_keys]]`
 
@@ -295,10 +298,12 @@ Lifecycle events & retraction (RFC-ACDP-0013). When enabled the registry
 serves `POST /contexts/{ctx_id}/retract` / `/republish`, derives `status`
 with the `retracted > superseded > expired > active` precedence, excludes
 retracted contexts from default search and from `/current`, serves
-`registry_state.lifecycle_events`, advertises `acdp-registry-lifecycle`,
-and bumps the capability claim to `0.3.0`. When disabled (the default)
-both endpoints answer `501 not_implemented` and neither `lifecycle_events`
-nor the `retracted` status is ever emitted.
+`registry_state.lifecycle_events`, and advertises `acdp-registry-lifecycle`
+(`acdp_version` itself is unconditionally `"0.5.0"` as of REG-3 —
+RFC-ACDP-0016 §10's anchors claim always wins the version max() — and no
+longer moves with this flag). When disabled (the default) both endpoints
+answer `501 not_implemented` and neither `lifecycle_events` nor the
+`retracted` status is ever emitted.
 
 | Key | Type | Default | Notes |
 |-----|------|---------|-------|
@@ -321,10 +326,11 @@ the context row and its receipt** (§7.1 — the body, the receipt, and the
 leaf commit together, or none does; a publish that cannot durably append
 its leaf fails), serves `GET /log/checkpoint`, `GET /log/proof`, and
 `GET /log/entries`, signs checkpoints with the `[receipt]` key (§6: no new
-key role), advertises `acdp-registry-transparency-log`, and bumps the
-capability claim to `0.3.0`. When disabled (the default) the three
-`/log/*` endpoints answer `501 not_implemented`. There is no degraded mode
-and no `log_unavailable` error.
+key role), and advertises `acdp-registry-transparency-log` (`acdp_version`
+itself is unconditionally `"0.5.0"` as of REG-3 and no longer moves with
+this flag). When disabled (the default) the three `/log/*` endpoints
+answer `501 not_implemented`. There is no degraded mode and no
+`log_unavailable` error.
 
 Prerequisites (enforced at startup): a configured `[receipt]` signing key
 and a durable storage backend (`sqlite` or `postgres`).
@@ -372,10 +378,12 @@ Aggregation is a pure convenience: the registry never holds a witness key,
 so it can neither forge a cosignature nor make itself a trust dependency —
 a consumer MAY always fetch direct from a witness (§6.2). There is **no new
 capability flag or profile**: a registry that aggregates does so under its
-existing `acdp-registry-transparency-log` profile (§10). Configuring
-`[[witnesses]]` does, however, raise the served `.well-known/acdp.json`
-`acdp_version` claim to `"0.4.0"`, since witness cosignature aggregation is
-itself the §6.1 wire member — see
+existing `acdp-registry-transparency-log` profile (§10). `acdp_version`
+served at `.well-known/acdp.json` is unconditionally `"0.5.0"` as of REG-3
+(RFC-ACDP-0016 §10's anchors claim always wins the version max()), so
+configuring `[[witnesses]]` no longer moves it; whether aggregation is
+active is visible in the response body (whether `witness_signatures`
+accompanies a checkpoint) — see
 [HTTP-API.md](HTTP-API.md#get-well-knownacdpjson).
 
 Prerequisites (enforced at startup): `log.enabled = true` (there are no

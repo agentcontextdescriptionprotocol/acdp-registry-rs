@@ -314,6 +314,48 @@ async fn publish_inner<S: ExtendedRegistryStore + 'static>(
     // uniformly to `/auth/*` and any future endpoint, not just publish.
     let req: PublishRequest = serde_json::from_slice(&body)
         .map_err(|e| RegistryError::Acdp(acdp::error::AcdpError::SchemaViolation(e.to_string())))?;
+
+    // RFC-ACDP-0016 §10 + §14: a publish carrying `anchors` MUST be rejected
+    // unless BOTH the registry's own advertised `acdp_version` (§10) and the
+    // request's own declared `acdp_version` (§14) are >= 0.5.0. Checked here,
+    // immediately after the body parses and before the rate limiter, so:
+    //   - a malformed-JSON body still 400s as a parse error, not a version
+    //     error (this gate never runs on an unparseable body);
+    //   - a rejected-by-version publish never consumes a producer's publish
+    //     budget (it runs before the limiter check below);
+    //   - it sits above the did:key / playground-pinned / test-only /
+    //     default did:web branch further down, so one check covers all four
+    //     publish paths.
+    // Absent `acdp_version` on the request means `0.1.0` per VERSIONING.md's
+    // layers table ("Body version — body.acdp_version (optional); absent =>
+    // 0.1.0") — i.e. absent means *reject* when anchors are present. `null`
+    // never reaches here: `de_present` rejects a literal JSON null for this
+    // field at deserialize time, before this gate runs.
+    //
+    // No new error variant / wire code: RFC-ACDP-0016 §10 explicitly
+    // rejected minting a dedicated anchor-specific error code, so both
+    // halves of this gate reuse the existing `schema_violation` idiom below.
+    if req.anchors.is_some() {
+        let advertised = &state.server.capabilities().acdp_version;
+        if !version_at_least(advertised, 0, 5) {
+            return Err(RegistryError::Acdp(
+                acdp::error::AcdpError::SchemaViolation(format!(
+                    "anchors requires a registry advertising acdp_version >= 0.5.0 \
+                     (RFC-ACDP-0016 §10); this registry advertises '{advertised}'"
+                )),
+            ));
+        }
+        let declared = req.acdp_version.as_deref().unwrap_or("0.1.0");
+        if !version_at_least(declared, 0, 5) {
+            return Err(RegistryError::Acdp(
+                acdp::error::AcdpError::SchemaViolation(format!(
+                    "anchors requires the publish request to declare acdp_version >= 0.5.0 \
+                     (RFC-ACDP-0016 §14); this request declared '{declared}'"
+                )),
+            ));
+        }
+    }
+
     // RFC-ACDP-0003 §6.1/§6.2.1: the Idempotency-Key value is 1–256 ASCII
     // printable characters. An empty, over-long, or non-printable value is
     // treated as ABSENT (the publish proceeds without idempotency) — NOT
@@ -591,6 +633,70 @@ async fn publish_inner<S: ExtendedRegistryStore + 'static>(
     }
 
     Ok(Json(response))
+}
+
+/// `RFC-ACDP-0016` §10/§14 version-gate predicate: is `v` >= `major.minor`?
+///
+/// Reimplemented here rather than reused because `acdp-validation`'s own
+/// `version_at_least` is a private `fn`, not re-exported by the `acdp`
+/// facade crate. Deliberately **stricter** than that upstream helper (which
+/// only requires two leading numeric components and ignores the rest): this
+/// copies the strictness of `acdp-server`'s `require_min_acdp_version`
+/// instead — a version string must split into *exactly* three `.`-separated
+/// components, each a plain unsigned integer (`MAJOR.MINOR.PATCH`), or the
+/// whole string fails closed. Fail-closed matters here because an
+/// unparseable version must be treated as *below* 0.5.0 (i.e. still
+/// rejected when anchors are present), never silently accepted.
+///
+/// Comparison is numeric, not lexical — `"0.10.0"` must compare `>=`
+/// `"0.5.0"` rather than losing to it because `"10" < "5"` as strings.
+fn version_at_least(v: &str, major: u64, minor: u64) -> bool {
+    let Ok(parts) = v
+        .split('.')
+        .map(|p| p.parse::<u64>())
+        .collect::<Result<Vec<u64>, _>>()
+    else {
+        return false;
+    };
+    let [ma, mi, _patch] = parts.as_slice() else {
+        return false;
+    };
+    *ma > major || (*ma == major && *mi >= minor)
+}
+
+#[cfg(test)]
+mod version_at_least_tests {
+    use super::version_at_least;
+
+    #[test]
+    fn below_0_5_is_false() {
+        assert!(!version_at_least("0.4.9", 0, 5));
+    }
+
+    #[test]
+    fn exactly_0_5_0_is_true() {
+        assert!(version_at_least("0.5.0", 0, 5));
+    }
+
+    #[test]
+    fn numeric_not_lexical_comparison() {
+        // The classic bug: "10" < "5" lexically but 10 >= 5 numerically.
+        assert!(version_at_least("0.10.0", 0, 5));
+    }
+
+    #[test]
+    fn higher_major_is_true() {
+        assert!(version_at_least("1.0.0", 0, 5));
+    }
+
+    #[test]
+    fn malformed_versions_fail_closed() {
+        assert!(!version_at_least("", 0, 5));
+        assert!(!version_at_least("0.5", 0, 5));
+        assert!(!version_at_least("x.y.z", 0, 5));
+        assert!(!version_at_least("0.5.0-draft", 0, 5));
+        assert!(!version_at_least("0.5.0.1", 0, 5));
+    }
 }
 
 /// DESIGN-04: same typed accessor as in the storage backends.
