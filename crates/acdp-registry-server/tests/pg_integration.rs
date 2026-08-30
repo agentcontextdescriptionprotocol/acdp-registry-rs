@@ -27,6 +27,7 @@ use acdp::producer::Producer;
 use acdp::registry::RegistryServer;
 use acdp::types::capabilities::{CapabilitiesDocument, Limits};
 use acdp::types::primitives::{AgentDid, ContextType, Visibility};
+use acdp::{AnchorEntry, ContentHash};
 use acdp_registry_auth::{
     AuthService, ChallengeStore, InMemoryChallengeStore, JwtSecret, JwtSigner,
 };
@@ -138,6 +139,26 @@ async fn truncate(pool: &sqlx::PgPool) {
 }
 
 async fn harness(playground: bool, url: &str) -> axum::Router {
+    harness_with_caps(playground, url, caps()).await
+}
+
+/// REG-3 Phase 5 (plans/reg3-anchors.md): 0.5.0 capabilities document —
+/// the §10 half of the anchors version gate. Mirrors `http_integration.rs`'s
+/// `caps_050()`.
+fn caps_050() -> CapabilitiesDocument {
+    let mut c = caps();
+    c.acdp_version = "0.5.0".into();
+    c
+}
+
+/// Like [`harness`] but with a caller-supplied capabilities document — used
+/// by the anchors round-trip tests to reach `acdp_version >= 0.5.0` on the
+/// registry-advertised side of the gate.
+async fn harness_with_caps(
+    playground: bool,
+    url: &str,
+    caps: CapabilitiesDocument,
+) -> axum::Router {
     let store = PgStore::connect(url, 4).await.unwrap();
     store.migrate().await.unwrap();
     // Reach into the underlying pool to truncate via a fresh connection.
@@ -145,7 +166,7 @@ async fn harness(playground: bool, url: &str) -> axum::Router {
     truncate(&pool).await;
     pool.close().await;
 
-    let server = Arc::new(RegistryServer::try_new(store, caps(), AUTHORITY).unwrap());
+    let server = Arc::new(RegistryServer::try_new(store, caps, AUTHORITY).unwrap());
     let challenges: Arc<dyn ChallengeStore> = Arc::new(InMemoryChallengeStore::new());
     let secret = JwtSecret::from_bytes(&[42u8; 32]);
     let signer = JwtSigner::new(secret, format!("did:web:{AUTHORITY}"), AUTHORITY.into(), 30);
@@ -159,6 +180,12 @@ async fn harness(playground: bool, url: &str) -> axum::Router {
     ));
     let state = AppStateInner::new(server, auth, None, config(playground), None);
     build_router(state)
+}
+
+/// Playground-on, 0.5.0-advertising harness — the §10 half of the REG-3
+/// anchors version gate. Mirrors `http_integration.rs`'s `harness_050`.
+async fn harness_050(playground: bool, url: &str) -> axum::Router {
+    harness_with_caps(playground, url, caps_050()).await
 }
 
 fn producer(seed: u8) -> Producer {
@@ -602,4 +629,224 @@ async fn pg_receipt_atomicity_and_round_trip() {
         .unwrap()
         .expect("context exists");
     assert_eq!(fetched.registry_receipt, Some(receipt));
+}
+
+// ─── REG-3 Phase 5: byte-exact round-trip (Postgres) ───
+//
+// `plans/reg3-anchors.md` Phase 5: mirrors `http_integration.rs`'s sqlite
+// leg exactly, against `PgStore`. **Mandatory, not optional** — the plan is
+// explicit that this is the phase's real risk: sqlite stores the body as
+// `TEXT` (`serde_json::to_string`), Postgres as `JSONB`
+// (`serde_json::to_value`), and JSONB is a normalizing representation
+// (number re-rendering, key dedup/reorder) where TEXT is not. That
+// asymmetry is already latent for every arbitrary-JSON field this repo
+// stores (`metadata`, and now `AnchorEntry.extensions`) and has apparently
+// never been pinned by a cross-backend byte-exactness test before this.
+
+async fn get_json(app: &axum::Router, uri: &str) -> (StatusCode, Value) {
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let v = body_to_json(resp).await;
+    (status, v)
+}
+
+/// Two anchors: the first mirrors anc-001's shape
+/// (spec schemas/conformance/anc-001-well-formed-anchor.json, not present
+/// in this repo) but adds a `uri` and a flattened extension key
+/// (`AnchorEntry.extensions`) so Postgres's JSONB normalization has real
+/// surface to bite on; the second has a different scheme/hash and no
+/// optional fields, so array ORDER is meaningfully exercised (acceptance
+/// criterion 3). anc-001's anchor `content_hash` literal is reused only for
+/// shape — an arbitrary-but-valid external digest, unrelated to this
+/// request's own freshly computed top-level `content_hash` (anc-001's own
+/// placeholders are NOT replayed; see its `input.notes`).
+fn anchors_for_round_trip() -> Vec<AnchorEntry> {
+    let mut ext = serde_json::Map::new();
+    ext.insert("commitment_id".into(), json!("cmt-782"));
+    ext.insert("sealed_amount".into(), json!(478231));
+    // Numeric-normalization probe: `1e-7` is a value Postgres's `jsonb`
+    // type is known to re-render differently (in text form) from what
+    // `serde_json` produces — unlike the plain positive integer above,
+    // which round-trips through JSONB unchanged either way. Without this,
+    // the round-trip proof only demonstrates field *presence*, not
+    // resilience to JSONB's number normalization, which is the actual risk
+    // this phase is about.
+    ext.insert("normalization_probe".into(), json!(1e-7));
+    let first = AnchorEntry {
+        scheme: "macp.commitment".to_string(),
+        content_hash: ContentHash::parse(
+            "sha256:fa8fe6b9143b469866d31de09b81928cc44d226ed935162cd346ae80d14fd200",
+        )
+        .unwrap(),
+        uri: Some("https://example.test/commitments/782".to_string()),
+        extensions: ext,
+    };
+    let second = AnchorEntry {
+        // Deliberately sorts BEFORE `first.scheme` ("macp.commitment")
+        // alphabetically, so a "helpful" ascending sort by `scheme` (or by
+        // the first serialized field) is not a no-op on this fixture and
+        // would actually change the served order — which
+        // `pg_anchors_two_entries_preserve_order` below would then catch.
+        scheme: "aaa.artifact".to_string(),
+        content_hash: ContentHash::parse(format!("sha256:{}", "9".repeat(64))).unwrap(),
+        uri: None,
+        extensions: Default::default(),
+    };
+    vec![first, second]
+}
+
+fn assert_anchors_round_trip_byte_exact(
+    label: &str,
+    served_body: &Value,
+    sent_anchors: &[AnchorEntry],
+    expected_content_hash: &ContentHash,
+) {
+    let sent_anchors_json = serde_json::to_value(sent_anchors).unwrap();
+    assert_eq!(
+        served_body["anchors"], sent_anchors_json,
+        "{label}: served anchors must be order-preserving deep-equal (raw JSON) to what was sent"
+    );
+    let served_anchors: Vec<AnchorEntry> =
+        serde_json::from_value(served_body["anchors"].clone()).unwrap();
+    assert_eq!(
+        &served_anchors, sent_anchors,
+        "{label}: served anchors must be deep-equal on the typed struct too"
+    );
+
+    // The assertion that actually proves byte-exactness (not PartialEq on a
+    // deserialized struct, which the plan explicitly rejects as
+    // insufficient): recompute content_hash over the served body — read
+    // back from Postgres's JSONB column — and confirm it reproduces the
+    // content_hash that was actually published.
+    let recomputed = acdp::crypto::compute_content_hash(served_body).unwrap();
+    assert_eq!(
+        &recomputed, expected_content_hash,
+        "{label}: compute_content_hash over the served (Postgres-JSONB-round-tripped) body \
+         must reproduce the published content_hash"
+    );
+}
+
+/// Acceptance criteria 2 + 3 (Postgres) + the mandatory Postgres leg of
+/// criterion 4's mutation check. Identical assertions to
+/// `http_integration.rs`'s `anchors_round_trip_byte_exact_sqlite`, run
+/// against `PgStore` — proving the sqlite leg's green result isn't hiding a
+/// JSONB-specific normalization divergence.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn pg_anchors_round_trip_byte_exact() {
+    let Some(url) = pg_url_or_skip() else { return };
+    let app = harness_050(true, &url).await;
+
+    let anchors = anchors_for_round_trip();
+    let req = producer(230)
+        .publish_request()
+        .title("pg anchors byte-exact round trip")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .acdp_version("0.5.0")
+        .anchors(anchors.clone())
+        .build()
+        .unwrap();
+    let (status, v) = publish(&app, &req, None).await;
+    assert_eq!(status, StatusCode::OK, "publish body = {v}");
+    let ctx_id = v["ctx_id"].as_str().unwrap().to_string();
+
+    let (status, full) = get_json(
+        &app,
+        &format!("/contexts/{}", pct_encode_path_segment(&ctx_id)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{full}");
+    let served_full_body = full["body"].clone();
+
+    let (status, bare) = get_json(
+        &app,
+        &format!("/contexts/{}/body", pct_encode_path_segment(&ctx_id)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{bare}");
+
+    assert_anchors_round_trip_byte_exact(
+        "pg: GET /contexts/{ctx_id} (nested body)",
+        &served_full_body,
+        &anchors,
+        &req.content_hash,
+    );
+    assert_anchors_round_trip_byte_exact(
+        "pg: GET /contexts/{ctx_id}/body (bare)",
+        &bare,
+        &anchors,
+        &req.content_hash,
+    );
+
+    // ── Live mutation check (criterion 4), Postgres leg ──
+    // Simulate `anchors` being dropped from the served (JSONB-round-tripped)
+    // value and confirm the hash-recompute assertion actually goes RED —
+    // otherwise this Postgres leg would not be measuring byte-exactness at
+    // all, only that JSON deserialization succeeds.
+    let mut mutated = served_full_body.clone();
+    mutated
+        .as_object_mut()
+        .expect("served body is a JSON object")
+        .remove("anchors");
+    let mutated_hash = acdp::crypto::compute_content_hash(&mutated).unwrap();
+    assert_ne!(
+        &mutated_hash, &req.content_hash,
+        "pg mutation check: dropping anchors from the served body must change the recomputed \
+         hash — if it doesn't, the round-trip assertion above is not exercising anchors"
+    );
+}
+
+/// Acceptance criterion 3, isolated: a two-anchor body preserves array
+/// ORDER specifically across a fresh publish -> retrieve, independent of
+/// the byte-exactness assertions above — reordering changes the JCS
+/// preimage (and therefore the recomputed hash), which is exactly what
+/// `pg_anchors_round_trip_byte_exact` already proves; this test pins the
+/// order check on its own so a future refactor of that combined test can't
+/// silently drop order coverage.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn pg_anchors_two_entries_preserve_order() {
+    let Some(url) = pg_url_or_skip() else { return };
+    let app = harness_050(true, &url).await;
+
+    let anchors = anchors_for_round_trip();
+    assert_eq!(anchors[0].scheme, "macp.commitment");
+    assert_eq!(anchors[1].scheme, "aaa.artifact");
+
+    let req = producer(231)
+        .publish_request()
+        .title("pg anchors order preserved")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .acdp_version("0.5.0")
+        .anchors(anchors.clone())
+        .build()
+        .unwrap();
+    let (status, v) = publish(&app, &req, None).await;
+    assert_eq!(status, StatusCode::OK, "publish body = {v}");
+    let ctx_id = v["ctx_id"].as_str().unwrap().to_string();
+
+    let (status, bare) = get_json(
+        &app,
+        &format!("/contexts/{}/body", pct_encode_path_segment(&ctx_id)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{bare}");
+    let served = bare["anchors"].as_array().expect("anchors array served");
+    assert_eq!(served.len(), 2, "both anchors served");
+    assert_eq!(
+        served[0]["scheme"], "macp.commitment",
+        "first anchor must stay first (order-sensitive, not a set)"
+    );
+    assert_eq!(
+        served[1]["scheme"], "aaa.artifact",
+        "second anchor must stay second — a 'helpful' sort would silently reorder this \
+         (its scheme sorts alphabetically BEFORE the first anchor's, so an ascending sort \
+         would actually move it and get caught here)"
+    );
 }

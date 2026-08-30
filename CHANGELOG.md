@@ -8,6 +8,57 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Byte-exact `anchors` round-trip proof, both storage backends** (`REG-3`
+  Phase 5). Proves RFC-ACDP-0016 §5's normative requirement and anc-001's
+  stated post-publish invariant: `anchors` survives publish → store →
+  retrieve byte-exactly, such that `acdp::crypto::compute_content_hash`
+  over the retrieved body reproduces the published `content_hash`. No test
+  in this repo recomputed `content_hash` from a retrieved body at all
+  before this (`grep -rn compute_content_hash crates/` was zero hits) —
+  this is a first for the repo, not just for anchors.
+  `anchors_round_trip_byte_exact_sqlite` /
+  `anchors_two_entries_preserve_order_sqlite`
+  (`crates/acdp-registry-server/tests/http_integration.rs`) and
+  `pg_anchors_round_trip_byte_exact` / `pg_anchors_two_entries_preserve_order`
+  (`crates/acdp-registry-server/tests/pg_integration.rs`) publish a
+  **freshly-signed, self-consistent** request through the real router
+  (`RequestBuilder::build()` computes its own `content_hash` — anc-001's
+  own placeholder `content_hash`/`signature` are never replayed; anc-001 is
+  used only as the shape reference for the first anchor's
+  `scheme`/`content_hash`), fetch both `GET /contexts/{ctx_id}` and
+  `GET /contexts/{ctx_id}/body`, and assert against both: the served
+  `anchors` array is order-sensitive deep-equal (raw `serde_json::Value`,
+  since `AnchorEntry` has no `Eq`/`Hash`) to what was sent, AND the
+  recomputed hash matches. The two-anchor test body carries a `uri`, a
+  flattened extension key holding a plain integer
+  (`AnchorEntry.extensions`, `#[serde(flatten)]`) and a second flattened
+  key holding `1e-7` — a value Postgres's `jsonb` type is known to
+  re-render differently (in text form) from `serde_json`'s own output,
+  unlike the plain integer, which round-trips through JSONB unchanged
+  either way — on the first entry, and a structurally different second
+  entry whose `scheme` sorts alphabetically *before* the first entry's (so
+  a "helpful" ascending sort would visibly reorder the pair rather than
+  being a no-op on the fixture). Array ORDER is therefore genuinely
+  exercised (reordering changes the JCS preimage, and an accidental sort
+  would now be caught), and Postgres's JSONB storage
+  (`serde_json::to_value`, a normalizing representation — number
+  re-rendering, key dedup/reorder) has real surface to diverge from
+  SQLite's `TEXT` storage (`serde_json::to_string`) if it were going to. It
+  doesn't: both backends reproduce the published `content_hash`
+  byte-exactly — including across the `1e-7` re-rendering — run against a
+  real `postgres:16-alpine` container — **no cross-backend JSONB
+  normalization divergence found**. The PRIMARY proof of byte-exactness is
+  the hash-recomputation assertion itself: because JCS canonicalization is
+  sensitive to field drop, field mutation, and array reorder alike, a
+  passing recompute on its own already rules out all three. Each
+  round-trip test additionally runs a narrower, supplementary regression
+  guard (`assert_ne!`) that simulates `anchors` being dropped from the
+  served value and confirms the hash-recompute assertion would go red in
+  that specific case — this guard only exercises the drop case, not
+  reorder or mutation, so it does not by itself establish byte-exactness;
+  it exists to catch a regression where the recompute assertion above
+  stops actually depending on `anchors` (e.g. a future refactor that reads
+  `content_hash` from a cached field instead of recomputing it).
 - **RFC-ACDP-0016 §10/§14 version gate** (`REG-3` Phase 3). RFC-ACDP-0016
   (typed external `anchors`) is still **Draft**, not Final — this repo
   implements the two MUST-reject rules the spec defines for that field
