@@ -61,11 +61,11 @@
 //! ## Coverage ratchet (`KNOWN_FAMILIES` / `EXCUSED`)
 //!
 //! `KNOWN_FAMILIES` is the honest claim "we have looked at every fixture
-//! family the pinned spec declares" — all 28 keys of `registries/
+//! family the pinned spec declares" — all 29 keys of `registries/
 //! profiles.json`'s `fixture_families` object, each with fixtures on disk,
 //! each classified by the manifest above as replayed or skipped-with-reason.
 //! `all_conformance_fixtures_are_bucketed_into_known_families` is the ratchet
-//! itself: a 29th family (new fixture id prefix the spec adds later) fails
+//! itself: a 30th family (new fixture id prefix the spec adds later) fails
 //! the build until a human looks at it and adds it here.
 //!
 //! `EXCUSED` is a strict subset of `KNOWN_FAMILIES` naming the families this
@@ -546,7 +546,7 @@ fn resolve_fixture_dir(dir: &str) -> Option<PathBuf> {
     .find(has_json)
 }
 
-/// Exchanges replayable at spec 31cf874: pub-004, pub-005, pub-008, ret-001.
+/// Exchanges replayable at spec 417211f: pub-004, pub-005, pub-008, ret-001.
 /// A gate that accidentally over-matches must fail loudly, not quietly shrink
 /// coverage to a still-nonzero number. Raise this as coverage grows.
 const MIN_REPLAYED_EXCHANGES: usize = 4;
@@ -1372,14 +1372,15 @@ fn fixture_family_panics_naming_file_when_id_missing() {
 
 // ─── Phase 4: family-coverage ratchet (`KNOWN_FAMILIES` / `EXCUSED`) ───
 
-/// All 28 fixture families the pinned spec (`registries/profiles.json`'s
-/// `fixture_families` object) declares, as of SHA `31cf874`. Every one has
+/// All 29 fixture families the pinned spec (`registries/profiles.json`'s
+/// `fixture_families` object) declares, as of SHA `417211f`. Every one has
 /// fixtures on disk and is classified (replayed or skipped-with-reason) by
-/// this harness. Listing all 28 — not just the ones we replay — is the
-/// honest statement "we have looked at every family"; a 29th family (the
+/// this harness. Listing all 29 — not just the ones we replay — is the
+/// honest statement "we have looked at every family"; a 30th family (the
 /// spec adding a new fixture prefix) is what turns
 /// `all_conformance_fixtures_are_bucketed_into_known_families` red.
 const KNOWN_FAMILIES: &[&str] = &[
+    "anc",
     "body",
     "can",
     "caps",
