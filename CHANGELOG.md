@@ -8,6 +8,67 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`anc-001`/`anc-002`/`anc-003` move from "skipped as non-HTTP by the
+  generic replayer" to direct, fixture-driven coverage, and require-mode CI
+  is confirmed green at spec pin `417211f`** (`REG-3` Phase 7 — the closing
+  phase of `plans/reg3-anchors.md`). None of `anc-001/002/003` is replayable
+  through `crates/acdp-registry-server/tests/conformance.rs`'s generic
+  `extract_shapes` at any pin: `anc-001` expects a *positive* (2xx) publish
+  outcome carrying a `content_hash`/`signature` its own `input.notes` calls
+  placeholders that don't recompute over the fixture's own body (Shape A
+  refuses any non-400 publish outcome by design), and `anc-002`/`anc-003`
+  carry only an `input.anchor_under_test` fragment, not a full body. So,
+  following the same precedent already established for `wit-001`/`wit-004`
+  and the did:key golden vector, three new in-process tests —
+  `anc001_well_formed_anchor_is_accepted_and_round_trips`,
+  `anc002_malformed_anchor_content_hash_is_rejected`,
+  `anc003_empty_anchors_array_is_rejected_with_established_ordering` — read
+  each fixture's own data via the existing `spec_fixtures()`/`read_json`
+  helpers (resolved by the fixture's own `id` field through a directory
+  scan, not a hardcoded filename), splice it into a freshly-signed body
+  built with the same producer/`RequestBuilder` technique REG-3 Phase 5
+  uses, and publish it against a **locally-built** capabilities document
+  advertising `acdp_version: "0.5.0"` (`anc_caps_050`/`anc_harness_050` —
+  the shared `caps()`, which stays `"0.1.0"` for
+  `replays_spec_fixtures_when_present`, is never mutated). `anc-001`
+  asserts HTTP 200 (this repo's actual publish success code, not the
+  fixture's own literal `201`) plus both of the fixture's stated
+  post-publish invariants (anchors served byte-identical; recomputed
+  `content_hash` matches). `anc-002` asserts 400 `schema_violation` and its
+  doc-comment states plainly that this exercises the *upstream*
+  `acdp_validation::validate_anchors` shape check inherited from the `acdp`
+  0.8.2 bump, not this repo's own Phase 3 version gate. `anc-003` asserts
+  400 `schema_violation` on both a sub-`0.5.0` and a `0.5.0`-advertising
+  registry, and additionally pins the ordering Phase 3 already established:
+  on the sub-`0.5.0` registry this repo's own §10 version gate fires first
+  (message names §10, not the SDK's "MUST be omitted entirely" wording); on
+  the `0.5.0` registry the gate passes and the SDK's own empty-array rule
+  fires instead. `anc`'s classification is unchanged by this phase — it was
+  never `EXCUSED` and still isn't (`KNOWN_FAMILIES`'s doc-comment now
+  records the added direct coverage) — and the skip manifest in
+  `replays_spec_fixtures_when_present` still correctly shows
+  `anc: 5 (non-HTTP fixture ...)`, since the replayer itself still doesn't
+  replay any `anc-*` fixture; the three new tests run beside it, not in
+  place of it. `MIN_REPLAYED_EXCHANGES` stays at exactly 4.
+
+  `anc-004` and `anc-005` are deliberately OUT OF SCOPE: `anc-004` is a pure
+  hash-computation golden vector (no endpoint, no request) over
+  `acdp-crypto`'s JCS/hash pipeline, which this repo delegates to via the
+  `acdp` dependency and does not own — Phase 5's
+  `anchors_round_trip_byte_exact_sqlite` / `pg_anchors_round_trip_byte_exact`
+  already prove that pipeline handles anchors correctly *through this
+  repo's own storage*, which is what this repo is accountable for.
+  `anc-005` is consumer-side behavioral (a scheme-unaware verifier
+  tolerating an unknown scheme) — a registry has no verifier role, and the
+  pinned spec places all five `anc-*` fixtures in `acdp-consumer`'s
+  `required_fixtures`, never in any `acdp-registry-*` profile's.
+
+  Confirmed green: `ACDP_REQUIRE_CONFORMANCE=1 ACDP_SPEC_DIR=<pinned
+  417211f checkout> cargo test -p acdp-registry-server --features
+  storage-sqlite,playground --test conformance --test conformance_gate`
+  exits 0, with `replayed 4 exchange(s); failures=0` and zero
+  `ACDP_SPEC_DIR unset` lines.
+
 - **Behavioral and structural proof that `anchors[].uri` is never
   dereferenced** (`REG-3` Phase 6). Proves RFC-ACDP-0016 §6's NORMATIVE
   rule — stricter than the DataRef SSRF posture — that "there is no code

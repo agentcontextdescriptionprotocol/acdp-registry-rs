@@ -108,14 +108,38 @@
 //! which drives `acdp::client::verify_witness_cosignature_value` and
 //! `evaluate_witness_quorum` in-process — beside, not instead of, the HTTP
 //! replayer's skip manifest below.
+//!
+//! `anc-*` (RFC-ACDP-0016 anchors) is likewise a family the generic replayer
+//! cannot reach at any pin: `anc-001` expects a positive (2xx) publish
+//! outcome with a placeholder, non-recomputable signature -- `extract_shapes`'s
+//! Shape A refuses any non-400 publish outcome by design -- and `anc-002`/
+//! `anc-003` carry only an `input.anchor_under_test` fragment, no full body.
+//! `anc-001`/`anc-002`/`anc-003` (the three registry-surface members of the
+//! family -- anchors schema acceptance at publish time) now have DIRECT
+//! fixture-driven coverage via `anc001_well_formed_anchor_is_accepted_and_round_trips`,
+//! `anc002_malformed_anchor_content_hash_is_rejected`, and
+//! `anc003_empty_anchors_array_is_rejected_with_established_ordering`, which
+//! splice each fixture's own anchor data into a freshly-signed body and
+//! publish it in-process -- beside, not instead of, the HTTP replayer's skip
+//! manifest below, which still (correctly) shows `anc` as non-HTTP-replayed.
+//! `anc-004` (a pure hash-computation golden vector over `acdp-crypto`'s
+//! JCS/hash pipeline, which this repo delegates to) and `anc-005` (consumer-
+//! side scheme-unaware-verifier tolerance -- a registry has no verifier role)
+//! are deliberately out of scope; see the doc-comments on the three tests
+//! above and the CHANGELOG for the full reasoning.
 
 #![cfg(feature = "storage-sqlite")]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use acdp::crypto::SigningKey;
+use acdp::producer::Producer;
 use acdp::registry::RegistryServer;
 use acdp::types::capabilities::{CapabilitiesDocument, Limits};
+use acdp::types::primitives::{AgentDid, ContextType, Visibility};
+use acdp::types::publish::PublishRequest;
+use acdp::AnchorEntry;
 use acdp_registry_auth::{
     AuthService, ChallengeStore, InMemoryChallengeStore, JwtSecret, JwtSigner,
 };
@@ -1164,6 +1188,393 @@ fn wit004_key_mismatch_cosignature_is_rejected_and_wit001_golden_is_accepted() {
     );
 }
 
+// ─── REG-3 Phase 7 (plans/reg3-anchors.md): anc-001/002/003 direct,
+// fixture-driven coverage ───
+//
+// None of anc-001/002/003 is replayable through `extract_shapes` at any pin
+// (Context Correction 5 in the plan): anc-001 expects a *positive* publish
+// outcome carrying a content_hash/signature its own `input.notes` calls
+// placeholders that do not recompute over the fixture's own body —
+// `extract_shapes`'s Shape A (`:389-393` above) refuses any non-400 publish
+// outcome by design, for exactly that reason — and anc-002/anc-003 carry
+// only an `input.anchor_under_test` fragment, no full body. So, following
+// the same precedent as
+// `wit004_key_mismatch_cosignature_is_rejected_and_wit001_golden_is_accepted`
+// and `did_key_golden_vector_accepted_and_gated` above, these three tests
+// consume the fixtures' own data directly and drive the registry in-process
+// instead of going through the generic replayer. They run BESIDE the
+// replayer, not instead of it — the skip manifest in
+// `replays_spec_fixtures_when_present` still (correctly) shows `anc` as
+// non-HTTP-replayed, because the replayer itself still doesn't replay any
+// anc-* fixture.
+//
+// anc-004 and anc-005 are deliberately OUT OF SCOPE for this phase (see the
+// CHANGELOG entry for the same reasoning):
+//   * anc-004 is a pure hash-computation golden vector (top-level `vectors`,
+//     no `expected.http_status`, no endpoint, no request) over
+//     `acdp-crypto`'s JCS/hash pipeline, which this repo delegates to via
+//     the `acdp` dependency and does not own. `anchors_round_trip_byte_exact_sqlite`
+//     / `pg_anchors_round_trip_byte_exact` (REG-3 Phase 5,
+//     `http_integration.rs` / `pg_integration.rs`) already prove that
+//     pipeline handles anchors correctly *through this repo's own
+//     storage*, which is the part this repo is accountable for. Duplicating
+//     anc-004 here would just re-test an upstream crate's own golden vector.
+//   * anc-005 is consumer-side behavioral (a scheme-unaware verifier
+//     tolerating an unknown scheme) — this registry has no verifier role,
+//     and the pinned spec places all five anc-* fixtures in
+//     `acdp-consumer`'s `required_fixtures`, never in any
+//     `acdp-registry-*` profile's `required_fixtures` or
+//     `conditional_fixtures`.
+
+/// Capabilities for a `0.5.0`-advertising registry, built LOCALLY for the
+/// three anc-* tests below — do NOT mutate the shared `caps()` (`:142`,
+/// `"0.1.0"`), which `replays_spec_fixtures_when_present` (and other tests)
+/// depend on. Mirrors `did_key_caps()` (`:877`)'s pattern of cloning
+/// `caps()` and bumping the one field under test.
+fn anc_caps_050() -> CapabilitiesDocument {
+    let mut c = caps();
+    c.acdp_version = "0.5.0".into();
+    c
+}
+
+/// A `0.5.0`-advertising harness, playground on (so a freshly-signed
+/// synthetic producer identity can publish without a live DID resolver) —
+/// the same shape as the file's shared `harness()` (`:205`) except for the
+/// swapped-in capabilities document, built locally the same way
+/// `did_key_harness()` (`:887`) builds its own isolated harness rather than
+/// touching the shared one.
+async fn anc_harness_050() -> axum::Router {
+    let store = SqliteStore::connect_in_memory().await.unwrap();
+    store.migrate().await.unwrap();
+    let server = Arc::new(RegistryServer::try_new(store, anc_caps_050(), AUTHORITY).unwrap());
+    let challenges: Arc<dyn ChallengeStore> = Arc::new(InMemoryChallengeStore::new());
+    let secret = JwtSecret::from_bytes(&[42u8; 32]);
+    let signer = JwtSigner::new(secret, format!("did:web:{AUTHORITY}"), AUTHORITY.into(), 30);
+    let resolver = Arc::new(acdp::did::WebResolver::new());
+    let auth = Arc::new(AuthService::new(
+        AuthConfig::default(),
+        challenges,
+        signer,
+        resolver,
+        AUTHORITY.into(),
+    ));
+    let state = AppStateInner::new(server, auth, None, config(), None);
+    build_router(state)
+}
+
+/// A signing producer identity for the anc-* tests, isolated from any other
+/// test's seed space — mirrors `http_integration.rs`'s `producer()`.
+fn anc_producer(seed: u8) -> Producer {
+    Producer::new(
+        SigningKey::from_bytes(&[seed; 32]),
+        AgentDid::new(format!("did:web:agents.test:anc-{seed}")),
+        format!("did:web:agents.test:anc-{seed}#key-1"),
+    )
+}
+
+/// POST `req` to `/contexts` on `app` and return `(status, parsed body)`.
+async fn anc_publish(app: &axum::Router, req: &PublishRequest) -> (StatusCode, Value) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/contexts")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let v = body_to_json(resp).await;
+    (status, v)
+}
+
+/// GET `uri` on `app` and return `(status, parsed body)`. A small local
+/// mirror of `http_integration.rs`'s `get_json` — this file has no such
+/// helper yet.
+async fn anc_get(app: &axum::Router, uri: &str) -> (StatusCode, Value) {
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let v = body_to_json(resp).await;
+    (status, v)
+}
+
+/// Resolve a fixture by its own `id` field via the same directory-scan
+/// mechanism `replays_spec_fixtures_when_present` / `bucketed_fixtures` use
+/// (`fixtures` must already be a resolved `spec_fixtures()` directory),
+/// rather than hardcoding a filename. Returns `None` only via a LOUD path:
+/// under `ACDP_REQUIRE_CONFORMANCE`, "no fixture with this id" is a hard
+/// panic naming both the id and the searched directory — a
+/// silently-skipped conformance test is exactly the failure mode this
+/// repo's whole ratchet exists to prevent.
+fn find_fixture_by_id(fixtures: &Path, id: &str) -> Option<Value> {
+    let entries = std::fs::read_dir(fixtures).unwrap_or_else(|e| panic!("read {fixtures:?}: {e}"));
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().map(|x| x == "json").unwrap_or(false))
+        .collect();
+    paths.sort();
+    for path in &paths {
+        let fx = read_json(path);
+        if fx.get("id").and_then(Value::as_str) == Some(id) {
+            return Some(fx);
+        }
+    }
+    assert!(
+        !require_conformance(),
+        "ACDP_REQUIRE_CONFORMANCE is set but no fixture with id \"{id}\" was found under {}",
+        fixtures.display()
+    );
+    eprintln!(
+        "conformance: no fixture with id \"{id}\" found under {}; skipping",
+        fixtures.display()
+    );
+    None
+}
+
+/// anc-001 (RFC-ACDP-0016 §4/§5): a publish body carrying one well-formed
+/// `anchors` entry must be accepted, served intact, and its recomputed
+/// `content_hash` must match. `extract_shapes`'s Shape A (`:389-393`)
+/// refuses this fixture by design — it is a *positive* publish outcome, and
+/// anc-001's own `content_hash`/`signature` are placeholders (per its
+/// `input.notes`) that don't recompute over its own body. So this test
+/// lifts only `input.body.anchors`'s SHAPE and splices it into a body it
+/// signs itself via `anc_producer` (reusing REG-3 Phase 5's
+/// test-body-construction technique), publishing on the locally-built
+/// `anc_harness_050()` — NOT the shared `caps()`/`harness()` pair
+/// `replays_spec_fixtures_when_present` uses. This repo's `POST /contexts`
+/// returns HTTP 200 on success, not the fixture's own literal
+/// `expected.http_status: 201` — established by REG-3 Phases 3-6 and
+/// reconfirmed here.
+#[tokio::test(flavor = "multi_thread")]
+async fn anc001_well_formed_anchor_is_accepted_and_round_trips() {
+    let Some(fixtures) = spec_fixtures() else {
+        eprintln!(
+            "conformance: ACDP_SPEC_DIR unset or no fixtures resolvable; skipping anc-001 \
+             (set ACDP_REQUIRE_CONFORMANCE to make this a hard failure)"
+        );
+        return;
+    };
+    let Some(fx) = find_fixture_by_id(&fixtures, "anc-001") else {
+        return;
+    };
+    let anchors_json = fx["input"]["body"]["anchors"].clone();
+    assert!(
+        anchors_json.as_array().is_some_and(|a| !a.is_empty()),
+        "anc-001 must carry a non-empty input.body.anchors array: {fx}"
+    );
+    let anchors: Vec<AnchorEntry> = serde_json::from_value(anchors_json).unwrap_or_else(|e| {
+        panic!("anc-001 input.body.anchors did not parse as Vec<AnchorEntry>: {e}")
+    });
+
+    let req = anc_producer(240)
+        .publish_request()
+        .title("anc-001 well-formed anchor")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .acdp_version("0.5.0")
+        .anchors(anchors)
+        .build()
+        .unwrap();
+
+    let app = anc_harness_050().await;
+    let (status, v) = anc_publish(&app, &req).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "anc-001: this repo's POST /contexts returns 200 on success (not the fixture's own \
+         literal 201); body = {v}"
+    );
+    let ctx_id = v["ctx_id"].as_str().unwrap().to_string();
+
+    // Post-publish invariant 1 (anc-001's own `expected.post_publish_invariants[0]`):
+    // GET returns the body with anchors present, byte-identical to what was signed.
+    let (status, served) = anc_get(
+        &app,
+        &format!("/contexts/{}/body", pct_encode_path_segment(&ctx_id)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "anc-001 GET body = {served}");
+    let sent_anchors_json = serde_json::to_value(&req.anchors).unwrap();
+    assert_eq!(
+        served["anchors"], sent_anchors_json,
+        "anc-001 invariant 1: served anchors must be byte-identical to what was signed"
+    );
+
+    // Post-publish invariant 2 (anc-001's own `expected.post_publish_invariants[1]`):
+    // content_hash recomputed over the retrieved body (anchors included)
+    // matches the stored content_hash.
+    let recomputed = acdp::crypto::compute_content_hash(&served).unwrap();
+    assert_eq!(
+        &recomputed, &req.content_hash,
+        "anc-001 invariant 2: compute_content_hash over the served body must reproduce the \
+         published content_hash"
+    );
+}
+
+/// anc-002 (RFC-ACDP-0016 §4): `anchors[].content_hash` failing the
+/// `sha256:` + 64-lowercase-hex shape must be rejected `schema_violation`.
+///
+/// IMPORTANT — this test exercises INHERITED (upstream) behavior, not this
+/// repo's own code: the check that actually fires here is
+/// `acdp_validation::validate_anchors`'s `ContentHash::parse` call, inside
+/// the `acdp` 0.8.2 dependency this repo bumped to in REG-3 Phase 2 — NOT
+/// this repo's own Phase 3 version gate (RFC-ACDP-0016 §10/§14), which runs
+/// earlier in `publish_inner` and only ever inspects the acdp_version pair,
+/// never anchor *content*. (`ContentHash`'s `Deserialize` impl is
+/// permissive — any string deserializes — so the malformed hash survives
+/// wire deserialization and is only caught by this later, explicit shape
+/// check.) This is a regression net worth having for an inherited
+/// behavior, labelled honestly as such rather than implied to be this
+/// repo's own gate.
+#[tokio::test(flavor = "multi_thread")]
+async fn anc002_malformed_anchor_content_hash_is_rejected() {
+    let Some(fixtures) = spec_fixtures() else {
+        eprintln!(
+            "conformance: ACDP_SPEC_DIR unset or no fixtures resolvable; skipping anc-002 \
+             (set ACDP_REQUIRE_CONFORMANCE to make this a hard failure)"
+        );
+        return;
+    };
+    let Some(fx) = find_fixture_by_id(&fixtures, "anc-002") else {
+        return;
+    };
+    let anchor_json = fx["input"]["anchor_under_test"].clone();
+    assert!(
+        anchor_json.is_object(),
+        "anc-002 must carry input.anchor_under_test as an object: {fx}"
+    );
+    let malformed: AnchorEntry = serde_json::from_value(anchor_json).unwrap_or_else(|e| {
+        panic!("anc-002 input.anchor_under_test did not parse as AnchorEntry: {e}")
+    });
+
+    // `.anchors(vec![malformed]).build()` would refuse this client-side —
+    // `RequestBuilder::build()` runs the SDK's own `validate_publish_request`
+    // (which calls `validate_anchors`) before ever returning, so it would
+    // reject the malformed content_hash before a request exists to send.
+    // Same technique as `gate_fires_before_sdk_empty_vec_check_on_sub_0_5_0_registry`
+    // in `http_integration.rs`: build a valid, anchors-free base request,
+    // then patch the malformed anchor onto the struct literal so the
+    // malformed body actually reaches the wire.
+    let base = anc_producer(241)
+        .publish_request()
+        .title("anc-002 malformed anchor content_hash")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .acdp_version("0.5.0")
+        .build()
+        .unwrap();
+    let req = PublishRequest {
+        anchors: Some(vec![malformed]),
+        ..base
+    };
+
+    let app = anc_harness_050().await;
+    let (status, v) = anc_publish(&app, &req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "anc-002 body = {v}");
+    assert_eq!(v["error"]["code"], "schema_violation");
+}
+
+/// anc-003 (RFC-ACDP-0016 §4): `anchors: []` must be rejected
+/// `schema_violation` — the absent-when-empty convention. Also pins the
+/// ORDERING already established by `http_integration.rs`'s
+/// `gate_fires_before_sdk_empty_vec_check_on_sub_0_5_0_registry` /
+/// `empty_anchors_still_rejected_downstream_once_gate_passes` (REG-3 Phase
+/// 3): on a sub-0.5.0 registry this repo's OWN §10 version gate fires
+/// first (it runs at the very top of `publish_inner`, before the SDK's
+/// validator ever sees the body); on a 0.5.0-advertising registry the gate
+/// passes and the SDK's own `validate_anchors` empty-vec rule fires
+/// instead. Both outcomes are 400/`schema_violation` at the HTTP level, so
+/// this test distinguishes them by the specific error MESSAGE — exactly as
+/// the two `http_integration.rs` tests above do — so a future reordering of
+/// the two checks would flip which message appears and be caught here.
+#[tokio::test(flavor = "multi_thread")]
+async fn anc003_empty_anchors_array_is_rejected_with_established_ordering() {
+    let Some(fixtures) = spec_fixtures() else {
+        eprintln!(
+            "conformance: ACDP_SPEC_DIR unset or no fixtures resolvable; skipping anc-003 \
+             (set ACDP_REQUIRE_CONFORMANCE to make this a hard failure)"
+        );
+        return;
+    };
+    let Some(fx) = find_fixture_by_id(&fixtures, "anc-003") else {
+        return;
+    };
+    let anchor_under_test = fx["input"]["anchor_under_test"].clone();
+    assert_eq!(
+        anchor_under_test,
+        json!([]),
+        "anc-003 must carry input.anchor_under_test == [] (empty array): {fx}"
+    );
+
+    // Sub-0.5.0 registry: this repo's own §10 version gate fires first.
+    let sub_050_app = harness().await; // shared caps(): acdp_version "0.1.0"
+    let base_sub = anc_producer(242)
+        .publish_request()
+        .title("anc-003 empty anchors, sub-0.5.0 registry")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let req_sub = PublishRequest {
+        anchors: Some(vec![]),
+        ..base_sub
+    };
+    let (status, v) = anc_publish(&sub_050_app, &req_sub).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "anc-003 (sub-0.5.0) body = {v}"
+    );
+    assert_eq!(v["error"]["code"], "schema_violation");
+    let msg = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("\u{a7}10"),
+        "anc-003 on a sub-0.5.0 registry: the version gate, not the SDK's empty-vec check, \
+         must fire first: {msg}"
+    );
+    assert!(
+        !msg.contains("MUST be omitted entirely"),
+        "anc-003 on a sub-0.5.0 registry: the SDK's empty-vec message must not be the one \
+         surfaced here: {msg}"
+    );
+
+    // 0.5.0 registry: the gate passes, so the SDK's own empty-vec rule fires.
+    let app_050 = anc_harness_050().await;
+    let base_050 = anc_producer(243)
+        .publish_request()
+        .title("anc-003 empty anchors, 0.5.0 registry")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .acdp_version("0.5.0")
+        .build()
+        .unwrap();
+    let req_050 = PublishRequest {
+        anchors: Some(vec![]),
+        ..base_050
+    };
+    let (status, v) = anc_publish(&app_050, &req_050).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "anc-003 (0.5.0) body = {v}"
+    );
+    assert_eq!(v["error"]["code"], "schema_violation");
+    let msg = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("MUST be omitted entirely"),
+        "anc-003 on a 0.5.0 registry: once the gate passes, the SDK's own empty-vec check \
+         must fire: {msg}"
+    );
+}
+
 // ─── Phase 1: harness fidelity gates ───
 
 /// A fixture whose `applies_to_profiles` is disjoint from `HARNESS_PROFILES`
@@ -1379,6 +1790,17 @@ fn fixture_family_panics_naming_file_when_id_missing() {
 /// honest statement "we have looked at every family"; a 30th family (the
 /// spec adding a new fixture prefix) is what turns
 /// `all_conformance_fixtures_are_bucketed_into_known_families` red.
+///
+/// `anc` (RFC-ACDP-0016 anchors) stays classified "non-HTTP fixture" by the
+/// generic replay harness (`extract_shapes`'s Shape A refuses `anc-001`'s
+/// positive/placeholder-signature publish outcome by design, and
+/// `anc-002`/`anc-003` carry no full body) — but `anc-001`/`anc-002`/
+/// `anc-003` now have DIRECT fixture-driven coverage (REG-3 Phase 7,
+/// `plans/reg3-anchors.md`) via `anc001_well_formed_anchor_is_accepted_and_round_trips`,
+/// `anc002_malformed_anchor_content_hash_is_rejected`, and
+/// `anc003_empty_anchors_array_is_rejected_with_established_ordering`, same
+/// precedent as `wit`. `anc`'s *classification* here is unchanged — it was
+/// never `EXCUSED` and still isn't; only its *coverage* changed.
 const KNOWN_FAMILIES: &[&str] = &[
     "anc",
     "body",
