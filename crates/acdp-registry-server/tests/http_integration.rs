@@ -74,6 +74,18 @@ fn caps() -> CapabilitiesDocument {
         // must also bump the `acdp_version` on the `CapabilitiesDocument`
         // it asserts against to "0.4.0", or it will silently assert a
         // stale 0.3.0/0.1.0 claim.
+        //
+        // REG-3 Phase 4 (plans/reg3-anchors.md): the binary's
+        // `acdp_version_claim` also folds in an UNCONDITIONAL "0.5.0"
+        // anchors claim (RFC-ACDP-0016 §10 — no admin-config gate), so
+        // in the real binary EVERY reachable config, including this
+        // harness's plain `config()`, now advertises >= "0.5.0". This
+        // `caps()` helper deliberately does *not* mirror that either —
+        // keeping the pre-anchors "0.1.0" claim here is what lets the
+        // §10 reject-side tests (`gate_rejects_when_registry_advertises_below_0_5_0`
+        // and friends) exercise a below-0.5.0 registry at all. See
+        // `caps_050()` below for the harness that mirrors the real,
+        // post-Phase-4 shape.
         limits: Limits {
             max_payload_bytes: 1_048_576,
             max_embedded_bytes: 65_536,
@@ -5753,4 +5765,70 @@ async fn retrieve_path_is_not_gated_and_serves_anchors_byte_exact_after_downgrad
         "read path must serve the stored body byte-exactly regardless of the \
          registry's currently-advertised acdp_version"
     );
+}
+
+// ─── REG-3 Phase 4: anchors reachable in the capability ladder ───
+//
+// `plans/reg3-anchors.md` Phase 4 makes the binary's own `build_capabilities`
+// advertise `acdp_version >= "0.5.0"` unconditionally (RFC-ACDP-0016 §10 —
+// anchors handling has no admin-config gate, so its version claim is folded
+// into the ladder's max() unconditionally too; see `main.rs`'s
+// `acdp_version_claim`). Practically, that means EVERY reachable
+// configuration of the shipped binary — including a completely bare one,
+// with no receipt key, no log, no witnesses configured — now reaches 0.5.0.
+// The test below proves that composes correctly with Phase 3's version gate:
+// a router built on the plain, unmodified `config()`/`caps_050()` pairing
+// used throughout this file (which is exactly the shape a real, upgraded
+// deployment now has) accepts an anchored publish; a router still on the
+// pre-Phase-4 shape (`caps()`, "0.1.0" — what every deployment served before
+// this phase shipped) rejects one, exactly as Phase 3 alone already proved.
+// This is the one test in this file added specifically for Phase 4 — the
+// gate's own accept/reject behavior is already exhaustively covered above.
+
+#[tokio::test]
+async fn config_reaching_0_5_0_composes_with_the_anchors_gate() {
+    // Accept side: the plain `config()`/`caps_050()` pairing this file
+    // already uses everywhere else. Nothing about it is special-cased for
+    // anchors — no receipt key, no log, no witnesses — which is the point:
+    // under REG-3 Phase 4's unconditional anchors claim, this ordinary
+    // config is now exactly what a real 0.5.0 deployment looks like.
+    let accept = harness_050(true).await;
+    let accept_req = producer(224)
+        .publish_request()
+        .title("phase 3+4 composition: accept")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .acdp_version("0.5.0")
+        .anchors(vec![gate_test_anchor()])
+        .build()
+        .unwrap();
+    let (accept_status, accept_body) = publish(&accept.router, &accept_req, None).await;
+    assert_eq!(accept_status, StatusCode::OK, "body = {accept_body}");
+    assert!(
+        accept_body["ctx_id"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "accepted publish must yield a ctx_id: {accept_body}"
+    );
+
+    // Reject side: the pre-Phase-4-shaped capabilities document (what every
+    // deployment served before this phase). Same publish shape, same
+    // anchors payload — only the registry's advertised version differs.
+    let reject = harness(true).await;
+    let reject_req = producer(225)
+        .publish_request()
+        .title("phase 3+4 composition: reject")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .acdp_version("0.5.0")
+        .anchors(vec![gate_test_anchor()])
+        .build()
+        .unwrap();
+    let (reject_status, reject_body) = publish(&reject.router, &reject_req, None).await;
+    assert_eq!(
+        reject_status,
+        StatusCode::BAD_REQUEST,
+        "body = {reject_body}"
+    );
+    assert_eq!(reject_body["error"]["code"], "schema_violation");
 }

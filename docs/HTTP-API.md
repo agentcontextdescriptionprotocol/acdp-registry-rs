@@ -68,7 +68,7 @@ Capabilities document. `Cache-Control: max-age=300`.
 
 ```json
 {
-  "acdp_version": "0.1.0",
+  "acdp_version": "0.5.0",
   "registry_did": "did:web:registry.example.com",
   "supported_signature_algorithms": ["ed25519"],
   "supported_did_methods": ["did:web"],
@@ -84,10 +84,16 @@ Capabilities document. `Cache-Control: max-age=300`.
 `supported_did_methods` mirrors `auth.did_methods`; `profiles` mirrors
 `registry.profiles`; `limits` mirrors the `[limits]` config section.
 
-With a `[receipt]` signing key configured (ACDP 0.2.0), `acdp_version`
-becomes `"0.2.0"` and `profiles` additionally carries
-`"acdp-registry-receipts"`. `supported_did_methods` may include `"did:key"`
-when enabled via `auth.did_methods`.
+`acdp_version` is unconditionally `"0.5.0"` (RFC-ACDP-0016 §10 — anchors
+handling has no admin-config gate, so its version claim always wins), but
+`profiles` still lights up per-config exactly as before: with a `[receipt]`
+signing key configured (ACDP 0.2.0), `profiles` additionally carries
+`"acdp-registry-receipts"`, and so on for lifecycle/log/witnesses. The
+advertised version string and the set of active capabilities are two
+different axes — do not infer what a registry actually enforces from
+`acdp_version` alone; check `profiles` and the response bodies instead.
+`supported_did_methods` may include `"did:key"` when enabled via
+`auth.did_methods`.
 
 ### `GET /.well-known/jwks.json`
 
@@ -372,11 +378,17 @@ cosignatures for the served tuple, the response is the **bare** checkpoint
 above (no envelope, no `witness_signatures`) — the array is never
 fabricated or served empty, and pre-0.4.0 consumers see exactly what they
 always did. A registry only serves `witness_signatures` at all once
-`[[witnesses]]` is configured, and doing so also raises the `acdp_version`
-served at [`GET /.well-known/acdp.json`](#get-well-knownacdpjson) to
-`"0.4.0"` — a deployment with no witnesses configured therefore also
-serves the version claim it always did, since nothing triggers the
-rung that adds this member. The
+`[[witnesses]]` is configured — that gating is unchanged. What changed
+(REG-3, RFC-ACDP-0016 §10) is that `acdp_version` served at
+[`GET /.well-known/acdp.json`](#get-well-knownacdpjson) no longer moves in
+step with this: `acdp_version` is unconditionally `"0.5.0"` regardless of
+whether `[[witnesses]]` is configured, since the anchors capability claim
+always wins the version max(). A deployment with no witnesses configured
+still advertises `"0.5.0"` and simply never serves `witness_signatures`;
+whether witness aggregation is active is visible in the response body
+(whether `witness_signatures` accompanies a checkpoint) and in
+`profiles` (`"acdp-registry-transparency-log"` — witnesses are never a
+distinct registry profile, RFC-ACDP-0015 §6.1), not in `acdp_version`. The
 same top-level `witness_signatures` sibling is attached to
 the embedded checkpoint carried by `GET /log/proof` (inclusion and
 consistency modes) when cosignatures exist for that embedded checkpoint's

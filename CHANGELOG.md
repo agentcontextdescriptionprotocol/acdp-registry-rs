@@ -110,6 +110,43 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`acdp_version` capability advertisement now reaches `"0.5.0"`** (`REG-3`
+  Phase 4 — **one-way-door**). Phase 3's RFC-ACDP-0016 §10/§14 version gate
+  shipped with no reachable configuration of the shipped binary that could
+  ever clear it — the ladder topped out at `"0.4.0"`, so every anchored
+  publish was rejected forever. `crates/acdp-registry-server/src/main.rs`'s
+  `build_capabilities` is refactored from the four-rung ordered if/else
+  ladder into an order-independent `max()` over independent per-feature
+  version claims (`ladder_claims` / `acdp_version_claim`): witnesses
+  configured still contributes `"0.4.0"`, lifecycle/log/head-receipts still
+  contributes `"0.3.0"`, a configured receipt key still contributes
+  `"0.2.0"`, the base floor is still `"0.1.0"` — and a fifth,
+  **unconditional** claim of `"0.5.0"` is added for `anchors` support,
+  since RFC-ACDP-0016 §10 is explicit that anchors is "a body field, not a
+  registry surface" with no new profile or admin-config gate to check (the
+  accept/reject/store/serve handling runs on every publish regardless of
+  config). Because that claim is both unconditional and the largest value
+  in the `max()`, it wins for every configuration: **every reachable
+  deployment of the shipped binary now advertises `acdp_version >=
+  "0.5.0"`**, including a completely bare one with no receipt key, log, or
+  witnesses configured. This is a deliberate, acknowledged trade-off, not
+  an oversight — the previous four rungs no longer distinguish themselves
+  in what `build_capabilities` actually serves (a consumer can no longer
+  infer "does this registry aggregate witness signatures" from
+  `acdp_version` alone), which is exactly the cost the plan names for this
+  option. `RegistryServer::try_new`'s `validate_capabilities` startup check
+  still passes for every existing config permutation (its only
+  version-conditioned guard is `>= 0.3.0` requiring
+  `supports_idempotency_key: true`, which is unconditionally `true` here
+  regardless of version). This phase **executes the follow-up OQ2's own
+  `DECISIONS.md` entry (2026-08-29) already recorded** — "if a 5th
+  `acdp_version` rung is ever added, consider replacing the ordered if/else
+  ladder with an order-independent `max()` over per-feature version
+  claims" — rather than superseding OQ2's decision; OQ2's conditional
+  0.4.0-ahead-of-0.3.0 ordering is unchanged, just re-expressed as one
+  candidate among several. Logged `UNCONFIRMED` in `ASSUMPTIONS.md` pending
+  `/reconcile` sign-off, per this repo's standing practice for one-way-door
+  decisions.
 - **Bumped `acdp` 0.8.1 → 0.8.2** (`REG-3` Phase 2), pulling all twelve
   `acdp-*` workspace crates in lockstep. This inherits `AnchorEntry`,
   `PublishRequest::anchors`, `Body::anchors`, `validate_anchors`, and

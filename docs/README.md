@@ -1,11 +1,24 @@
 # acdp-registry-rs documentation
 
 Reference documentation for the Agent Context Distribution Protocol (ACDP)
-registry. The baseline is protocol v0.1.0; higher protocol levels light up as
-their sections are configured — v0.2.0 trust-hardening (registry receipts,
-did:key), v0.3.0 (lifecycle events, the transparency log, head receipts), and
-v0.4.0 (witness cosignature aggregation). Start with the
-[project README](../README.md) for a quick start; these docs go deeper.
+registry. Two axes matter here and they are **not** the same thing:
+
+- **Advertised version** — the `acdp_version` string served at
+  `GET /.well-known/acdp.json`. As of REG-3 (RFC-ACDP-0016 §10 anchors
+  support), this is unconditionally `"0.5.0"` for every configuration of
+  the shipped binary, because anchors handling has no admin-config gate
+  and its version claim always wins the capability-ladder max(). It no
+  longer tells you which of the sections below are actually active.
+- **Functional capabilities** — what the registry actually enables and
+  enforces, which still lights up per-section exactly as before: v0.2.0
+  trust-hardening (registry receipts, did:key), v0.3.0 (lifecycle events,
+  the transparency log, head receipts), and v0.4.0 (witness cosignature
+  aggregation) each activate only when their config sections are
+  configured. Check `profiles` and the response bodies (not
+  `acdp_version`) to see which of these a given deployment actually runs.
+
+Start with the [project README](../README.md) for a quick start; these docs
+go deeper.
 
 ## Map
 
