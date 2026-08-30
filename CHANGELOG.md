@@ -71,6 +71,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Pinned conformance spec SHA bumped to `417211f6a13aeceef4db00eb67f98ed0ed13761b`**
+  (`REG-3`) in `.github/workflows/ci.yml`. The only substantive delta since the
+  prior pin is RFC-ACDP-0016's draft and its conformance pack (the new `anc-*`
+  fixture family, SPEC-9); the third commit in the range is an unrelated
+  SPEC-7 rev-002 change with no anchors content. This repo does **not** yet
+  implement RFC-ACDP-0016 — `anc` is classified in
+  `crates/acdp-registry-server/tests/conformance.rs`'s `KNOWN_FAMILIES` (not
+  `EXCUSED`) and picked up by the replay harness's non-HTTP fallthrough, same
+  as `wit`; real coverage is a separate, later change.
 - **Pinned conformance spec SHA** (`REG-2`) adopted in
   `.github/workflows/ci.yml`: now `31cf8743b62debe2c7c8572ce3a3a0b7ca5ad099`.
   Annotation-only at this pin: RFC-ACDP-0015 promoted Draft → **Final**
