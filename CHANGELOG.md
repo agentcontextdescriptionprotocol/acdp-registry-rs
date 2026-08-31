@@ -8,6 +8,28 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`.github/workflows/bump-spec.yml`, a manual and dispatch-driven
+  replacement for hand-written spec-pin bumps** (`REG-10` Phase 3, GitHub
+  issue #110). It delegates to acdp-ci's reusable `bump-spec-ref.yml@v1`
+  workflow, mirroring the existing `bump-acdp.yml` pattern: `with: file:
+  .github/workflows/ci.yml` names the file whose single spec-pin anchor gets
+  rewritten, `sha` picks the target commit (on `workflow_dispatch`, the
+  input — blank meaning spec HEAD; on `repository_dispatch`, the event
+  payload's SHA), and `secrets: inherit` supplies `ACDP_BOT_APP_ID` and
+  `ACDP_BOT_PRIVATE_KEY`, already proven available in this repo via
+  `notify-website.yml`. The reusable workflow hard-fails on zero or more
+  than one spec-pin anchor in the named file, rewrites only the `ref:`
+  following that anchor, asserts the rewrite landed, and opens a PR on
+  branch `deps/spec-<sha:0:12>` for review — it never auto-merges, and it
+  opens no PR when the target SHA already matches the current pin. Two
+  triggers are wired: `workflow_dispatch`, runnable from the Actions tab
+  today with an optional explicit `sha` input; and `repository_dispatch` on
+  `spec-released`, which stays inert until the spec repo's
+  `notify-spec-consumers.yml` adds this repo to its consumer matrix (as of
+  this writing that matrix lists only `acdp-rs` and `acdp-verifier-py`).
+  `CONTRIBUTING.md`'s conformance-pin paragraph now points at this workflow
+  as an alternative to bumping the pin by hand.
+
 - **`anc-001`/`anc-002`/`anc-003` move from "skipped as non-HTTP by the
   generic replayer" to direct, fixture-driven coverage, and require-mode CI
   is confirmed green at spec pin `417211f`** (`REG-3` Phase 7 — the closing

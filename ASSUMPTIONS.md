@@ -287,3 +287,30 @@ public-API-contract changes, mirroring how the prior wave routed OQ2 (the witnes
   the run-the-harness half could erode, and only via a future edit that adds a sqlite cfg gate
   to a currently-ungated test file.
 - **Status:** UNCONFIRMED
+
+### `acdp-deps-bot` holds `workflows: write` in this repo (Phase 3)
+- **Plan:** plans/reg10-conformance-and-ci-hygiene.md
+- **Question:** `bump-spec.yml` delegates to `bump-spec-ref.yml@v1`, whose token-mint step
+  requests `permission-workflows: write` (`bump-spec-ref.yml:59`) — required because the spec
+  pin lives in `.github/workflows/ci.yml`, and GitHub blocks App pushes touching anything
+  under `.github/workflows/` without that scope. Does the `acdp-deps-bot` installation
+  actually grant it here?
+- **Answer: yes — verified directly, not assumed.**
+  `GET /orgs/agentcontextdistributionprotocol/installations` returns installation
+  `145550409` (`app_slug: acdp-deps-bot`) with `repository_selection: "all"` and
+  `permissions.workflows: "write"`. That is the org-wide install described at
+  `acdp-ci/DELIVERY-STANDARD.md:250-273`, read from the API rather than taken from the doc.
+  Confirmed empirically as well: the same `bump-spec-ref.yml@v1` already runs green in
+  `acdp-rs` and has opened `app/acdp-deps-bot`-authored PRs whose only changed file is
+  `.github/workflows/ci.yml` — #185, #182, #168, #167 on `deps/spec-*` branches. #168 is
+  `deps/spec-417211f6a13a`, i.e. this workflow produced the adoption PR for the very spec
+  pin this repo currently carries.
+- **Correction:** this entry was first logged as UNCONFIRMED, on the reasoning that checking
+  the installation needed admin credentials this session lacks. That was wrong — the
+  installations endpoint answers it with ordinary `gh` auth. The Phase 3 verifier caught it;
+  the claim above is the re-checked result.
+- **Residual risk:** only that the org-wide grant is later narrowed. If it were, the run's
+  first step ("Mint GitHub App token") would 422 and fail before `actions/checkout`, the
+  rewrite, or any `git push` — nothing reaches `main` and no PR opens. The fix would be an
+  org App-settings grant, not a code change here.
+- **Status:** CONFIRMED (2026-08-31)
