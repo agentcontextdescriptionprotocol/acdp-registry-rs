@@ -24,8 +24,8 @@ see [docs/HTTP-API.md](docs/HTTP-API.md).
 
 - **RFC-ACDP-0003-conformant publish pipeline** — full DID-resolution +
   signature verification + lineage coherence + atomic commit.
-- **Pluggable storage** — Postgres (production) and SQLite (dev / CI), behind a
-  unified `ExtendedRegistryStore` trait.
+- **Pluggable storage** — Postgres (production), SQLite (dev / CI), and an
+  in-memory backend, behind a unified `ExtendedRegistryStore` trait.
 - **DID-bound authentication** — challenge / response over Ed25519, short-lived
   JWTs (HS256 or EdDSA with a published JWKS), token revocation, anonymous
   public reads opt-in.
@@ -108,7 +108,7 @@ Selected fields:
 |-----------------------------------|---------------------------------------------|-------|
 | `registry.authority`              | `ACDP_REGISTRY_REGISTRY__AUTHORITY`         | Bare lowercase DNS name; also the `did:web` identifier. |
 | `registry.port`                   | `ACDP_REGISTRY_REGISTRY__PORT`              | Default `8443`. |
-| `storage.backend`                 | `ACDP_REGISTRY_STORAGE__BACKEND`            | `"postgres"` or `"sqlite"`. |
+| `storage.backend`                 | `ACDP_REGISTRY_STORAGE__BACKEND`            | `"postgres"`, `"sqlite"`, or `"memory"`. |
 | `storage.postgres_url`            | `ACDP_REGISTRY_STORAGE__POSTGRES_URL`       | Required when `backend = "postgres"`. |
 | `auth.jwt_secret`                 | `ACDP_REGISTRY_AUTH__JWT_SECRET`            | Base64-encoded ≥32-byte secret. |
 | `webhook.url`                     | `ACDP_REGISTRY_WEBHOOK__URL`                | HMAC-signed POST target. |
@@ -205,6 +205,8 @@ tables between cases.
 cargo build --release                                          # default = SQLite
 cargo build --release -p acdp-registry-server                   \
     --no-default-features --features storage-pg                # Postgres only
+cargo build --release -p acdp-registry-server                   \
+    --no-default-features --features storage-memory            # In-memory
 cargo build --release -p acdp-registry-server                   \
     --features storage-sqlite,playground                       # Playground
 ```

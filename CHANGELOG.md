@@ -249,13 +249,48 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `acdp-registry-webhook`: HMAC-SHA256-signed POSTs with retry/backoff.
 - `acdp-registry-core`: axum router + handlers generic over the storage trait.
 - `acdp-registry-server`: binary wiring via Cargo features
-  (`storage-sqlite` default, `storage-pg`, `playground`).
+  (`storage-sqlite` default, `storage-pg`, `storage-memory`, `playground`).
 - Docker image (multi-stage with `cargo-chef`) + docker-compose with Postgres.
 - GitHub Actions: `ci.yml` (fmt + clippy across feature matrix + test +
   cargo-deny), `release-plz.yml`, `docker.yml`.
 
 ### Changed
 
+- **`storage-memory` gets its first required CI coverage** (`REG-10`,
+  issue #109). `.github/workflows/ci.yml`'s `clippy` job gains a fourth
+  step, `clippy (memory)`, running
+  `cargo clippy -p acdp-registry-server --no-default-features --features
+  storage-memory --all-targets -- -D warnings`; the `test` job gains a
+  matching `cargo test (memory)` step running `cargo test -p
+  acdp-registry-server --no-default-features --features storage-memory`.
+  Both are appended as steps to the existing jobs, matching how the
+  pg/sqlite/playground legs are already structured — no new job, no
+  matrix, and `--no-default-features` is load-bearing: `storage-sqlite`
+  is the crate's `default` feature, and a bare `--features storage-memory`
+  would trip the `storage-sqlite`+`storage-memory` mutual-exclusion
+  `compile_error!` in `crates/acdp-registry-server/src/main.rs`. Both legs
+  land in the *required* `clippy`/`test` jobs, not the advisory `msrv`
+  job, so a future break in `memory_ext.rs` now blocks merge instead of
+  going uncaught entirely — before this change no CI job built
+  `storage-memory` at all. Deliberately scoped as compile + lint coverage,
+  not behavioral coverage: `--all-targets` compiles the bin and test
+  targets under this feature set (closing a compile gap `memory_ext.rs`
+  had never been checked against before), and `cargo test`'s memory leg
+  runs the binary's own unit tests plus three tests from the two
+  always-compiled integration binaries, but `tests/conformance.rs`,
+  `tests/http_integration.rs`, and `tests/metrics_integration.rs` are all
+  `#![cfg(feature = "storage-sqlite")]` and compile to zero tests under
+  `storage-memory` — this leg proves the memory cfg gates and the memory
+  `run()` arm typecheck and pass lint, not that the memory-backed store
+  behaves correctly against the HTTP surface. Verified locally: both
+  commands pass as-is (clippy clean; 40 tests pass — 37 unit plus 3 from
+  the two always-compiled integration test binaries, with `conformance.rs`
+  / `http_integration.rs` / `metrics_integration.rs` / `pg_integration.rs`
+  each reporting `0 tests` under this feature set); a deliberate type
+  error introduced into `memory_ext.rs`'s `put` impl made the clippy leg
+  fail with `E0061`, confirming the leg is non-vacuous, then was reverted.
+  `CONTRIBUTING.md`'s feature-flag variant block gains the matching
+  `storage-memory` invocations alongside the existing pg/sqlite ones.
 - **`acdp_version` capability advertisement now reaches `"0.5.0"`** (`REG-3`
   Phase 4 — **one-way-door**). Phase 3's RFC-ACDP-0016 §10/§14 version gate
   shipped with no reachable configuration of the shipped binary that could
