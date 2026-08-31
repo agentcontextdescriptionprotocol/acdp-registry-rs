@@ -65,7 +65,10 @@ ACDP_REQUIRE_CONFORMANCE=1 ACDP_SPEC_DIR=/path/to/spec/checkout \
 CI's `conformance` job checks out the spec at a SHA pinned in
 `.github/workflows/ci.yml` (the `conformance` job's `ref:`), so a push to the
 spec repo cannot silently change this repo's CI result. When adopting new
-fixtures, bump that SHA deliberately in its own commit.
+fixtures, bump that SHA deliberately in its own commit. The bump can be
+driven by running the `bump spec` workflow from the Actions tab (optionally
+with an explicit SHA), which opens a PR for review rather than committing
+directly.
 
 CI also measures coverage with `cargo llvm-cov` (summary on the run page, lcov
 artifact attached) and smoke-tests the Docker image on every PR — it builds the
