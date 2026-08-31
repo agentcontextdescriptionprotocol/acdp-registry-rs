@@ -223,3 +223,42 @@ public-API-contract changes, mirroring how the prior wave routed OQ2 (the witnes
   one-way-door and routed to Fable rather than the default Opus verification pass.
 - **Status:** CONFIRMED (2026-08-29) — see `DECISIONS.md` for the full Fable
   recommendation and human decision.
+
+---
+
+## `reg10-conformance-and-ci-hygiene` — logged during `/implement` 2026-08-31
+
+### Pin durability over upstream's default ergonomics (Phase 1)
+- **Plan:** plans/reg10-conformance-and-ci-hygiene.md
+- **Assumed:** the human's decision on the `dtolnay/rust-toolchain` orphaned pin — prefer a
+  SHA reachable from the default branch plus an explicit input, over a convenient-but-
+  unreachable ref-selector SHA — is a *principle* that generalizes, not a one-off ruling on
+  that single action.
+- **Chose:** applied the same resolution to `taiki-e/install-action` without stopping to ask
+  again. Pinned `1ed6d7be…  # v2.87.2` (`compare main...` → `identical`) and passed
+  `tool: cargo-llvm-cov` explicitly, replacing `ea647c55… # cargo-llvm-cov` (`ahead 1,
+  behind 0` — not in `main`'s history; upstream's README calls hash-pinning tool tags
+  "strongly discouraged" for exactly this reason).
+- **Alternatives:** (a) stop and ask a second time — rejected, it is the identical tradeoff
+  in the same phase, and re-asking spends the human's attention on a settled question;
+  (b) keep the tool-tag pin and accept ~daily orphaning — rejected outright, it reproduces
+  the defect this phase exists to remove; (c) revert install-action to `@cargo-llvm-cov`
+  unpinned — rejected, abandons the phase's goal for one action.
+- **Blast radius if wrong:** near zero. One workflow line plus a `with:` block; revert is a
+  one-line change. If the explicit `tool:` were wrong the coverage job fails loudly at
+  `cargo llvm-cov`, in CI, before merge.
+- **Status:** UNCONFIRMED
+
+### Amended acceptance criterion 4 (Phase 1)
+- **Plan:** plans/reg10-conformance-and-ci-hygiene.md
+- **Assumed:** AC4 as written ("the coverage job's install-action pin still defaults
+  `tool: cargo-llvm-cov`") encoded a *means*, not the *end*. Its intent is that the coverage
+  job installs cargo-llvm-cov.
+- **Chose:** amended AC4 to "the coverage job installs `cargo-llvm-cov`, via an explicitly
+  passed `tool:` input on a `main`-reachable pin." The original letter is unsatisfiable on a
+  durable pin, since the `default:` exists only in the generated tool-tag commit.
+- **Alternatives:** hold AC4 literally and keep the orphan-prone pin — rejected; that would
+  let a criterion written before the facts were known dictate a worse outcome.
+- **Blast radius if wrong:** none beyond the item above; this is bookkeeping on the same
+  change.
+- **Status:** UNCONFIRMED

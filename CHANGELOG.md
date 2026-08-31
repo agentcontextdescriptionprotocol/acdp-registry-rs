@@ -546,6 +546,31 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   go silently blank until updated to match. A new assertion in
   `tests/metrics_integration.rs` pins the new label form on a
   parameterized request so this doesn't regress unnoticed again.
+- **SHA-pinned `ci.yml`'s third-party actions, and corrected an unreachable pin**
+  (`REG-10`, #111): the fifteen `dtolnay/rust-toolchain`, `Swatinem/rust-cache`,
+  `taiki-e/install-action`, and `EmbarkStudios/cargo-deny-action` refs across `ci.yml`'s
+  eight jobs now resolve at an immutable 40-hex commit SHA with a trailing
+  `# <version-or-branch>` comment, extending `REG-8`'s pinning posture from
+  `docker.yml`/`release-plz.yml` to the last unpinned workflow. First-party `actions/*`
+  refs stay tag-pinned, unchanged.
+  All seven `dtolnay/rust-toolchain` call sites now pin
+  `6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master` and pass an explicit `toolchain:`
+  (`stable` at six sites, `"1.88"` in `msrv`). dtolnay requires a pinned SHA to sit within
+  `master`'s history — anything else is eventually garbage-collected — and the
+  previously-used `4be7066…`, inherited from `release-plz.yml`, is today reachable from no
+  ref at all. That pin is corrected in `release-plz.yml` as part of this change rather than
+  copied into six more jobs.
+  `Swatinem/rust-cache@6323deb… # v2.9.2` (six sites) and
+  `EmbarkStudios/cargo-deny-action@3c63498… # v2.1.1` are ordinary tag-to-SHA pins.
+  `taiki-e/install-action@1ed6d7be… # v2.87.2` pins a release SHA on `main` and passes
+  `tool: cargo-llvm-cov` explicitly. The `@cargo-llvm-cov` tool tag defaults that input, but
+  upstream strongly discourages pinning tool tags by hash: those commits are regenerated per
+  release and are never in `main`'s history, so a hash pin starts referencing a commit that
+  is not present on the repository.
+  Because `# master` is a ref selector rather than a semver tag, Dependabot's
+  `github-actions` ecosystem (`.github/dependabot.yml`, monthly) has nothing to track for the
+  `dtolnay/rust-toolchain` pins; the `# v2.9.2`, `# v2.1.1`, and `# v2.87.2` pins will be
+  kept current.
 
 ### Security
 
