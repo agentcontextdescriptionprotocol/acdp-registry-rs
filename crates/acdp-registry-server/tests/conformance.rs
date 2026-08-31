@@ -1150,8 +1150,9 @@ fn wit004_key_mismatch_cosignature_is_rejected_and_wit001_golden_is_accepted() {
         .expect("wit-001: golden cosignature must verify under the same witness key");
 
     // The rejected wit-004 cosignature does NOT count toward the
-    // N-witnessed quorum; the accepted wit-001 one does, and the
-    // witnessed DID reported is the witness that actually verified.
+    // N-witnessed quorum; the accepted wit-001 one does, and it is
+    // attributed exactly once in `witnesses` (not left empty, not
+    // double-counted).
     let mut docs = HashMap::new();
     docs.insert(witness_id.to_string(), doc.clone());
     let trusted: HashSet<String> = [witness_id.to_string()].into_iter().collect();
@@ -1184,7 +1185,11 @@ fn wit004_key_mismatch_cosignature_is_rejected_and_wit001_golden_is_accepted() {
     assert_eq!(
         report_both.witnesses,
         vec![witness_id.to_string()],
-        "the witnessed DID must be wit-001's witness, not wit-004's"
+        "the one verifying cosignature must appear exactly once in `witnesses` \
+         (wit-001 and wit-004 share a witness DID, so this pins the reported \
+         identifier — the witness DID, not its verification-method id — and \
+         its consistency with witnessed_count; it cannot discriminate which \
+         of the two witnesses verified)"
     );
 }
 

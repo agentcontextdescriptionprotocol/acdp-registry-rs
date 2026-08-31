@@ -8,6 +8,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The witness aggregator's reject-then-no-write path is now directly
+  tested** (`REG-10` Phase 4, GitHub issue #112). `witness.rs`'s
+  `verify_and_store` was split at the point right after DID resolution:
+  it now resolves the witness DID document and tail-calls a new private
+  `verify_and_store_resolved(store, log, witness_did, doc_value,
+  cosig_value) -> bool`, a verbatim lift of the verify-then-store half
+  (the `verify_cosignature_against_own_log` match through the
+  `upsert_witness_cosignature` call and the three metric-labeled early
+  returns). This is a no-behavior-change refactor — `verify_and_store`'s
+  signature, visibility, and callers are untouched — that makes the
+  store-writing half callable directly against a real `SqliteStore`
+  without a live witness endpoint. Two new tests exercise it:
+  `rejected_cosignature_is_not_persisted_by_the_store_path` (a forged-root
+  cosignature is reported unstored, and leaves no row at either the
+  forged or the honest checkpoint tuple) and
+  `verified_cosignature_is_persisted_by_the_store_path` (the positive
+  control — a genuine cosignature is reported stored and reads back).
+  Previously only the pre-store verification helper had forward-guard
+  assertions; nothing exercised the actual persistence path.
+
 - **`.github/workflows/bump-spec.yml`, a manual and dispatch-driven
   replacement for hand-written spec-pin bumps** (`REG-10` Phase 3, GitHub
   issue #110). It delegates to acdp-ci's reusable `bump-spec-ref.yml@v1`
@@ -277,6 +297,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   cargo-deny), `release-plz.yml`, `docker.yml`.
 
 ### Changed
+
+- **Reworded the wit-001/wit-004 quorum assertion's message and its
+  preceding comment** (`REG-10` Phase 5, GitHub issue #113) in
+  `wit004_key_mismatch_cosignature_is_rejected_and_wit001_golden_is_accepted`.
+  The old message claimed the assertion proved `report_both.witnesses`
+  names *wit-001's* witness and not wit-004's — impossible by
+  construction, since the test pins both fixtures to the same witness
+  assertionMethod key and only ever registers one witness DID. The
+  assertion is unchanged; it actually proves the one verifying
+  cosignature is attributed exactly once in `witnesses`, consistent with
+  `witnessed_count`. No executable change.
 
 - **`storage-memory` gets its first required CI coverage** (`REG-10`,
   issue #109). `.github/workflows/ci.yml`'s `clippy` job gains a fourth
