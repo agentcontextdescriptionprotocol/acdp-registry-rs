@@ -161,6 +161,139 @@ pub async fn build_harness_with_webhook(
     }
 }
 
+/// A per-fixture, stateful harness for Shape D (REG-10 Phase 8's
+/// `conformance.rs`). Unlike [`build_harness_with_webhook`] -- a one-shot
+/// `Router` built once and shared by every Shape A/B/C exchange -- this
+/// keeps the underlying `Arc<RegistryServer<SqliteStore>>` and
+/// `Arc<AuthService>` alive so [`SeededHarness::rebuild`] can produce a
+/// NEW `Router` (and, when `caps` changes, a NEW `RegistryServer`) against
+/// a different `RegistryConfig`/`CapabilitiesDocument` (e.g. to flip
+/// `anonymous_public_reads` for one scenario, per `vis-002`/`vis-009`'s
+/// `registry_capabilities_subset`) WITHOUT losing already-seeded state --
+/// the seeded contexts live in the SQLite store, which `rebuild` clones
+/// (cheap: `SqliteStore` is pool-backed) rather than recreates.
+pub struct SeededHarness {
+    server: Arc<RegistryServer<SqliteStore>>,
+    auth: Arc<AuthService>,
+    authority: String,
+    pub router: axum::Router,
+}
+
+impl SeededHarness {
+    /// Build a fresh in-memory store + router (REG-10 Phase 8's isolation
+    /// requirement: every Shape D fixture gets its own `SeededHarness`,
+    /// never the shared `app` Shapes A/B/C replay against). Mirrors
+    /// [`build_harness_with_webhook`]'s wiring, minus the `db`/webhook
+    /// plumbing Shape D doesn't need.
+    pub async fn new(cfg: RegistryConfig, caps: CapabilitiesDocument, authority: &str) -> Self {
+        let store = SqliteStore::connect_in_memory().await.unwrap();
+        let store = if cfg.log.enabled {
+            store.with_transparency_log()
+        } else {
+            store
+        };
+        store.migrate().await.unwrap();
+        let server = wire_server(store, caps, authority, &cfg);
+        let server = Arc::new(server);
+        let challenges: Arc<dyn ChallengeStore> = Arc::new(InMemoryChallengeStore::new());
+        let secret = JwtSecret::from_bytes(&[42u8; 32]);
+        let signer = JwtSigner::new(secret, format!("did:web:{authority}"), authority.into(), 30);
+        let resolver = Arc::new(WebResolver::new());
+        let auth = Arc::new(AuthService::new(
+            AuthConfig::default(),
+            challenges,
+            signer,
+            resolver,
+            authority.into(),
+        ));
+        let router = build_router(AppStateInner::new(
+            server.clone(),
+            auth.clone(),
+            None,
+            cfg,
+            None,
+        ));
+        Self {
+            server,
+            auth,
+            authority: authority.to_string(),
+            router,
+        }
+    }
+
+    /// Rebuild `router` against `cfg` AND `caps`, reusing the SAME
+    /// underlying store data.
+    ///
+    /// GAP 3 (REG-10 Phase 8 fixer pass): `RegistryServer::search` /
+    /// `::retrieve` gate `anonymous_public_reads` (and every other
+    /// capability-driven authorization decision) off `self.caps` -- the
+    /// `CapabilitiesDocument` baked in at `RegistryServer::try_new` /
+    /// `RegistryServer::new` time, NOT off `RegistryConfig` -- so an
+    /// earlier version of this method, which only rebuilt the `Router`
+    /// against a new `cfg` while reusing the SAME `Arc<RegistryServer>`
+    /// (and therefore the SAME, unchanged `caps`), could never actually
+    /// change authorization-relevant behavior. `vis-002`/`vis-009`-style
+    /// scenarios (`registry_capabilities_subset` overriding
+    /// `anonymous_public_reads`) would have silently kept exercising the
+    /// harness's ORIGINAL `anonymous_public_reads` regardless of the
+    /// override, which `seeded_harness_rebuild_changes_router_behavior_and_preserves_seeded_state`
+    /// (`conformance.rs`) now proves directly.
+    ///
+    /// The fix: reconstruct `server` too, from a CLONE of the current
+    /// store (`SqliteStore` is pool-backed -- cloning it shares the same
+    /// underlying connections/data, it does not create a second database)
+    /// combined with the new `caps`. This is what actually makes the new
+    /// `anonymous_public_reads` value take effect, while every context
+    /// published before the rebuild remains readable afterward.
+    pub fn rebuild(&mut self, cfg: RegistryConfig, caps: CapabilitiesDocument) {
+        let store = self.server.store().clone();
+        let server = Arc::new(wire_server(store, caps, &self.authority, &cfg));
+        self.server = server.clone();
+        self.router = build_router(AppStateInner::new(
+            server,
+            self.auth.clone(),
+            None,
+            cfg,
+            None,
+        ));
+    }
+}
+
+/// Shared `RegistryServer` construction + `with_*` wiring, mirroring the
+/// binary's `serve_with_store` (see [`build_harness_with_webhook`]'s doc
+/// comment). Factored out so [`SeededHarness::new`] and
+/// [`SeededHarness::rebuild`] apply IDENTICAL wiring -- a rebuild that
+/// silently dropped, say, the receipt signer because it hand-rolled a
+/// shorter version of this would be its own latent bug.
+fn wire_server(
+    store: SqliteStore,
+    caps: CapabilitiesDocument,
+    authority: &str,
+    cfg: &RegistryConfig,
+) -> RegistryServer<SqliteStore> {
+    let server = RegistryServer::try_new(store, caps, authority).unwrap();
+    let server = if cfg.receipt.is_configured() {
+        let signer =
+            acdp_registry_core::receipt::build_signer(&cfg.receipt, &cfg.registry.authority)
+                .expect("receipt signer");
+        server.with_receipt_signer(signer).expect("receipt signer")
+    } else {
+        server
+    };
+    let server = if cfg.receipt.head_receipts {
+        server
+            .with_lineage_head_receipts()
+            .expect("head receipts enabled")
+    } else {
+        server
+    };
+    if cfg.lifecycle.enabled {
+        server.with_lifecycle().expect("lifecycle enabled")
+    } else {
+        server
+    }
+}
+
 /// A signing producer identity, namespaced by `prefix` so different test
 /// files (or different fixture families within one file) don't collide on
 /// DID/seed space — e.g. `http_integration.rs` uses `"smoke"`,

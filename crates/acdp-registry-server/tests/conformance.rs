@@ -37,12 +37,24 @@
 //! per-reason manifest so coverage is never silently truncated:
 //!
 //!   * **Replayed** — negative publish fixtures that fail at schema/validation
-//!     (HTTP 400) with an inline body, and stateless retrieval fixtures
-//!     (e.g. `ret-*` GET of a missing ctx → 404).
-//!   * **Skipped — requires pre-seeded state** — `vis-*`, `idem-*` and other
+//!     (HTTP 400) with an inline body, stateless retrieval fixtures
+//!     (e.g. `ret-*` GET of a missing ctx → 404), and (REG-10 Phase 8) the
+//!     one `vis-*` fixture (`vis-006`) whose `setup` + single exchange Shape
+//!     D can fully pre-seed, sign, and verify end-to-end.
+//!   * **Skipped — requires pre-seeded state** — `idem-*` and other
 //!     fixtures whose `setup`/`preconditions` (top-level or under `input`)
 //!     need a context with a specific registry-assigned `ctx_id` the publish
-//!     API won't let us mint.
+//!     API won't let us mint, PLUS the `vis-*`/`ret-*` fixtures whose
+//!     `setup` shape Shape D doesn't recognize at all (`setup.lineages` —
+//!     `vis-008`, `ret-002`). As of Phase 8, `vis-006` alone has escaped
+//!     this bucket via Shape D (below).
+//!   * **Skipped — Shape D: unrecognized scenario/expected key** — the rest
+//!     of `vis-*`: Shape D CAN seed these (their `setup` fully parses) but
+//!     at least one scenario or `expected` key is outside its allowlist
+//!     (`matches_ctx_ids`, `total_estimate`, `context_subset_for_test`, …).
+//!     A distinct reason from the bucket above so a future widening of the
+//!     allowlist (Phases 9a/9c) is auditable: it's the scenario shape, not
+//!     the seeding, blocking these.
 //!   * **Skipped — profile not advertised** — fixtures whose
 //!     `applies_to_profiles` is disjoint from `HARNESS_PROFILES`, e.g.
 //!     `lc-*` (`acdp-registry-lifecycle`), `fed-*`
@@ -55,6 +67,41 @@
 //!     need valid crypto material the synthetic fixtures don't carry.
 //!   * **Skipped — unsubstituted template** — an exchange whose constructed
 //!     path still carries a `{...}` placeholder the harness couldn't fill.
+//!
+//! `extract_shapes` (below) dispatches every fixture through exactly one of
+//! four shapes, tried in this order:
+//!
+//!   * **Shape A** — top-level `request` + `expected`: one self-contained
+//!     exchange (`pub-*` negative publishes, most singleton fixtures).
+//!   * **Shape D** — `setup` present AND (`scenarios` present OR (`input` +
+//!     top-level `expected` present)): a *stateful* fixture that needs
+//!     pre-seeded registry state before it can replay at all (REG-10 Phase
+//!     8). Dispatched **ahead of Shape B**, deliberately: a `setup`-carrying
+//!     fixture's `scenarios[]` (e.g. `vis-001`) also satisfies Shape B's own
+//!     predicate (`request` + `expected` per scenario), and Shape B has no
+//!     seeding step — if it ran first it would silently replay such a
+//!     fixture against an empty store, turning "context doesn't exist yet"
+//!     404s into false-negative passes. Shape D seeds `setup.context_published`
+//!     / `setup.contexts_published` through the real publish API (substituting
+//!     the fixture's unmintable literal `ctx_id`s and any non-`did:web`
+//!     `agent_id`s — see [`replay_shape_d`] and its `SeedContext`/`did_map`
+//!     handling), mints a per-scenario bearer from `effective_requester_did`
+//!     (no `Authorization` header when it's `null`), and rebuilds the router
+//!     when a scenario's `registry_capabilities_subset` overrides
+//!     `anonymous_public_reads`. A fixture whose seeding shape or scenario
+//!     assertions Shape D doesn't yet recognize (`setup.lineages`,
+//!     `matches_ctx_ids`, `context_subset_for_test`, …) is deliberately left
+//!     to `unseeded_precondition_reason`'s skip path rather than partially
+//!     replayed — see [`parse_shape_d`]. Each Shape D fixture gets its own
+//!     fresh in-memory store ([`common::SeededHarness`]), never the shared
+//!     `app` Shapes A/B/C replay against.
+//!   * **Shape B** — `scenarios[]`, each a self-contained `request` +
+//!     `expected` (multi-scenario fixtures Shape D doesn't yet claim).
+//!   * **Shape C** — retrieval-by-template: `input.endpoint =
+//!     "GET /contexts/{ctx_id}"` + `input.ctx_id` (`ret-*`).
+//!
+//! Shapes A, B, and C are unmodified by Phase 8 — Shape D takes precedence
+//! purely by trying its (narrower, `setup`-gated) predicate first.
 //!
 //! Any replayed exchange whose status or error code mismatches fails the test.
 //!
@@ -160,11 +207,12 @@ use std::sync::Arc;
 
 use common::{body_to_json, body_to_json_lenient, pct_encode_path_segment};
 
+use acdp::crypto::SigningKey;
 use acdp::producer::Producer;
 #[cfg(feature = "playground")]
 use acdp::registry::RegistryServer;
 use acdp::types::capabilities::{CapabilitiesDocument, Limits};
-use acdp::types::primitives::{ContentHash, ContextType, CtxId, Visibility};
+use acdp::types::primitives::{AgentDid, ContentHash, ContextType, CtxId, Visibility};
 use acdp::types::publish::PublishRequest;
 use acdp::AnchorEntry;
 #[cfg(feature = "playground")]
@@ -256,6 +304,33 @@ fn config() -> RegistryConfig {
     }
 }
 
+/// Shape D's own `RegistryConfig`, layered on [`config()`]: identical
+/// except `auth.enabled = true`.
+///
+/// GAP 1 fixer-pass finding: `config()`'s `auth.enabled` is left at its
+/// default `false` (Shapes A/B/C's shared, stateless `harness()` never
+/// needs caller identity), but `acdp-registry-core`'s
+/// `caller_from_headers` gates bearer parsing behind exactly that flag --
+/// `if !state.config.auth.enabled { return Ok(None); }`. Shape D mints a
+/// real per-scenario bearer from `effective_requester_did`
+/// ([`replay_shape_d`]) specifically so restricted/private/audience
+/// visibility checks (RFC-ACDP-0008 §4.5) can distinguish producer vs.
+/// audience vs. outsider -- with `auth.enabled` left `false`, every one of
+/// those bearers would be silently ignored and every Shape D scenario
+/// would replay anonymously regardless of `effective_requester_did`,
+/// which would make GAP 1's `did_map` bug (and its fix) unobservable
+/// through HTTP replay -- exactly the failure mode the GAP 1 write-up
+/// describes ("Scenario 1... would then get a bearer sub =
+/// shape-d-2... 1 match instead of 2") requires a *working* bearer path
+/// to even manifest. Scoped to Shape D's own harness only -- `config()`
+/// itself, and therefore Shapes A/B/C's shared `app`/`harness()`, is
+/// unchanged.
+fn shape_d_config() -> RegistryConfig {
+    let mut cfg = config();
+    cfg.auth.enabled = true;
+    cfg
+}
+
 async fn harness() -> axum::Router {
     common::build_harness_with_webhook(
         config(),
@@ -290,8 +365,608 @@ struct Exchange {
 enum Extracted {
     /// One or more replayable HTTP exchanges.
     Run(Vec<Exchange>),
+    /// A *stateful* fixture Shape D fully understands: pre-seed, then
+    /// replay one or more scenarios against the seeded store. See
+    /// [`replay_shape_d`] and the module doc-block's Shape D writeup.
+    RunStateful(ShapeDPlan),
     /// Not replayable through the public API; carries a human reason.
     Skip(&'static str),
+}
+
+// ── Shape D (REG-10 Phase 8): `setup` + (`scenarios` OR (`input` +
+// `expected`)) ───────────────────────────────────────────────────────────
+//
+// Everything below builds and executes a `ShapeDPlan`. See the module
+// doc-block for the high-level writeup and `extract_shapes`'s Shape D
+// dispatch block for *why* it runs ahead of Shape B.
+
+/// One `setup.context_published` / one element of `setup.contexts_published`
+/// — the two seeding shapes this phase handles. `setup.lineages` (`vis-008`)
+/// is deliberately NOT modeled here; see [`parse_seed_plan`].
+#[derive(Debug, Clone)]
+struct SeedContext {
+    /// The fixture's own literal `ctx_id` — never mintable as-is
+    /// (`pub-013` proves the registry must reject a producer-supplied
+    /// `ctx_id`), so every request path referencing it must be rewritten
+    /// through the substitution map [`replay_shape_d`] builds.
+    fixture_ctx_id: String,
+    /// Literal fixture `agent_id`, if the seed shape carries one at all
+    /// (`contexts_published` entries in `vis-002`/`vis-005`/`vis-009` do
+    /// not). `None` gets a harness-minted `did:web` default.
+    agent_id: Option<String>,
+    title: Option<String>,
+    visibility: String,
+    audience: Vec<String>,
+}
+
+/// One HTTP exchange inside a Shape D plan: either one element of a
+/// fixture's `scenarios[]`, or the fixture's own single `input` +
+/// top-level `expected` (`vis-006`'s shape — no `scenarios` at all).
+#[derive(Debug, Clone)]
+struct ShapeDScenario {
+    method: String,
+    path: String,
+    /// `None` ⇒ send no `Authorization` header at all (anonymous).
+    effective_requester_did: Option<String>,
+    /// `Some(b)` when the scenario's `registry_capabilities_subset`
+    /// overrides `anonymous_public_reads`; forces a router rebuild.
+    anonymous_public_reads_override: Option<bool>,
+    want_status: u16,
+    want_error_code: Option<String>,
+    want_matches_count: Option<u64>,
+    want_match_summary_contains: Option<Value>,
+}
+
+/// A fully-parsed, fully-understood Shape D fixture: every `setup` entry
+/// and every scenario used only keys this phase recognizes. Built by
+/// [`parse_shape_d`]; replayed by [`replay_shape_d`].
+#[derive(Debug, Clone)]
+struct ShapeDPlan {
+    seeds: Vec<SeedContext>,
+    scenarios: Vec<ShapeDScenario>,
+}
+
+/// The CORRECTED Shape D dispatch predicate (see the Phase 8 plan
+/// correction — the original "`setup` and `scenarios`" wording can never
+/// match `vis-006`, the proof fixture, which has no `scenarios` at all):
+/// `setup` present AND (`scenarios` present OR (`input` AND `expected`
+/// present)).
+fn is_shape_d_candidate(fx: &Value) -> bool {
+    fx.get("setup").is_some()
+        && (fx.get("scenarios").is_some()
+            || (fx.get("input").is_some() && fx.get("expected").is_some()))
+}
+
+/// Parse one `context_published` / `contexts_published` element. `None`
+/// when the object carries any key outside the recognized set — this is
+/// the mechanism that keeps Shape D from silently half-seeding a shape it
+/// doesn't fully understand yet.
+fn parse_seed_context(v: &Value) -> Option<SeedContext> {
+    let obj = v.as_object()?;
+    const KNOWN: &[&str] = &["ctx_id", "agent_id", "title", "visibility", "audience"];
+    if obj.keys().any(|k| !KNOWN.contains(&k.as_str())) {
+        return None;
+    }
+    let fixture_ctx_id = obj.get("ctx_id")?.as_str()?.to_string();
+    let visibility = obj.get("visibility")?.as_str()?.to_string();
+    let agent_id = obj
+        .get("agent_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let title = obj.get("title").and_then(Value::as_str).map(str::to_string);
+    let audience = obj
+        .get("audience")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(SeedContext {
+        fixture_ctx_id,
+        agent_id,
+        title,
+        visibility,
+        audience,
+    })
+}
+
+/// Parse `setup` into seed contexts. `None` when `setup` carries anything
+/// other than exactly one of `context_published` (object) /
+/// `contexts_published` (array) — in particular `setup.lineages`
+/// (`vis-008`), which is Phase 9c's job and must keep skipping via
+/// `unseeded_precondition_reason` until then.
+fn parse_seed_plan(setup: &Value) -> Option<Vec<SeedContext>> {
+    let obj = setup.as_object()?;
+    const KNOWN: &[&str] = &["context_published", "contexts_published"];
+    if obj.keys().any(|k| !KNOWN.contains(&k.as_str())) {
+        return None;
+    }
+    match (obj.get("context_published"), obj.get("contexts_published")) {
+        (Some(single), None) => Some(vec![parse_seed_context(single)?]),
+        (None, Some(Value::Array(list))) => list.iter().map(parse_seed_context).collect(),
+        _ => None,
+    }
+}
+
+/// The parts of an `expected` object Shape D actually asserts on. Returned
+/// by [`parse_expected`] instead of a tuple (clippy's `type_complexity`).
+struct ParsedExpected {
+    status: u16,
+    error_code: Option<String>,
+    matches_count: Option<u64>,
+    match_summary_contains: Option<Value>,
+}
+
+/// Parse an `expected` object shared by both scenario forms. Returns
+/// `None` when it carries any key outside the recognized assertable /
+/// purely-descriptive set — e.g. `total_estimate`, `matches_ctx_ids`,
+/// `match_visibility_field_disposition`, `response_body_constraints`.
+/// This allowlist is precisely what keeps Phase 8 scoped to `vis-006`
+/// alone: every other `vis-*` fixture's `expected` uses at least one key
+/// outside it. `match_visibility`, `outcome`, `rationale`,
+/// `implementer_note`, and `notes` are recognized but purely descriptive
+/// (never asserted) — `match_summary_contains` already covers the
+/// disclosure assertion `match_visibility` restates.
+fn parse_expected(expected: &Value) -> Option<ParsedExpected> {
+    let obj = expected.as_object()?;
+    const RECOGNIZED: &[&str] = &[
+        "status",
+        "http_status",
+        "error_code",
+        "matches_count",
+        "match_summary_contains",
+        "match_visibility",
+        "outcome",
+        "rationale",
+        "implementer_note",
+        "notes",
+    ];
+    if obj.keys().any(|k| !RECOGNIZED.contains(&k.as_str())) {
+        return None;
+    }
+    let status = want_status(expected)?;
+    Some(ParsedExpected {
+        status,
+        error_code: want_error_code(expected),
+        matches_count: expected.get("matches_count").and_then(Value::as_u64),
+        match_summary_contains: expected.get("match_summary_contains").cloned(),
+    })
+}
+
+/// Parse `vis-006`'s single-exchange shape: top-level `input` + top-level
+/// `expected`, no `scenarios` at all.
+fn parse_single_exchange_scenario(fx: &Value) -> Option<ShapeDScenario> {
+    let input = fx.get("input")?.as_object()?;
+    const KNOWN: &[&str] = &["endpoint", "effective_requester_did"];
+    if input.keys().any(|k| !KNOWN.contains(&k.as_str())) {
+        return None;
+    }
+    let (method, path) = input.get("endpoint")?.as_str()?.split_once(' ')?;
+    let effective_requester_did = match input.get("effective_requester_did") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        _ => return None,
+    };
+    let expected = parse_expected(fx.get("expected")?)?;
+    Some(ShapeDScenario {
+        method: method.to_uppercase(),
+        path: path.to_string(),
+        effective_requester_did,
+        anonymous_public_reads_override: None,
+        want_status: expected.status,
+        want_error_code: expected.error_code,
+        want_matches_count: expected.matches_count,
+        want_match_summary_contains: expected.match_summary_contains,
+    })
+}
+
+/// Parse a `scenarios[]` array (the `vis-001`-style multi-scenario shape).
+/// `None` (via `Option`'s `FromIterator`) as soon as any single scenario
+/// carries a request field Shape D doesn't handle yet — most importantly
+/// `context_subset_for_test` (post-seed context mutation, not built in
+/// this phase). This is what keeps `vis-001`/`vis-004` from being
+/// silently half-replayed: they're otherwise well within Shape D's
+/// `expected`-key allowlist.
+fn parse_scenarios_array(scenarios: &[Value]) -> Option<Vec<ShapeDScenario>> {
+    scenarios
+        .iter()
+        .map(|sc| {
+            const KNOWN_SCENARIO: &[&str] = &["name", "request", "expected", "notes"];
+            if sc
+                .as_object()?
+                .keys()
+                .any(|k| !KNOWN_SCENARIO.contains(&k.as_str()))
+            {
+                return None;
+            }
+            let req = sc.get("request")?.as_object()?;
+            const KNOWN_REQUEST: &[&str] = &[
+                "method",
+                "path",
+                "effective_requester_did",
+                "registry_capabilities_subset",
+            ];
+            if req.keys().any(|k| !KNOWN_REQUEST.contains(&k.as_str())) {
+                return None;
+            }
+            let method = req.get("method")?.as_str()?.to_uppercase();
+            let path = req.get("path")?.as_str()?.to_string();
+            let effective_requester_did = match req.get("effective_requester_did") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => Some(s.clone()),
+                _ => return None,
+            };
+            let anonymous_public_reads_override = match req.get("registry_capabilities_subset") {
+                None => None,
+                Some(v) => {
+                    let obj = v.as_object()?;
+                    if obj.len() != 1 {
+                        return None;
+                    }
+                    obj.get("anonymous_public_reads")?.as_bool()
+                }
+            };
+            let expected = parse_expected(sc.get("expected")?)?;
+            Some(ShapeDScenario {
+                method,
+                path,
+                effective_requester_did,
+                anonymous_public_reads_override,
+                want_status: expected.status,
+                want_error_code: expected.error_code,
+                want_matches_count: expected.matches_count,
+                want_match_summary_contains: expected.match_summary_contains,
+            })
+        })
+        .collect()
+}
+
+/// Fully parse a Shape D candidate into a plan, or `None` when any part of
+/// it (the seed shape, or any one scenario) uses a key this phase doesn't
+/// recognize. `unseeded_precondition_reason` calls this to decide whether a
+/// `setup`-carrying fixture escapes the generic pre-seeded-state skip;
+/// `extract_shapes` calls it again to build the plan it actually replays.
+/// A fixture only ever reaches [`replay_shape_d`] once both call sites
+/// agree it parses.
+fn parse_shape_d(fx: &Value) -> Option<ShapeDPlan> {
+    let seeds = parse_seed_plan(fx.get("setup")?)?;
+    // `contexts_published: []` parses to `Some(vec![])` in `parse_seed_plan`
+    // -- that shape is a syntactically valid (if useless) seed list, not a
+    // parse failure. But `replay_shape_d` asserts its `ctx_map` is
+    // non-empty afterward, so a plan with zero seeds must never reach it:
+    // treat it the same as an unrecognized seed shape here (`None`), which
+    // routes the fixture to `extract()`'s skip path with its own distinct
+    // reason instead of panicking mid-replay.
+    if seeds.is_empty() {
+        return None;
+    }
+    let scenarios = if let Some(arr) = fx.get("scenarios").and_then(Value::as_array) {
+        parse_scenarios_array(arr)?
+    } else if fx.get("input").is_some() && fx.get("expected").is_some() {
+        vec![parse_single_exchange_scenario(fx)?]
+    } else {
+        return None;
+    };
+    if scenarios.is_empty() {
+        return None;
+    }
+    Some(ShapeDPlan { seeds, scenarios })
+}
+
+/// A signing producer whose `agent_id` is exactly `did` -- used both for a
+/// fixture literal `agent_id` that's already `did:web` (no substitution
+/// needed, e.g. `vis-006`/`vis-007`'s `did:web:agents.example.com:test-producer`)
+/// and for a freshly-minted substitute (`did:web:agents.test:shape-d-{seed}`).
+/// `seed` only needs to be distinct per producer within one fixture replay.
+fn shape_d_producer(did: &str, seed: u8) -> Producer {
+    Producer::new(
+        SigningKey::from_bytes(&[seed; 32]),
+        AgentDid::new(did.to_string()),
+        format!("{did}#key-1"),
+    )
+}
+
+/// Parse a fixture's literal `visibility` string into [`Visibility`].
+/// Panics on an unrecognized value -- `parse_seed_context` already
+/// requires the key to be present and a string, so an unrecognized value
+/// here means the pinned spec introduced a fourth visibility level, which
+/// is worth failing loudly on rather than silently mis-seeding.
+fn shape_d_visibility(s: &str) -> Visibility {
+    serde_json::from_value(json!(s))
+        .unwrap_or_else(|e| panic!("Shape D: unrecognized visibility {s:?}: {e}"))
+}
+
+/// Rewrite every occurrence of a fixture's literal `ctx_id` in `path` (raw
+/// or single-segment percent-encoded, matching how `request.path` /
+/// `input.ctx_id` each appear across the corpus) with its minted
+/// replacement. Used both to build the actual request path and, by the
+/// caller, to assert no un-substituted literal ctx_id survives into it.
+fn substitute_ctx_ids_in_path(
+    path: &str,
+    ctx_map: &std::collections::BTreeMap<String, String>,
+) -> String {
+    let mut out = path.to_string();
+    for (fixture_ctx, minted_ctx) in ctx_map {
+        let encoded_fixture = pct_encode_path_segment(fixture_ctx);
+        let encoded_minted = pct_encode_path_segment(minted_ctx);
+        if out.contains(&encoded_fixture) {
+            out = out.replace(&encoded_fixture, &encoded_minted);
+        } else if out.contains(fixture_ctx.as_str()) {
+            out = out.replace(fixture_ctx.as_str(), minted_ctx.as_str());
+        }
+    }
+    out
+}
+
+/// Result of replaying one Shape D plan: how many scenario exchanges
+/// matched their expectation, every mismatch found (empty ⇒ full pass),
+/// and the substitution maps built while seeding -- exposed so the
+/// dedicated `vis-006` proof test can assert on them directly (the Phase 8
+/// plan's Correction 3: completeness, not non-emptiness, since the DID map
+/// is legitimately empty for `vis-006`).
+#[derive(Debug)]
+struct ShapeDResult {
+    ran: usize,
+    failures: Vec<String>,
+    ctx_map: std::collections::BTreeMap<String, String>,
+    did_map: std::collections::BTreeMap<String, String>,
+}
+
+/// Replay one Shape D plan end-to-end.
+///
+/// 1. **Isolation**: a fresh in-memory [`common::SeededHarness`] -- never
+///    the shared `app` Shapes A/B/C replay against.
+/// 2. **Seed**: publish every `setup` context through the real publish API
+///    (never a direct store write), substituting each fixture's unmintable
+///    literal `ctx_id` (`ctx_map`) and, for any seeded `agent_id` that
+///    isn't already `did:web` (`caps().supported_did_methods`), minting a
+///    substitute `did:web` producer this harness holds the key for
+///    (`did_map`). `audience` entries pass through the SAME `did_map`
+///    lookup as requester DIDs (falling back to the literal string when
+///    absent) so an audience-membership check stays consistent with
+///    whichever bearer `sub` a scenario presents -- `contributors` would be
+///    exempt from this entirely (per the plan), but no seed shape Phase 8
+///    handles carries any. A seed publish that does not return 200 PANICS
+///    -- never skips -- per the plan's edge-case note: a mis-seeded
+///    fixture that silently skipped would be indistinguishable from a
+///    genuinely passing one.
+/// 3. **Replay**: mint a bearer per scenario from `effective_requester_did`
+///    (no `Authorization` header at all when it's `null`), rebuilding the
+///    router whenever a scenario's `anonymous_public_reads_override`
+///    differs from the router's current setting. Per-scenario assertion
+///    mismatches are collected into `failures` rather than panicking, so
+///    the mutation proof (a deliberately-broken `vis-006` copy) can
+///    observe a non-empty `failures` without aborting the whole test
+///    binary.
+async fn replay_shape_d(name: &str, plan: &ShapeDPlan) -> ShapeDResult {
+    let mut harness = common::SeededHarness::new(shape_d_config(), caps(), AUTHORITY).await;
+
+    let mut ctx_map = std::collections::BTreeMap::new();
+    let mut did_map = std::collections::BTreeMap::new();
+
+    // Pass 1: mint every non-`did:web` literal `agent_id` exactly ONCE,
+    // before any seed is published. Two seeds can legitimately share one
+    // literal `agent_id` (e.g. `vis-005`'s two `contexts_published`
+    // entries both carry `did:agent:owner`) -- minting inline, per-seed,
+    // as the loop below used to do would silently overwrite the first
+    // mint's `did_map` entry with a second, DIFFERENT minted DID, leaving
+    // the first-seeded context "owned" by a DID no longer reachable
+    // through `did_map` (see the module doc-block / REG-10 Phase 8 GAP 1
+    // writeup). `did_map.entry(..).or_insert_with(..)` makes the mapping
+    // idempotent: however many seeds name the same literal agent, they
+    // all resolve to the SAME minted `did:web`. Doing this as its own
+    // pass, ahead of any publish, also means pass 2's `audience`
+    // resolution below can never race a seed whose `agent_id` is only
+    // minted by a LATER seed in `plan.seeds` -- every literal agent DID
+    // this plan will ever mint is already in `did_map` before pass 2
+    // starts.
+    let mut mint_seq: u8 = 1;
+    for seed in &plan.seeds {
+        let literal_agent = seed
+            .agent_id
+            .clone()
+            .unwrap_or_else(|| "did:web:agents.test:shape-d-default".to_string());
+        if !literal_agent.starts_with("did:web:") {
+            did_map.entry(literal_agent).or_insert_with(|| {
+                let minted = format!("did:web:agents.test:shape-d-{mint_seq}");
+                mint_seq = mint_seq.wrapping_add(1);
+                minted
+            });
+        }
+    }
+
+    // Pass 2: publish every seed, resolving both its own `agent_id` and
+    // every `audience` entry against the now-complete `did_map` built
+    // above.
+    let mut seed_seq: u8 = 1;
+    for seed in &plan.seeds {
+        let literal_agent = seed
+            .agent_id
+            .clone()
+            .unwrap_or_else(|| "did:web:agents.test:shape-d-default".to_string());
+        let seeded_agent = did_map
+            .get(&literal_agent)
+            .cloned()
+            .unwrap_or(literal_agent);
+        assert!(
+            seeded_agent.starts_with("did:web:"),
+            "{name}: every seeded agent_id must be did:web (caps().supported_did_methods); \
+             got {seeded_agent}"
+        );
+        let producer = shape_d_producer(&seeded_agent, seed_seq);
+        seed_seq = seed_seq.wrapping_add(1);
+
+        // An `audience` entry resolves through `did_map` ONLY when it
+        // matches some seed's own literal `agent_id` elsewhere in this
+        // plan (pass 1 above minted a substitute for every such literal,
+        // regardless of seeding order -- the two-pass fix). Most audience
+        // DIDs name a pure consumer identity that never publishes
+        // anything itself (e.g. `vis-001`'s `did:agent:authorized_consumer`)
+        // and so never appears in `did_map` at all -- those pass through
+        // UNCHANGED, exactly like the requester-bearer `sub` resolution
+        // below (`did_map.get(did).unwrap_or_else(|| did.clone())`), so
+        // audience membership and bearer identity stay consistent with
+        // each other even for a literal, non-`did:web` DID.
+        let audience: Vec<AgentDid> = seed
+            .audience
+            .iter()
+            .map(|a| AgentDid::new(did_map.get(a).cloned().unwrap_or_else(|| a.clone())))
+            .collect();
+
+        let mut builder = producer
+            .publish_request()
+            .title(
+                seed.title
+                    .clone()
+                    .unwrap_or_else(|| format!("Shape D seed ({name})")),
+            )
+            .context_type(ContextType::DataSnapshot)
+            .visibility(shape_d_visibility(&seed.visibility));
+        if !audience.is_empty() {
+            builder = builder.audience(audience);
+        }
+        let req = builder
+            .build()
+            .unwrap_or_else(|e| panic!("{name}: Shape D seed request failed to build: {e}"));
+
+        let (status, body) = common::publish(&harness.router, &req, None).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{name}: Shape D seed publish for fixture ctx_id {} MUST succeed -- a failed seed \
+             panics, it never skips; body = {body}",
+            seed.fixture_ctx_id
+        );
+        let minted_ctx = body["ctx_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{name}: seed publish response carried no ctx_id: {body}"))
+            .to_string();
+        ctx_map.insert(seed.fixture_ctx_id.clone(), minted_ctx);
+    }
+    assert!(
+        !ctx_map.is_empty(),
+        "{name}: Shape D ctx_id substitution map must be non-empty for every `vis` fixture"
+    );
+
+    let mut current_anon = shape_d_config().auth.anonymous_public_reads;
+    let mut ran = 0usize;
+    let mut failures = Vec::new();
+
+    for sc in &plan.scenarios {
+        let desired_anon = sc.anonymous_public_reads_override.unwrap_or(current_anon);
+        if desired_anon != current_anon {
+            let mut cfg = shape_d_config();
+            cfg.auth.anonymous_public_reads = desired_anon;
+            // `anonymous_public_reads` is authorization-relevant behavior
+            // (`RegistryServer::search`/`::retrieve` gate off `caps`, not
+            // off `RegistryConfig` -- see `SeededHarness::rebuild`'s doc
+            // comment / GAP 3), so the `CapabilitiesDocument` passed to
+            // `rebuild` must carry the override too, not just `cfg`.
+            let mut new_caps = caps();
+            new_caps.anonymous_public_reads = desired_anon;
+            harness.rebuild(cfg, new_caps);
+            current_anon = desired_anon;
+        }
+
+        let mut path = substitute_ctx_ids_in_path(&sc.path, &ctx_map);
+        // GET paths may carry a raw `acdp://` ctx_id needing single-segment
+        // percent-encoding for axum's `{ctx_id}` matcher -- mirrors the
+        // main replay loop's own handling for Shapes A/B/C.
+        if path.contains("acdp://") && sc.method == "GET" {
+            if let Some(idx) = path.rfind('/') {
+                let seg = &path[idx + 1..];
+                path = format!("{}/{}", &path[..idx], pct_encode_path_segment(seg));
+            }
+        }
+        for fixture_ctx in ctx_map.keys() {
+            assert!(
+                !path.contains(fixture_ctx.as_str()),
+                "{name}: fixture ctx_id {fixture_ctx} leaked into request path unsubstituted: {path}"
+            );
+        }
+
+        let mut builder = Request::builder().method(sc.method.as_str()).uri(&path);
+        if let Some(did) = &sc.effective_requester_did {
+            let sub = did_map.get(did).cloned().unwrap_or_else(|| did.clone());
+            let bearer = common::forged_bearer(&sub, &format!("{name}-{sub}"), 300);
+            builder = builder.header("authorization", format!("Bearer {bearer}"));
+        }
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let got_status = resp.status().as_u16();
+        let body_json = body_to_json_lenient(resp).await;
+
+        let mut mismatch = None;
+        if got_status != sc.want_status {
+            mismatch = Some(format!(
+                "{name}: status {got_status} != {}; body = {body_json}",
+                sc.want_status
+            ));
+        } else if let Some(code) = &sc.want_error_code {
+            let actual = body_json
+                .get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(Value::as_str);
+            if actual != Some(code.as_str()) {
+                mismatch = Some(format!(
+                    "{name}: error code {actual:?} != {code:?}; body = {body_json}"
+                ));
+            }
+        }
+        if mismatch.is_none() {
+            if let Some(n) = sc.want_matches_count {
+                let got_n = body_json
+                    .get("matches")
+                    .and_then(Value::as_array)
+                    .map(|a| a.len() as u64);
+                if got_n != Some(n) {
+                    mismatch = Some(format!(
+                        "{name}: matches_count {got_n:?} != {n}; body = {body_json}"
+                    ));
+                }
+            }
+        }
+        if mismatch.is_none() {
+            if let Some(contains) = &sc.want_match_summary_contains {
+                let first = body_json
+                    .get("matches")
+                    .and_then(Value::as_array)
+                    .and_then(|a| a.first());
+                match first {
+                    None => {
+                        mismatch = Some(format!(
+                            "{name}: match_summary_contains asserted but matches[] is empty; \
+                             body = {body_json}"
+                        ))
+                    }
+                    Some(m) => {
+                        if let Err(reason) = json_contains(m, contains) {
+                            mismatch = Some(format!("{name}: {reason}; body = {body_json}"));
+                        }
+                    }
+                }
+            }
+        }
+
+        match mismatch {
+            Some(f) => failures.push(f),
+            None => ran += 1,
+        }
+    }
+
+    ShapeDResult {
+        ran,
+        failures,
+        ctx_map,
+        did_map,
+    }
 }
 
 fn want_status(expected: &Value) -> Option<u16> {
@@ -337,17 +1012,59 @@ fn targets_unadvertised_profile(fx: &Value) -> bool {
             .any(|p| HARNESS_PROFILES.contains(p))
 }
 
-/// True iff the fixture declares any of the four precondition-carrying keys
-/// the pinned corpus uses: top-level `setup`/`preconditions`, or
-/// `input.precondition`/`input.preconditions`. All four mean the fixture
-/// needs a ctx the publish API won't let us mint (registry assigns ctx_id),
-/// so we skip those.
-fn has_unseeded_precondition(fx: &Value) -> bool {
-    fx.get("setup").is_some()
+/// The skip reason for a fixture that carries an unseeded precondition, or
+/// `None` when Shape D fully understands the fixture (it should be
+/// replayed, not skipped). All four of the pinned corpus's
+/// precondition-carrying keys — top-level `setup`/`preconditions`, or
+/// `input.precondition`/`input.preconditions` — mean the fixture needs a
+/// ctx the publish API won't let us mint (registry assigns `ctx_id`), so we
+/// skip those UNLESS Shape D (REG-10 Phase 8) fully understands how to
+/// pre-seed and replay it — narrowed, not deleted, per the Phase 8 plan.
+/// `is_shape_d_candidate` alone is not enough (it's deliberately broad —
+/// see the module doc-block); `parse_shape_d(fx).is_some()` is what
+/// actually proves every `setup` entry and every scenario used only
+/// recognized keys.
+///
+/// A Shape D candidate that fails to fully parse gets one of two DISTINCT
+/// reasons, so a future widening of Shape D's allowlist (Phase 9a/9c) is
+/// auditable rather than lumped into one catch-all bucket:
+///
+///   * its `setup` shape itself is unrecognized (e.g. `setup.lineages` —
+///     `vis-008`, `ret-002`) — Shape D cannot even SEED these yet, so they
+///     keep the generic `"requires pre-seeded registry state"` reason;
+///   * its `setup` parses fine (Shape D COULD seed it) but some
+///     scenario/expected key is outside the allowlist (e.g. `vis-001`'s
+///     `context_subset_for_test`, `vis-007`'s `total_estimate`) — these get
+///     `"Shape D: unrecognized scenario/expected key"`, naming precisely
+///     what's blocking them: the scenario shape, not the seeding.
+///
+/// An empty `contexts_published: []` seed list is its own third reason
+/// (`parse_shape_d` treats it as unparseable — see its doc comment — so it
+/// never reaches [`replay_shape_d`] and panics on an empty `ctx_map`).
+fn unseeded_precondition_reason(fx: &Value) -> Option<&'static str> {
+    if is_shape_d_candidate(fx) {
+        if parse_shape_d(fx).is_some() {
+            return None;
+        }
+        if let Some(seeds) = fx.get("setup").and_then(parse_seed_plan) {
+            return Some(if seeds.is_empty() {
+                "Shape D: empty contexts_published seed list"
+            } else {
+                "Shape D: unrecognized scenario/expected key"
+            });
+        }
+        // else: `setup` itself didn't parse (e.g. `setup.lineages`) — fall
+        // through to the generic reason below.
+    }
+    if fx.get("setup").is_some()
         || fx.get("preconditions").is_some()
         || fx
             .get("input")
             .is_some_and(|i| i.get("precondition").is_some() || i.get("preconditions").is_some())
+    {
+        return Some("requires pre-seeded registry state");
+    }
+    None
 }
 
 /// Turn a parsed fixture into replayable exchanges or a skip reason. Only
@@ -364,8 +1081,8 @@ fn extract(fx: &Value) -> Extracted {
     if targets_unadvertised_profile(fx) {
         return Extracted::Skip("fixture targets a profile this harness does not advertise");
     }
-    if has_unseeded_precondition(fx) {
-        return Extracted::Skip("requires pre-seeded registry state");
+    if let Some(reason) = unseeded_precondition_reason(fx) {
+        return Extracted::Skip(reason);
     }
     let extracted = extract_shapes(fx);
     // Template gate: inspect the *constructed* Exchange.path, never the
@@ -389,6 +1106,21 @@ fn extract(fx: &Value) -> Extracted {
 
 /// Shape dispatch: the actual per-family extraction logic, run after the
 /// profile and precondition gates have already passed.
+// Sibling note to Shape A's non-400-publish refusal below (the "A publish
+// fixture is only deterministically replayable to a *schema/validation*
+// (400) outcome" comment, just inside the `is_publish` branch): that
+// refusal applies only to fixtures replayed as an HTTP *exchange* through
+// `extract_shapes`'s own generic path. Shape D's seeding step
+// ([`replay_shape_d`]) never goes through `extract_shapes` at all -- it
+// calls `common::publish` directly with a request THIS harness signs
+// itself (title/visibility/audience lifted from `setup.context_published`
+// / `.contexts_published`, everything else supplied fresh), the same
+// technique the `anc-*`/`wit-*` direct-coverage tests already use
+// elsewhere in this file. A seeded publish is therefore expected to
+// succeed (200), not merely tolerated as a 400 — and per the Phase 8 plan,
+// a seed publish that does NOT return 200 is a hard bug in the harness's
+// own request construction, so `replay_shape_d` panics on it rather than
+// skipping or recording it as a fixture mismatch.
 fn extract_shapes(fx: &Value) -> Extracted {
     // Shape A: top-level `request` + `expected`.
     if let (Some(req), Some(exp)) = (fx.get("request"), fx.get("expected")) {
@@ -437,6 +1169,23 @@ fn extract_shapes(fx: &Value) -> Extracted {
                 want_json: exp.get("json_contains").cloned(),
             }]);
         }
+    }
+    // Shape D: `setup` present AND (`scenarios` present OR (`input` +
+    // `expected` present)) -- REG-10 Phase 8. Dispatched HERE, ahead of
+    // Shape B: a `setup`-carrying fixture's `scenarios[]` (e.g. `vis-001`)
+    // also satisfies Shape B's own predicate (`request` + `expected` per
+    // scenario), and Shape B has no seeding step at all -- if it ran first
+    // it would silently replay such a fixture against an empty store,
+    // turning "context doesn't exist yet" 404s into false-negative passes.
+    // See the module doc-block for the full writeup. Shapes A (above) and
+    // B/C (below) are unmodified by this phase -- Shape D wins purely by
+    // trying its narrower, `setup`-gated predicate first.
+    if is_shape_d_candidate(fx) {
+        let plan = parse_shape_d(fx).expect(
+            "extract_shapes is only reached once extract()'s unseeded_precondition_reason() gate \
+             has already confirmed is_shape_d_candidate(fx) && parse_shape_d(fx).is_some()",
+        );
+        return Extracted::RunStateful(plan);
     }
     // Shape B: `scenarios[]`, each a self-contained request + expected.
     if let Some(scenarios) = fx.get("scenarios").and_then(Value::as_array) {
@@ -570,10 +1319,11 @@ fn resolve_fixture_dir(dir: &str) -> Option<PathBuf> {
     .find(has_json)
 }
 
-/// Exchanges replayable at spec 417211f: pub-004, pub-005, pub-008, ret-001.
+/// Exchanges replayable at spec 417211f: pub-004, pub-005, pub-008, ret-001
+/// (Shapes A/C), plus vis-006 (Shape D, REG-10 Phase 8's proof fixture).
 /// A gate that accidentally over-matches must fail loudly, not quietly shrink
 /// coverage to a still-nonzero number. Raise this as coverage grows.
-const MIN_REPLAYED_EXCHANGES: usize = 4;
+const MIN_REPLAYED_EXCHANGES: usize = 5;
 
 fn family_of(name: &str) -> String {
     // Prefix up to the digit group: `data-ref-ssrf-001-...` -> `data-ref-ssrf`.
@@ -732,6 +1482,18 @@ async fn replays_spec_fixtures_when_present() {
                 continue;
             }
             Extracted::Run(x) => x,
+            Extracted::RunStateful(plan) => {
+                let result = replay_shape_d(&name, &plan).await;
+                eprintln!(
+                    "conformance: {name} replayed via Shape D ({} exchange(s), {} failure(s))",
+                    result.ran,
+                    result.failures.len()
+                );
+                failures.extend(result.failures);
+                replayed += result.ran;
+                *ran.entry(family.clone()).or_insert(0) += result.ran;
+                continue;
+            }
         };
 
         for ex in exchanges {
@@ -810,6 +1572,436 @@ async fn replays_spec_fixtures_when_present() {
         replayed >= MIN_REPLAYED_EXCHANGES,
         "replayed {replayed} exchange(s), expected at least {MIN_REPLAYED_EXCHANGES} \
          (a fidelity gate may be over-matching and silently shrinking coverage)"
+    );
+}
+
+/// REG-10 Phase 8 regression canary. The gravest failure mode of this phase
+/// is Shape D over-matching and capturing a fixture Shape A or C already
+/// handles — dispatching Shape D ahead of Shape B (`extract_shapes`, right
+/// before the "Shape B: `scenarios[]`" comment) exists specifically to
+/// avoid that. This proves it directly, not by inference from a green
+/// suite: `extract()` on each of the four exchanges replayed before this
+/// phase (`pub-004`, `pub-005`, `pub-008` via Shape A; `ret-001` via Shape
+/// C) still returns `Extracted::Run` (never `RunStateful`), and the
+/// extracted `Exchange`'s fields still match the fixture content
+/// field-for-field, exactly as they did before Shape D existed.
+#[tokio::test(flavor = "multi_thread")]
+async fn four_pre_existing_exchanges_still_use_original_shapes() {
+    let Some(fixtures) = spec_fixtures() else {
+        eprintln!(
+            "conformance: ACDP_SPEC_DIR unset or no fixtures resolvable; skipping regression \
+             canary (set ACDP_REQUIRE_CONFORMANCE to make this a hard failure)"
+        );
+        return;
+    };
+
+    // pub-004, pub-005, pub-008: Shape A, publish branch.
+    for id in ["pub-004", "pub-005", "pub-008"] {
+        let Some(fx) = find_fixture_by_id(&fixtures, id) else {
+            return;
+        };
+        assert!(
+            !is_shape_d_candidate(&fx),
+            "{id} carries no `setup`, so it must not even be a Shape D candidate"
+        );
+        let Extracted::Run(exchanges) = extract(&fx) else {
+            panic!("{id} must still extract via Shape A (Extracted::Run)");
+        };
+        assert_eq!(
+            exchanges.len(),
+            1,
+            "{id}: Shape A yields exactly one exchange"
+        );
+        let ex = &exchanges[0];
+        assert_eq!(
+            ex.method,
+            fx["request"]["method"].as_str().unwrap().to_uppercase(),
+            "{id}: method"
+        );
+        assert_eq!(
+            ex.path,
+            fx["request"]["path"].as_str().unwrap(),
+            "{id}: path"
+        );
+        assert_eq!(
+            ex.body,
+            fx["request"].get("body").cloned(),
+            "{id}: body must still be the fixture's own request.body"
+        );
+        assert_eq!(
+            ex.want_status,
+            fx["expected"]["status"].as_u64().unwrap() as u16,
+            "{id}: want_status"
+        );
+        assert!(
+            ex.want_error_code.is_none(),
+            "{id}: Shape A's publish branch never pins an error code (validation ordering is \
+             impl-defined) -- this must still hold"
+        );
+    }
+
+    // ret-001: Shape C, retrieval-by-template.
+    let Some(fx) = find_fixture_by_id(&fixtures, "ret-001") else {
+        return;
+    };
+    assert!(
+        !is_shape_d_candidate(&fx),
+        "ret-001 carries no `setup`, so it must not even be a Shape D candidate"
+    );
+    let Extracted::Run(exchanges) = extract(&fx) else {
+        panic!("ret-001 must still extract via Shape C (Extracted::Run)");
+    };
+    assert_eq!(
+        exchanges.len(),
+        1,
+        "ret-001: Shape C yields exactly one exchange"
+    );
+    let ex = &exchanges[0];
+    assert_eq!(ex.method, "GET");
+    assert_eq!(
+        ex.path,
+        format!(
+            "/contexts/{}",
+            pct_encode_path_segment(fx["input"]["ctx_id"].as_str().unwrap())
+        ),
+        "ret-001: path must still be Shape C's substituted /contexts/{{ctx_id}}"
+    );
+    assert_eq!(ex.want_status, 404);
+    assert_eq!(ex.want_error_code.as_deref(), Some("not_found"));
+}
+
+/// REG-10 Phase 8's proof fixture. `vis-006` is the only single-exchange
+/// `vis` fixture (`setup.context_published` + `input` + top-level
+/// `expected`, no `scenarios`), so it exercises all five Shape D
+/// capabilities (ctx_id substitution, the DID substitution table, `setup`
+/// handling, per-scenario identity, and per-fixture isolation) in one
+/// fixture. Driven directly through `extract`/`replay_shape_d` rather than
+/// via the shared replay loop, so the mutation proof below can inspect
+/// `ShapeDResult::failures` without panicking this whole test binary.
+#[tokio::test(flavor = "multi_thread")]
+async fn vis006_search_match_public_visibility_disclosure_replays_via_shape_d() {
+    let Some(fixtures) = spec_fixtures() else {
+        eprintln!(
+            "conformance: ACDP_SPEC_DIR unset or no fixtures resolvable; skipping vis-006 \
+             Shape D proof (set ACDP_REQUIRE_CONFORMANCE to make this a hard failure)"
+        );
+        return;
+    };
+    let Some(fx) = find_fixture_by_id(&fixtures, "vis-006") else {
+        return;
+    };
+
+    assert!(
+        is_shape_d_candidate(&fx),
+        "vis-006 must satisfy the corrected Shape D predicate: setup present AND (scenarios \
+         present OR (input AND expected present)) -- it has no `scenarios`, only input+expected"
+    );
+    let plan = parse_shape_d(&fx).expect("vis-006 is Shape D's proof fixture and must fully parse");
+    assert_eq!(plan.seeds.len(), 1, "vis-006 seeds exactly one context");
+    assert_eq!(
+        plan.scenarios.len(),
+        1,
+        "vis-006 is the single-exchange input+expected form, not scenarios[]"
+    );
+
+    let result = replay_shape_d("vis-006", &plan).await;
+    assert!(
+        result.failures.is_empty(),
+        "vis-006 must replay cleanly via Shape D: {:?}",
+        result.failures
+    );
+    assert_eq!(result.ran, 1);
+
+    // Correction 3 (the Phase 8 plan): the ctx_id map is non-empty for
+    // every `vis` fixture.
+    assert_eq!(
+        result.ctx_map.len(),
+        1,
+        "vis-006's ctx_id substitution map must contain exactly its one seeded context"
+    );
+    // ...but the DID map is legitimately EMPTY here: vis-006 already seeds
+    // `did:web:agents.example.com:test-producer`, which needs no
+    // substitution at all (unlike vis-001/004/005/008's `did:agent:owner`).
+    // Asserting it non-empty would be unsatisfiable on this fixture.
+    assert!(
+        result.did_map.is_empty(),
+        "vis-006 seeds an already-did:web agent_id; the DID map must be empty here, not \
+         merely non-empty-somewhere-else: {:?}",
+        result.did_map
+    );
+
+    // Mutation proof: an in-memory-only clone of the fixture (never
+    // written to the spec checkout -- the whole point is to never touch
+    // it) with the seeded context's visibility flipped to `restricted`
+    // must FAIL vis-006's own expectation (a public match disclosing
+    // `visibility: "public"`). This proves the harness is exercising the
+    // registry's real visibility-scoping logic, not trivially returning
+    // green regardless of what's seeded. `restricted` requires a non-empty
+    // `audience` (the SDK's own publish-request builder enforces this --
+    // seeding would otherwise panic as a hard seed-build failure, not a
+    // soft replay mismatch), so the mutation also adds one audience DID
+    // that is deliberately NOT vis-006's search requester
+    // (`did:agent:any-authenticated-or-anonymous`) -- the seeded context
+    // still publishes cleanly, but now sits outside the searcher's
+    // visibility, and the search's own `matches_count: 1` expectation
+    // must fail.
+    let mut mutated = fx.clone();
+    mutated["setup"]["context_published"]["visibility"] = json!("restricted");
+    mutated["setup"]["context_published"]["audience"] = json!(["did:agent:someone-else"]);
+    let mutated_plan =
+        parse_shape_d(&mutated).expect("mutated vis-006 must still parse as Shape D");
+    let mutated_result = replay_shape_d("vis-006-mutated", &mutated_plan).await;
+    assert!(
+        !mutated_result.failures.is_empty(),
+        "mutating vis-006's seeded visibility to `restricted` MUST fail replay -- if it \
+         doesn't, Shape D isn't actually checking anything: {mutated_result:?}"
+    );
+    // Pin the KIND of failure, not just its presence: a bare
+    // `!failures.is_empty()` would pass on ANY mismatch (e.g. a status-code
+    // regression elsewhere), which wouldn't actually prove the harness is
+    // exercising visibility scoping. The mutated context must specifically
+    // drop out of the search's `matches_count`, since it's no longer public.
+    assert!(
+        mutated_result
+            .failures
+            .iter()
+            .any(|f| f.contains("matches_count")),
+        "mutating vis-006's seeded visibility must fail specifically on a matches_count \
+         mismatch (the once-public match must disappear from the search results), not on \
+         some other, unrelated failure: {:?}",
+        mutated_result.failures
+    );
+}
+
+/// REG-10 Phase 8 GAP 1 / GAP 2 regression proof: a synthetic, in-test-only
+/// fixture (never read from the spec checkout -- this exercises a shape no
+/// pinned fixture currently reaches, since `vis-002`/`vis-005`/`vis-009`
+/// are all still excluded by `parse_expected`'s allowlist) whose
+/// `setup.contexts_published` carries THREE entries: two share one
+/// non-`did:web` literal `agent_id` (mirroring `vis-005`'s two
+/// `did:agent:owner` entries exactly -- the shape that will trip GAP 1 the
+/// moment `vis-005` itself is admitted in a later phase), and a third
+/// names a DIFFERENT agent that only the SECOND entry's `audience`
+/// forward-references (proving the two-pass mint/seed fix, not just the
+/// `did_map.entry` dedup).
+///
+/// Before the fix: seeding entry 1 (private, owned by `did:agent:owner`)
+/// minted `shape-d-1` and recorded it in `did_map`; seeding entry 2 (also
+/// `did:agent:owner`) minted a SECOND, different DID `shape-d-2` and
+/// OVERWROTE `did_map["did:agent:owner"]` with it. The owner-search
+/// scenario below then resolved its own bearer `sub` through the
+/// (now-overwritten) `did_map` and got `shape-d-2` -- which does not own
+/// entry 1 -- so entry 1 (privately scoped, agent_id-only search
+/// visibility) silently dropped out of the owner's own search results:
+/// `matches_count` was 1, not 2. After the fix, both entries resolve
+/// through the SAME `did_map` entry, and the owner's search correctly
+/// finds both.
+#[tokio::test(flavor = "multi_thread")]
+async fn shape_d_seeding_maps_one_shared_literal_agent_to_one_minted_did() {
+    let fx = json!({
+        "id": "shape-d-test-shared-agent-two-pass",
+        "setup": {
+            "contexts_published": [
+                {
+                    "ctx_id": "acdp://registry.example.com/00000000-0000-4000-8000-0000000000f1",
+                    "agent_id": "did:agent:owner",
+                    "title": "Gap1owner secret",
+                    "visibility": "private",
+                    "audience": ["did:agent:later-seeded"]
+                },
+                {
+                    "ctx_id": "acdp://registry.example.com/00000000-0000-4000-8000-0000000000f2",
+                    "agent_id": "did:agent:owner",
+                    "title": "Gap1owner public",
+                    "visibility": "public"
+                },
+                {
+                    "ctx_id": "acdp://registry.example.com/00000000-0000-4000-8000-0000000000f3",
+                    "agent_id": "did:agent:later-seeded",
+                    "title": "Gap1 later-seeded agent's own context",
+                    "visibility": "public"
+                }
+            ]
+        },
+        "scenarios": [
+            {
+                "name": "Owner (agent_id) searches and sees both of their own contexts",
+                "request": {
+                    "method": "GET",
+                    "path": "/contexts/search?q=Gap1owner",
+                    "effective_requester_did": "did:agent:owner"
+                },
+                "expected": {"status": 200, "matches_count": 2}
+            },
+            {
+                "name": "Later-seeded agent (audience of entry 1, seeded 3rd) retrieves it by ctx_id",
+                "request": {
+                    "method": "GET",
+                    "path": "/contexts/acdp%3A%2F%2Fregistry.example.com%2F00000000-0000-4000-8000-0000000000f1",
+                    "effective_requester_did": "did:agent:later-seeded"
+                },
+                "expected": {"status": 200}
+            }
+        ]
+    });
+
+    assert!(
+        is_shape_d_candidate(&fx),
+        "synthetic fixture must satisfy the Shape D dispatch predicate"
+    );
+    let plan =
+        parse_shape_d(&fx).expect("synthetic shared-agent fixture must fully parse as Shape D");
+    assert_eq!(plan.seeds.len(), 3, "three contexts_published entries");
+    assert_eq!(plan.seeds[0].agent_id.as_deref(), Some("did:agent:owner"));
+    assert_eq!(
+        plan.seeds[1].agent_id.as_deref(),
+        Some("did:agent:owner"),
+        "entries 0 and 1 MUST share one literal, non-did:web agent_id -- this is the exact \
+         shape that trips GAP 1"
+    );
+
+    let result = replay_shape_d("shape-d-test-shared-agent-two-pass", &plan).await;
+    assert!(
+        result.failures.is_empty(),
+        "GAP 1 AFTER the fix: both contexts_published entries sharing `did:agent:owner` \
+         must resolve to ONE minted producer DID, so the owner's own search sees both \
+         (matches_count: 2) and the later-seeded audience member's retrieval succeeds. A \
+         non-empty failures list here means the did_map overwrite bug (or the ordering bug) \
+         is back: {:?}",
+        result.failures
+    );
+    assert_eq!(
+        result.ran, 2,
+        "both scenarios (owner search, later-seeded audience retrieval) must pass"
+    );
+
+    // Structural proof, not just behavioral: `did_map` holds exactly one
+    // entry per distinct literal non-did:web agent (2: `did:agent:owner`,
+    // `did:agent:later-seeded`) -- never one per seed (3).
+    assert_eq!(
+        result.did_map.len(),
+        2,
+        "did_map must hold exactly one entry per distinct literal agent, not one per seed \
+         that names it: {:?}",
+        result.did_map
+    );
+    assert!(
+        result.did_map.contains_key("did:agent:owner"),
+        "did_map must carry the shared literal agent: {:?}",
+        result.did_map
+    );
+    assert!(
+        result.did_map.contains_key("did:agent:later-seeded"),
+        "did_map must resolve the forward-referenced (seeded 3rd, audience-referenced in \
+         seed 1) agent too -- this is the two-pass fix: {:?}",
+        result.did_map
+    );
+
+    // Both seeded contexts under the shared literal agent are present in
+    // ctx_map (all 3 seeds published successfully).
+    assert_eq!(result.ctx_map.len(), 3);
+}
+
+/// REG-10 Phase 8 GAP 3 regression proof: [`common::SeededHarness::rebuild`]
+/// is wired into `replay_shape_d` (for a scenario's
+/// `registry_capabilities_subset` override) but no pinned fixture reaches
+/// it yet. This proves `rebuild` directly, against the one endpoint
+/// `anonymous_public_reads` actually gates (keyword search -- RFC-ACDP-0005
+/// §2.5.5 / RFC-ACDP-0008 §6.3; direct retrieval by known `ctx_id` is NOT
+/// gated by this flag, only by visibility itself, so a GET-by-`ctx_id`
+/// probe would prove nothing here -- see `vis-009`): (a) it actually
+/// changes the router's behavior (an anonymous search that succeeded
+/// before rebuilding with `anonymous_public_reads: false` must be refused
+/// after), and (b) it PRESERVES already-seeded store state across the
+/// rebuild (the whole point of `SeededHarness` holding
+/// `Arc<RegistryServer>`/`Arc<AuthService>` rather than tearing down and
+/// re-seeding) -- proven by an AUTHENTICATED search still finding the
+/// pre-rebuild context afterward (authenticated search is never gated by
+/// `anonymous_public_reads`, so this isolates "is the state still there"
+/// from "does the flag apply to this requester").
+#[tokio::test(flavor = "multi_thread")]
+async fn seeded_harness_rebuild_changes_router_behavior_and_preserves_seeded_state() {
+    let mut harness = common::SeededHarness::new(shape_d_config(), caps(), AUTHORITY).await;
+
+    let producer_did = "did:web:agents.test:rebuild-proof";
+    let producer = shape_d_producer(producer_did, 200);
+    let req = producer
+        .publish_request()
+        .title("Rebuildproof context")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (status, body) = common::publish(&harness.router, &req, None).await;
+    assert_eq!(status, StatusCode::OK, "seed publish must succeed: {body}");
+    let ctx_id = body["ctx_id"]
+        .as_str()
+        .expect("seed publish response carried no ctx_id")
+        .to_string();
+
+    async fn search(router: &axum::Router, bearer: Option<&str>) -> (StatusCode, Value) {
+        let mut builder = Request::builder().uri("/contexts/search?q=Rebuildproof");
+        if let Some(b) = bearer {
+            builder = builder.header("authorization", format!("Bearer {b}"));
+        }
+        let resp = router
+            .clone()
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        (status, body_to_json_lenient(resp).await)
+    }
+
+    // `shape_d_config()` sets `anonymous_public_reads: true`, so an
+    // anonymous search finds the public context before any rebuild.
+    let (before_status, before_body) = search(&harness.router, None).await;
+    assert_eq!(
+        before_status,
+        StatusCode::OK,
+        "anonymous search must succeed before rebuild: {before_body}"
+    );
+    assert_eq!(
+        before_body["matches"].as_array().map(|a| a.len()),
+        Some(1),
+        "anonymous search must find the seeded public context before rebuild: {before_body}"
+    );
+
+    let mut cfg = shape_d_config();
+    cfg.auth.anonymous_public_reads = false;
+    let mut new_caps = caps();
+    new_caps.anonymous_public_reads = false;
+    harness.rebuild(cfg, new_caps);
+
+    // (a) Behavior actually changed: the same anonymous search must now be
+    // refused outright (RFC-ACDP-0008 §6.3: `not_authorized`, no
+    // matches/total_estimate leak), not merely return zero matches.
+    let (after_status, after_body) = search(&harness.router, None).await;
+    assert_ne!(
+        after_status,
+        StatusCode::OK,
+        "rebuild must actually take effect: anonymous_public_reads: false must refuse the \
+         same anonymous search that succeeded before rebuild: {after_body}"
+    );
+
+    // (b) State survived: the context seeded BEFORE rebuild is still
+    // findable AFTER it, via an AUTHENTICATED search (never gated by
+    // anonymous_public_reads) as its own producer.
+    let bearer = common::forged_bearer(producer_did, "seeded-harness-rebuild-proof", 300);
+    let (authed_status, authed_body) = search(&harness.router, Some(&bearer)).await;
+    assert_eq!(
+        authed_status,
+        StatusCode::OK,
+        "authenticated search must succeed after rebuild: {authed_body}"
+    );
+    assert_eq!(
+        authed_body["matches"]
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|m| m["ctx_id"].as_str()),
+        Some(ctx_id.as_str()),
+        "rebuild must preserve already-seeded store state -- the context published before \
+         rebuild must still be findable (authenticated) after it: {authed_body}"
     );
 }
 
@@ -1982,6 +3174,7 @@ fn extract_skips_fixtures_outside_advertised_profiles() {
             "fixture targets a profile this harness does not advertise"
         ),
         Extracted::Run(x) => panic!("expected profile-gate skip, got Run({x:?})"),
+        Extracted::RunStateful(_) => panic!("expected profile-gate skip, got RunStateful"),
     }
 
     // Overlapping (not disjoint) — must run, not be skipped.
@@ -1994,6 +3187,9 @@ fn extract_skips_fixtures_outside_advertised_profiles() {
         Extracted::Run(x) => assert_eq!(x.len(), 1),
         Extracted::Skip(reason) => {
             panic!("expected Run for overlapping profiles, got Skip({reason})")
+        }
+        Extracted::RunStateful(_) => {
+            panic!("expected Run for overlapping profiles, got RunStateful")
         }
     }
 }
@@ -2022,6 +3218,7 @@ fn extract_skips_unsubstituted_path_templates() {
             "request path carries an unsubstituted {template} placeholder"
         ),
         Extracted::Run(x) => panic!("expected template-gate skip, got Run({x:?})"),
+        Extracted::RunStateful(_) => panic!("expected template-gate skip, got RunStateful"),
     }
 
     // ret-001 regression: declared endpoint carries braces, but the
@@ -2045,6 +3242,9 @@ fn extract_skips_unsubstituted_path_templates() {
         Extracted::Skip(reason) => {
             panic!("expected ret-001-shape fixture to run, got Skip({reason})")
         }
+        Extracted::RunStateful(_) => {
+            panic!("expected ret-001-shape fixture to run via Shape C, got RunStateful")
+        }
     }
 }
 
@@ -2059,6 +3259,7 @@ fn extract_skips_input_level_preconditions() {
     match extract(&singular) {
         Extracted::Skip(reason) => assert_eq!(reason, "requires pre-seeded registry state"),
         Extracted::Run(x) => panic!("expected precondition skip, got Run({x:?})"),
+        Extracted::RunStateful(_) => panic!("expected precondition skip, got RunStateful"),
     }
 
     let plural = json!({
@@ -2067,6 +3268,7 @@ fn extract_skips_input_level_preconditions() {
     match extract(&plural) {
         Extracted::Skip(reason) => assert_eq!(reason, "requires pre-seeded registry state"),
         Extracted::Run(x) => panic!("expected precondition skip, got Run({x:?})"),
+        Extracted::RunStateful(_) => panic!("expected precondition skip, got RunStateful"),
     }
 }
 

@@ -8,6 +8,84 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The conformance replayer gains a fourth shape ("Shape D") that seeds
+  registry state before replaying, and `vis-006` (RFC-ACDP-0005 §2.2
+  public-visibility search disclosure) is now the fifth exchange it
+  proves live** (`REG-10` Phase 8). Previously the replayer's three shapes
+  (`conformance.rs`'s `extract_shapes`) only handled self-contained
+  exchanges; every fixture carrying `setup` — all of `vis-*`, `idem-*` and
+  friends — was a blanket skip ("requires pre-seeded registry state"),
+  because the registry mints its own `ctx_id` and the fixtures' literal
+  ones (`pub-013` proves a producer-supplied `ctx_id` is rejected) can't
+  be replayed against directly. Shape D closes that gap for the shapes it
+  understands: it seeds `setup.context_published` / `.contexts_published`
+  through the real publish API (never a direct store write), building a
+  `fixture_ctx_id -> minted_ctx_id` substitution table and, for any seeded
+  `agent_id` that isn't already `did:web` (this registry only advertises
+  `did:web`, and `pub-008` proves it rejects anything else), a
+  `did:agent:* -> did:web:*` substitution table for a producer identity
+  the harness holds the key for — `audience` entries and requester DIDs
+  route through the same table so an audience check stays consistent with
+  whichever bearer `sub` a scenario presents. It mints a per-scenario
+  bearer from `effective_requester_did` (no `Authorization` header at all
+  when it's `null`). Shape D runs under its own `shape_d_config()` with
+  `auth.enabled = true`: the shared `config()` Shapes A/B/C use leaves auth
+  off, which is right for them since they need no caller identity, but with
+  auth off `caller_from_headers` returns `None` unconditionally, so every
+  bearer Shape D minted was being discarded. Without that one line the
+  per-scenario bearer is inert and any identity-sensitive assertion built on
+  it would pass for the wrong reason. When a scenario's
+  `registry_capabilities_subset` overrides `anonymous_public_reads`, the
+  harness reconstructs the `RegistryServer` with the new capabilities
+  document rather than only rebuilding the router around it: `search` and
+  `retrieve` gate that flag on the server's own baked-in `caps`, not on
+  `RegistryConfig`, so rebuilding the router alone left the override
+  silently inert. Seeded state survives because `SqliteStore` is
+  `SqlitePool`-backed and the pool is an `Arc`, so the clone shares the same
+  in-memory database. Every Shape D fixture gets its own
+  fresh in-memory store, isolated from the shared store Shapes A/B/C
+  replay against. Dispatched deliberately **ahead of** Shape B (not after
+  the fallback, as an earlier draft of this phase's plan had it): a
+  `setup`-carrying fixture's `scenarios[]` also satisfies Shape B's own
+  predicate, and Shape B has no seeding step — letting it capture such a
+  fixture first would silently replay it against an empty store and read
+  the resulting 404s as legitimate negative results. Shapes A, B, and C
+  are textually unchanged. A fixture whose seed shape or scenario
+  assertions Shape D doesn't recognize yet (`setup.lineages`,
+  `matches_ctx_ids`, `total_estimate`, `context_subset_for_test`, …) still
+  falls through to the narrowed — not deleted — `unseeded_precondition_reason`
+  skip path rather than being partially replayed; this is what keeps this
+  phase scoped to exactly one fixture (`vis-006`, the only single-exchange
+  `vis` fixture) even though the rest of `vis-*` structurally satisfies
+  Shape D's dispatch predicate. A dedicated regression test,
+  `four_pre_existing_exchanges_still_use_original_shapes`, asserts the
+  four exchanges replayed before this phase (`pub-004`, `pub-005`,
+  `pub-008`, `ret-001`) still extract via their original shapes with
+  identical fields — the gravest failure mode this phase could introduce
+  is Shape D silently over-matching one of them. A second dedicated test
+  proves Shape D end-to-end on `vis-006` and then, against an in-memory-only
+  mutated copy of the fixture (never written to the spec checkout) whose
+  seeded context's visibility is flipped to `restricted`, proves the
+  replay now fails — demonstrating the harness exercises the registry's
+  real visibility-scoping logic rather than trivially passing. A failed
+  seed publish panics rather than skips, so a broken substitution can't
+  quietly read as "fixture not applicable". Two further tests cover paths no
+  fixture reaches yet, using synthetic in-test fixtures rather than spec
+  reads: `shape_d_seeding_maps_one_shared_literal_agent_to_one_minted_did`
+  pins the multi-seed `contexts_published` path, where two seeds sharing one
+  literal `agent_id` must resolve to a single minted DID — seeding is
+  two-pass for this reason, minting every distinct agent before any publish,
+  so a repeat cannot overwrite an earlier mint and an `audience` naming a
+  later-seeded agent still resolves; and
+  `seeded_harness_rebuild_changes_router_behavior_and_preserves_seeded_state`
+  pins both halves of the rebuild — that the anonymous-read posture actually
+  changes, and that the seeded rows survive it. Note `vis-006` itself does
+  not exercise the bearer path: its requester is
+  `did:agent:any-authenticated-or-anonymous` against a public context, so it
+  behaves identically with auth on or off. The bearer and rebuild mechanisms
+  are proven by the synthetic tests, not by the replayed fixture. `MIN_REPLAYED_EXCHANGES`
+  rises from 4 to 5.
+
 - **`can-*` (RFC-ACDP-0001 canonicalization & hashing) moves from zero
   coverage to direct, fixture-driven coverage of all 35 vectors across all
   12 fixtures** (`REG-10` Phase 7). None of `can-*` is HTTP-replayable —
