@@ -130,21 +130,30 @@
 
 #![cfg(feature = "storage-sqlite")]
 
+mod common;
+
 use std::path::{Path, PathBuf};
+#[cfg(feature = "playground")]
 use std::sync::Arc;
 
-use acdp::crypto::SigningKey;
+use common::{body_to_json, body_to_json_lenient, pct_encode_path_segment};
+
 use acdp::producer::Producer;
+#[cfg(feature = "playground")]
 use acdp::registry::RegistryServer;
 use acdp::types::capabilities::{CapabilitiesDocument, Limits};
-use acdp::types::primitives::{AgentDid, ContextType, Visibility};
+use acdp::types::primitives::{ContextType, Visibility};
 use acdp::types::publish::PublishRequest;
 use acdp::AnchorEntry;
+#[cfg(feature = "playground")]
 use acdp_registry_auth::{
     AuthService, ChallengeStore, InMemoryChallengeStore, JwtSecret, JwtSigner,
 };
+#[cfg(feature = "playground")]
 use acdp_registry_core::{build_router, AppStateInner};
+#[cfg(feature = "playground")]
 use acdp_registry_sqlite::SqliteStore;
+#[cfg(feature = "playground")]
 use acdp_registry_store::ExtendedRegistryStore;
 use acdp_registry_types::{
     AuthConfig, LimitsConfig, PlaygroundConfig, RegistryConfig, RegistrySection, StorageBackend,
@@ -152,7 +161,6 @@ use acdp_registry_types::{
 };
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
@@ -227,46 +235,16 @@ fn config() -> RegistryConfig {
 }
 
 async fn harness() -> axum::Router {
-    let store = SqliteStore::connect_in_memory().await.unwrap();
-    store.migrate().await.unwrap();
-    let server = Arc::new(RegistryServer::try_new(store, caps(), AUTHORITY).unwrap());
-    let challenges: Arc<dyn ChallengeStore> = Arc::new(InMemoryChallengeStore::new());
-    let secret = JwtSecret::from_bytes(&[42u8; 32]);
-    let signer = JwtSigner::new(secret, format!("did:web:{AUTHORITY}"), AUTHORITY.into(), 30);
-    let resolver = Arc::new(acdp::did::WebResolver::new());
-    let auth = Arc::new(AuthService::new(
-        AuthConfig::default(),
-        challenges,
-        signer,
-        resolver,
-        AUTHORITY.into(),
-    ));
-    let state = AppStateInner::new(server, auth, None, config(), None);
-    build_router(state)
-}
-
-async fn body_to_json(resp: axum::response::Response) -> Value {
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    if bytes.is_empty() {
-        return Value::Null;
-    }
-    serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-}
-
-/// Mirror of `pct_encode_path_segment` in `http_integration.rs` — the
-/// `acdp://authority/uuid` ctx_ids contain `/` and `:` which need
-/// percent-encoding to satisfy axum's `{ctx_id}` single-segment param.
-fn pct_encode_path_segment(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 3);
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{:02X}", b)),
-        }
-    }
-    out
+    common::build_harness_with_webhook(
+        config(),
+        caps(),
+        AUTHORITY,
+        common::StoreMode::Memory,
+        None,
+        None,
+    )
+    .await
+    .router
 }
 
 /// A single HTTP request/response pair extracted from a fixture. The real
@@ -759,7 +737,7 @@ async fn replays_spec_fixtures_when_present() {
                 .await
                 .unwrap();
             let got = resp.status().as_u16();
-            let body_json = body_to_json(resp).await;
+            let body_json = body_to_json_lenient(resp).await;
 
             if got != ex.want_status {
                 failures.push(format!(
@@ -909,24 +887,11 @@ fn did_key_caps() -> CapabilitiesDocument {
 /// full RFC-ACDP-0003 §2.1 pipeline (steps 7–8 included) runs without a
 /// network DID resolver — exactly what the golden vector is meant to pin.
 async fn did_key_harness(caps: CapabilitiesDocument) -> axum::Router {
-    let store = SqliteStore::connect_in_memory().await.unwrap();
-    store.migrate().await.unwrap();
-    let server = Arc::new(RegistryServer::try_new(store, caps, AUTHORITY).unwrap());
-    let challenges: Arc<dyn ChallengeStore> = Arc::new(InMemoryChallengeStore::new());
-    let secret = JwtSecret::from_bytes(&[42u8; 32]);
-    let signer = JwtSigner::new(secret, format!("did:web:{AUTHORITY}"), AUTHORITY.into(), 30);
-    let resolver = Arc::new(acdp::did::WebResolver::new());
-    let auth = Arc::new(AuthService::new(
-        AuthConfig::default(),
-        challenges,
-        signer,
-        resolver,
-        AUTHORITY.into(),
-    ));
     let mut cfg = config();
     cfg.playground.enabled = false;
-    let state = AppStateInner::new(server, auth, None, cfg, None);
-    build_router(state)
+    common::build_harness_with_webhook(cfg, caps, AUTHORITY, common::StoreMode::Memory, None, None)
+        .await
+        .router
 }
 
 /// Replays the spec's did:key golden publish request (sig-003,
@@ -1249,32 +1214,22 @@ fn anc_caps_050() -> CapabilitiesDocument {
 /// `did_key_harness()` (`:887`) builds its own isolated harness rather than
 /// touching the shared one.
 async fn anc_harness_050() -> axum::Router {
-    let store = SqliteStore::connect_in_memory().await.unwrap();
-    store.migrate().await.unwrap();
-    let server = Arc::new(RegistryServer::try_new(store, anc_caps_050(), AUTHORITY).unwrap());
-    let challenges: Arc<dyn ChallengeStore> = Arc::new(InMemoryChallengeStore::new());
-    let secret = JwtSecret::from_bytes(&[42u8; 32]);
-    let signer = JwtSigner::new(secret, format!("did:web:{AUTHORITY}"), AUTHORITY.into(), 30);
-    let resolver = Arc::new(acdp::did::WebResolver::new());
-    let auth = Arc::new(AuthService::new(
-        AuthConfig::default(),
-        challenges,
-        signer,
-        resolver,
-        AUTHORITY.into(),
-    ));
-    let state = AppStateInner::new(server, auth, None, config(), None);
-    build_router(state)
+    common::build_harness_with_webhook(
+        config(),
+        anc_caps_050(),
+        AUTHORITY,
+        common::StoreMode::Memory,
+        None,
+        None,
+    )
+    .await
+    .router
 }
 
 /// A signing producer identity for the anc-* tests, isolated from any other
 /// test's seed space — mirrors `http_integration.rs`'s `producer()`.
 fn anc_producer(seed: u8) -> Producer {
-    Producer::new(
-        SigningKey::from_bytes(&[seed; 32]),
-        AgentDid::new(format!("did:web:agents.test:anc-{seed}")),
-        format!("did:web:agents.test:anc-{seed}#key-1"),
-    )
+    common::producer("anc", seed)
 }
 
 /// POST `req` to `/contexts` on `app` and return `(status, parsed body)`.

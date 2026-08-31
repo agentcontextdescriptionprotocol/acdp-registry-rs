@@ -25,7 +25,13 @@
 
 #![cfg(feature = "storage-sqlite")]
 
+mod common;
+
 use std::sync::Arc;
+
+use common::{
+    body_to_json, forged_bearer, get_with_auth, pct_encode_path_segment, publish, Harness,
+};
 
 use acdp::crypto::{P256SigningKey, SigningKey};
 use acdp::did::WebResolver;
@@ -141,24 +147,6 @@ fn config(playground: bool) -> RegistryConfig {
     }
 }
 
-/// Per-test handle that keeps the tempfile alive for the duration of
-/// the test. The `Router` returned by `harness` shares a single SQLite
-/// store across all routes; the tempfile is dropped (and the DB file
-/// deleted) when the harness is dropped.
-struct Harness {
-    router: axum::Router,
-    db: tempfile::NamedTempFile,
-}
-
-impl Harness {
-    /// Path to the backing SQLite file, for tests that need to reach past
-    /// the HTTP surface (e.g. ageing an idempotency record to simulate
-    /// expiry without sleeping).
-    fn db_path(&self) -> &std::path::Path {
-        self.db.path()
-    }
-}
-
 async fn harness(playground: bool) -> Harness {
     harness_from_config(config(playground)).await
 }
@@ -205,91 +193,19 @@ async fn build_harness_with_webhook(
     cross_registry: Option<Arc<acdp::client::CrossRegistryResolver>>,
     webhook: Option<acdp_registry_webhook::WebhookEmitter>,
 ) -> Harness {
-    let db = tempfile::Builder::new()
-        .prefix("acdp-test-")
-        .suffix(".sqlite")
-        .tempfile()
-        .unwrap();
-    let store = SqliteStore::connect(db.path(), 1).await.unwrap();
-    // RFC-ACDP-0012: mirror the binary's run() wiring — an enabled [log]
-    // makes every commit_publish append the leaf atomically.
-    let store = if cfg.log.enabled {
-        store.with_transparency_log()
-    } else {
-        store
-    };
-    store.migrate().await.unwrap();
-    let server = RegistryServer::try_new(store, caps, AUTHORITY).unwrap();
-    // Mirror the binary's serve_with_store wiring: a configured receipt
-    // key attaches the signer (which also appends the receipts profile).
-    let server = if cfg.receipt.is_configured() {
-        let signer =
-            acdp_registry_core::receipt::build_signer(&cfg.receipt, &cfg.registry.authority)
-                .expect("receipt signer");
-        server.with_receipt_signer(signer).expect("receipt signer")
-    } else {
-        server
-    };
-    // RFC-ACDP-0011: head receipts on /current (requires the signer).
-    let server = if cfg.receipt.head_receipts {
-        server
-            .with_lineage_head_receipts()
-            .expect("head receipts enabled")
-    } else {
-        server
-    };
-    // RFC-ACDP-0013: lifecycle events & retraction.
-    let server = if cfg.lifecycle.enabled {
-        server.with_lifecycle().expect("lifecycle enabled")
-    } else {
-        server
-    };
-    let server = Arc::new(server);
-    let challenges: Arc<dyn ChallengeStore> = Arc::new(InMemoryChallengeStore::new());
-    let secret = JwtSecret::from_bytes(&[42u8; 32]);
-    let signer = JwtSigner::new(secret, format!("did:web:{AUTHORITY}"), AUTHORITY.into(), 30);
-    let resolver = Arc::new(WebResolver::new());
-    let auth = Arc::new(AuthService::new(
-        AuthConfig::default(),
-        challenges,
-        signer,
-        resolver,
-        AUTHORITY.into(),
-    ));
-    let state = AppStateInner::new(server, auth, webhook, cfg, cross_registry);
-    Harness {
-        router: build_router(state),
-        db,
-    }
+    common::build_harness_with_webhook(
+        cfg,
+        caps,
+        AUTHORITY,
+        common::StoreMode::File,
+        cross_registry,
+        webhook,
+    )
+    .await
 }
 
 fn producer(seed: u8) -> Producer {
-    Producer::new(
-        SigningKey::from_bytes(&[seed; 32]),
-        AgentDid::new(format!("did:web:agents.test:smoke-{seed}")),
-        format!("did:web:agents.test:smoke-{seed}#key-1"),
-    )
-}
-
-async fn body_to_json(resp: axum::response::Response) -> Value {
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    serde_json::from_slice(&bytes).unwrap()
-}
-
-/// `acdp://authority/uuid`-style ctx_ids contain `/` and `:`, which axum's
-/// single-segment `{ctx_id}` route param won't match unless they're percent-
-/// encoded by the client. Mirror the encoding rule here (RFC 3986 §2.3).
-fn pct_encode_path_segment(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 3);
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{:02X}", b)),
-        }
-    }
-    out
+    common::producer("smoke", seed)
 }
 
 #[tokio::test]
@@ -527,26 +443,6 @@ async fn capabilities_round_trips() {
     assert!(v["supports_idempotency_key"].as_bool().unwrap());
 }
 
-async fn publish(
-    app: &axum::Router,
-    req: &acdp::types::publish::PublishRequest,
-    idem: Option<&str>,
-) -> (StatusCode, Value) {
-    let body = serde_json::to_vec(req).unwrap();
-    let mut builder = Request::builder().method("POST").uri("/contexts");
-    if let Some(k) = idem {
-        builder = builder.header("Idempotency-Key", k);
-    }
-    let resp = app
-        .clone()
-        .oneshot(builder.body(Body::from(body)).unwrap())
-        .await
-        .unwrap();
-    let status = resp.status();
-    let v = body_to_json(resp).await;
-    (status, v)
-}
-
 async fn publish_with_tenant(
     app: &axum::Router,
     req: &acdp::types::publish::PublishRequest,
@@ -765,30 +661,6 @@ fn tenant_bound_token(tenant: Option<&str>) -> String {
     signer.sign(&claims).unwrap()
 }
 
-/// Forge an untenanted bearer for `sub` expiring `exp_offset_seconds` from
-/// now — the exact claim set `AuthService::issue_token` mints, signed by the
-/// same HS256 secret the default harness wires. A negative offset yields an
-/// already-expired token (the harness signer's leeway is 30s).
-fn forged_bearer(sub: &str, jti: &str, exp_offset_seconds: i64) -> String {
-    let secret = JwtSecret::from_bytes(&[42u8; 32]);
-    let signer = JwtSigner::new(secret, format!("did:web:{AUTHORITY}"), AUTHORITY.into(), 30);
-    let now = chrono::Utc::now().timestamp();
-    let claims = BearerClaims {
-        iss: format!("did:web:{AUTHORITY}"),
-        sub: sub.to_string(),
-        aud: AUTHORITY.into(),
-        jti: jti.to_string(),
-        iat: now - 60,
-        exp: now + exp_offset_seconds,
-        acdp: AcdpClaims {
-            registry: AUTHORITY.into(),
-            key_id: format!("{sub}#key-1"),
-        },
-        tenant: None,
-    };
-    signer.sign(&claims).unwrap()
-}
-
 #[tokio::test]
 async fn publish_rejects_tenant_header_that_contradicts_bound_token() {
     // A token bound to tenant-a must NOT be able to write a context into
@@ -881,27 +753,6 @@ async fn publish_stamps_tenant_from_bound_token_claim() {
         retrieve_with_tenant(&h.router, &ctx_id, Some("tenant-b")).await,
         StatusCode::NOT_FOUND,
     );
-}
-
-async fn get_with_auth(
-    app: &axum::Router,
-    ctx_id: &str,
-    bearer: Option<&str>,
-    tenant: Option<&str>,
-) -> StatusCode {
-    let mut builder =
-        Request::builder().uri(format!("/contexts/{}", pct_encode_path_segment(ctx_id)));
-    if let Some(t) = bearer {
-        builder = builder.header("authorization", format!("Bearer {t}"));
-    }
-    if let Some(t) = tenant {
-        builder = builder.header("X-Tenant-Id", t);
-    }
-    app.clone()
-        .oneshot(builder.body(Body::empty()).unwrap())
-        .await
-        .unwrap()
-        .status()
 }
 
 #[tokio::test]
@@ -2895,7 +2746,7 @@ async fn harness_with_playground(playground: PlaygroundConfig) -> Harness {
     let state = AppStateInner::new(server, auth, None, cfg, None);
     Harness {
         router: build_router(state),
-        db,
+        db: Some(db),
     }
 }
 

@@ -298,6 +298,31 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Extracted a shared `tests/common/` harness for `conformance.rs` and
+  `http_integration.rs`** (`REG-10` Phase 6). Rust integration tests
+  compile to separate binaries, so `conformance.rs` couldn't reach
+  `http_integration.rs`'s router-building code and had grown three
+  near-identical ad-hoc routers plus its own copies of
+  `pct_encode_path_segment`, `body_to_json`, and `producer`. All of that
+  now lives in `crates/acdp-registry-server/tests/common/mod.rs`
+  (`mod common;` in both files), parameterized over store backend
+  (`StoreMode::Memory` | `StoreMode::File` — `conformance.rs` used an
+  in-memory `SqliteStore`, `http_integration.rs` a `NamedTempFile`; both
+  are preserved) and capabilities document, so `conformance.rs`'s three
+  routers and `http_integration.rs`'s harness ladder now both build on
+  `common::build_harness_with_webhook`. `body_to_json` is deliberately kept
+  as two functions rather than one: the two files' copies differed, with
+  `http_integration.rs`'s panicking on an empty or non-JSON body and
+  `conformance.rs`'s degrading to `Value::Null`. The strict form is the
+  shared default at all 53 call sites, and `body_to_json_lenient` is used
+  at exactly one — the fixture replayer, which drains arbitrary spec
+  fixtures where an empty response is legitimate. Collapsing them onto the
+  lenient form would have silently removed a guard from ~50 assertions.
+  Pure refactor: the only line changed inside a `#[test]` body is that one
+  replayer call, which is behavior-preserving, and the full suite passes
+  with the exact same test count as before (175, across all seven binaries
+  under `--features storage-sqlite,playground`).
+
 - **Reworded the wit-001/wit-004 quorum assertion's message and its
   preceding comment** (`REG-10` Phase 5, GitHub issue #113) in
   `wit004_key_mismatch_cosignature_is_rejected_and_wit001_golden_is_accepted`.
