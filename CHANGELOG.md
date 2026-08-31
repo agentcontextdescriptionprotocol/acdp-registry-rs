@@ -8,6 +8,66 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`vis-001` (5 scenarios) and `vis-004` (4 scenarios) — single-context
+  restricted/private visibility fixtures — now replay end-to-end through
+  Shape D, and `vis-003` (search response field-naming) gets direct
+  in-process coverage** (`REG-10` Phase 9a). `MIN_REPLAYED_EXCHANGES` rises
+  from 5 to 14 (4 pre-existing + `vis-006`'s 1 + `vis-001`'s 5 + `vis-004`'s
+  4). `vis-001` (RFC-ACDP-0008 §4.5 existence-leak prevention) seeds one
+  `restricted` context and exercises producer / audience-member / outsider
+  / genuinely-nonexistent-ctx_id / non-audience-contributor across five
+  requester identities against the same ctx_id — the first fixture in this
+  file to require the bearer path to actually distinguish requesters (Phase
+  8's proof fixture, `vis-006`, is requester-identity-agnostic by
+  construction: `did:agent:any-authenticated-or-anonymous` against a public
+  context behaves the same with auth on or off). `vis-004` (RFC-ACDP-0008
+  §4.5 / RFC-ACDP-0002 §7 private/audience retrieval asymmetry) seeds one
+  `private` context with an `audience` and covers the same four-way split.
+  Both fixtures carry a scenario with
+  `request.context_subset_for_test.contributors` — a per-scenario mutation
+  of the seeded row's `contributors` list, not a requester swap, and
+  exactly the key Phase 8's allowlist excluded them on. Shape D is widened
+  to fold it onto the (single) seed at seed time rather than left
+  unsupported: the registry's only write path (`POST /contexts`) mints a
+  new `ctx_id` per call, so there is no in-place "update contributors on
+  this existing row" endpoint to genuinely mutate mid-replay, and applying
+  it at seed time is observably identical to that framing here since
+  `contributors` never affects any other scenario's status/error_code —
+  `can_retrieve` and `can_surface_in_search` branch only on visibility,
+  `agent_id`, `audience` and `anonymous_public_reads`, so contributors
+  carries attribution rather than retrieval authorization — and both
+  fixtures are single-seed and retrieval-only. That scoping is deliberate:
+  `contributors` *does* gate authorization on the supersession
+  producer-continuity path, so the same seed-time fold applied to a
+  publish/supersede fixture would change authorization rather than preserve
+  it. `parse_shape_d` fails closed (returns `None`, routing to
+  the existing skip path) rather than guess which seed a *multi*-seed
+  fixture's `context_subset_for_test` would target. `vis-001` scenario 4's
+  genuinely nonexistent ctx_id (`…-000000000000`, distinct from the seeded
+  `…-000000000001`) needed no special-casing — it was never seeded, gains
+  no substitution-table entry, and a dedicated test
+  (`vis001_restricted_denied_as_404_replays_via_shape_d`) asserts the
+  ctx_id map contains exactly the one context that actually was seeded.
+  `vis-003` has no `setup` (only `background`) and its scenarios use
+  `input.endpoint`/`input.received_response`, never
+  `request.method`/`request.path`, so it matches neither Shape D nor Shape
+  B; `vis003_search_response_emits_matches_not_results` drives a real `GET
+  /contexts/search` and asserts the fixture's own
+  `response_body_constraints` (`matches` present, `results` and its listed
+  alternates absent) directly against the real response body — same
+  precedent as the existing `anc`/`wit`/`can` direct-coverage tests. Its
+  other two scenarios (`expected.consumer_behavior` /
+  `expected.minimum_diagnostic_content`) are consumer-side obligations a
+  registry cannot satisfy or violate by construction; recorded
+  not-applicable, with reasoning, in that test's own doc comment rather
+  than silently dropped. `vis-004`'s own mutation proof (seeded visibility
+  flipped `private` → `public` on an in-memory-only fixture clone, never
+  written to the spec checkout) fails replay specifically on the
+  outsider/contributor scenarios' now-wrong 404 expectation, alongside the
+  pre-existing `vis-006` mutation proof — together demonstrating Shape D
+  exercises the registry's real visibility-scoping logic rather than
+  trivially passing. Shapes A, B, and C remain textually unchanged.
+
 - **The conformance replayer gains a fourth shape ("Shape D") that seeds
   registry state before replaying, and `vis-006` (RFC-ACDP-0005 §2.2
   public-visibility search disclosure) is now the fifth exchange it

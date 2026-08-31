@@ -38,23 +38,28 @@
 //!
 //!   * **Replayed** — negative publish fixtures that fail at schema/validation
 //!     (HTTP 400) with an inline body, stateless retrieval fixtures
-//!     (e.g. `ret-*` GET of a missing ctx → 404), and (REG-10 Phase 8) the
-//!     one `vis-*` fixture (`vis-006`) whose `setup` + single exchange Shape
-//!     D can fully pre-seed, sign, and verify end-to-end.
+//!     (e.g. `ret-*` GET of a missing ctx → 404), and (REG-10 Phase 8, widened
+//!     Phase 9a) the `vis-*` fixtures whose `setup` + scenario(s) Shape D can
+//!     fully pre-seed, sign, and verify end-to-end: `vis-006` (single
+//!     exchange, Phase 8's proof fixture), `vis-001` (5 scenarios), and
+//!     `vis-004` (4 scenarios) — the last two include a per-scenario
+//!     `context_subset_for_test.contributors`, folded into the seed at seed
+//!     time (see [`parse_shape_d`]'s fold step doc comment for why that's
+//!     faithful to the fixture's "mutate the seeded row" framing).
 //!   * **Skipped — requires pre-seeded state** — `idem-*` and other
 //!     fixtures whose `setup`/`preconditions` (top-level or under `input`)
 //!     need a context with a specific registry-assigned `ctx_id` the publish
 //!     API won't let us mint, PLUS the `vis-*`/`ret-*` fixtures whose
 //!     `setup` shape Shape D doesn't recognize at all (`setup.lineages` —
-//!     `vis-008`, `ret-002`). As of Phase 8, `vis-006` alone has escaped
-//!     this bucket via Shape D (below).
+//!     `vis-008`, `ret-002`). As of Phase 9a, `vis-001`, `vis-004`, and
+//!     `vis-006` have escaped this bucket via Shape D (below).
 //!   * **Skipped — Shape D: unrecognized scenario/expected key** — the rest
-//!     of `vis-*`: Shape D CAN seed these (their `setup` fully parses) but
-//!     at least one scenario or `expected` key is outside its allowlist
-//!     (`matches_ctx_ids`, `total_estimate`, `context_subset_for_test`, …).
-//!     A distinct reason from the bucket above so a future widening of the
-//!     allowlist (Phases 9a/9c) is auditable: it's the scenario shape, not
-//!     the seeding, blocking these.
+//!     of `vis-*` (`vis-002`, `vis-005`, `vis-007`, `vis-009`): Shape D CAN
+//!     seed these (their `setup` fully parses) but at least one scenario or
+//!     `expected` key is outside its allowlist (`matches_ctx_ids`,
+//!     `total_estimate`, …). A distinct reason from the bucket above so a
+//!     future widening of the allowlist (Phase 9c) is auditable: it's the
+//!     scenario shape, not the seeding, blocking these.
 //!   * **Skipped — profile not advertised** — fixtures whose
 //!     `applies_to_profiles` is disjoint from `HARNESS_PROFILES`, e.g.
 //!     `lc-*` (`acdp-registry-lifecycle`), `fed-*`
@@ -196,6 +201,27 @@
 //! *classification* here is unchanged -- it was never `EXCUSED` and still
 //! isn't (all 12 ids sit in `acdp-registry-core`'s `required_fixtures`,
 //! see `KNOWN_FAMILIES`'s doc comment) -- only its *coverage* changed.
+//!
+//! `vis-003` (RFC-ACDP-0005 §2.2 search response field-naming) is likewise
+//! not reachable through the generic replay loop -- it carries no `setup`
+//! (only `background`), and its `scenarios[]` use `input.endpoint` /
+//! `input.received_response`, not `request.method`/`request.path`, so it
+//! matches neither Shape D (no `setup`) nor Shape B (no `request` at all;
+//! it falls through Shape B's own scenario loop to
+//! `"scenarios carried no replayable request"`, the family's manifest
+//! classification here). REG-10 Phase 9a gives its one registry-side
+//! scenario (index 0: registry MUST emit `matches`, MUST NOT emit
+//! `results`) DIRECT coverage via
+//! `vis003_search_response_emits_matches_not_results`, which drives a real
+//! `GET /contexts/search` and asserts on the real response body -- beside,
+//! not instead of, the replay manifest above, same precedent as `anc`/`wit`/
+//! `can`. Its other two scenarios (indices 1-2) are consumer-side
+//! obligations (`expected.consumer_behavior` /
+//! `expected.minimum_diagnostic_content`) a registry implementation cannot
+//! satisfy or violate by construction -- they describe how a CONSUMER of
+//! this registry's response must behave, not this registry's own behavior --
+//! and are recorded not-applicable, with this reasoning, in that same test's
+//! doc comment rather than silently dropped.
 
 #![cfg(feature = "storage-sqlite")]
 
@@ -397,6 +423,15 @@ struct SeedContext {
     title: Option<String>,
     visibility: String,
     audience: Vec<String>,
+    /// Contributors folded onto this seed from any scenario's
+    /// `request.context_subset_for_test.contributors` (REG-10 Phase 9a —
+    /// `vis-001` scenario 5, `vis-004` scenario 4). Empty for every seed
+    /// shape Phase 8 handled; never populated by `setup` itself (no fixture
+    /// carries `contributors` there). See [`parse_shape_d`]'s fold step for
+    /// why applying it at seed time is faithful to the fixture's own
+    /// "per-scenario mutation of the seeded row" framing rather than an
+    /// identity swap.
+    contributors: Vec<String>,
 }
 
 /// One HTTP exchange inside a Shape D plan: either one element of a
@@ -415,6 +450,13 @@ struct ShapeDScenario {
     want_error_code: Option<String>,
     want_matches_count: Option<u64>,
     want_match_summary_contains: Option<Value>,
+    /// This scenario's own `request.context_subset_for_test.contributors`
+    /// (REG-10 Phase 9a), if any -- purely a parse-time carrier.
+    /// [`parse_shape_d`] drains this into the (single) seed's
+    /// [`SeedContext::contributors`] before replay ever starts; by the time
+    /// [`replay_shape_d`] runs, this field is inert. Always empty for the
+    /// single-exchange (`vis-006`) shape, which has no `request` at all.
+    contributors_for_seed: Vec<String>,
 }
 
 /// A fully-parsed, fully-understood Shape D fixture: every `setup` entry
@@ -470,6 +512,10 @@ fn parse_seed_context(v: &Value) -> Option<SeedContext> {
         title,
         visibility,
         audience,
+        // Never populated from `setup` itself -- only [`parse_shape_d`]'s
+        // fold step (from a scenario's `context_subset_for_test`) fills
+        // this in, after this function returns.
+        contributors: Vec::new(),
     })
 }
 
@@ -560,16 +606,19 @@ fn parse_single_exchange_scenario(fx: &Value) -> Option<ShapeDScenario> {
         want_error_code: expected.error_code,
         want_matches_count: expected.matches_count,
         want_match_summary_contains: expected.match_summary_contains,
+        contributors_for_seed: Vec::new(),
     })
 }
 
 /// Parse a `scenarios[]` array (the `vis-001`-style multi-scenario shape).
 /// `None` (via `Option`'s `FromIterator`) as soon as any single scenario
-/// carries a request field Shape D doesn't handle yet — most importantly
-/// `context_subset_for_test` (post-seed context mutation, not built in
-/// this phase). This is what keeps `vis-001`/`vis-004` from being
-/// silently half-replayed: they're otherwise well within Shape D's
-/// `expected`-key allowlist.
+/// carries a request field Shape D doesn't handle yet. As of REG-10 Phase
+/// 9a, `request.context_subset_for_test` IS recognized — `{"contributors":
+/// [...]}`, and only that shape (`vis-001` scenario 5, `vis-004` scenario
+/// 4): the DIDs listed become part of the SEEDED row's `contributors` (see
+/// [`parse_shape_d`]'s fold step), never a per-request override. Any other
+/// key inside `context_subset_for_test`, or any request key outside
+/// `KNOWN_REQUEST`, still fails the whole fixture's parse.
 fn parse_scenarios_array(scenarios: &[Value]) -> Option<Vec<ShapeDScenario>> {
     scenarios
         .iter()
@@ -588,6 +637,7 @@ fn parse_scenarios_array(scenarios: &[Value]) -> Option<Vec<ShapeDScenario>> {
                 "path",
                 "effective_requester_did",
                 "registry_capabilities_subset",
+                "context_subset_for_test",
             ];
             if req.keys().any(|k| !KNOWN_REQUEST.contains(&k.as_str())) {
                 return None;
@@ -609,6 +659,24 @@ fn parse_scenarios_array(scenarios: &[Value]) -> Option<Vec<ShapeDScenario>> {
                     obj.get("anonymous_public_reads")?.as_bool()
                 }
             };
+            // `context_subset_for_test`: exactly `{"contributors": [..]}` --
+            // any other shape (a future fixture using a different key
+            // inside it) still fails the parse rather than being silently
+            // ignored.
+            let contributors_for_seed = match req.get("context_subset_for_test") {
+                None => Vec::new(),
+                Some(v) => {
+                    let obj = v.as_object()?;
+                    if obj.len() != 1 {
+                        return None;
+                    }
+                    obj.get("contributors")?
+                        .as_array()?
+                        .iter()
+                        .map(|d| d.as_str().map(str::to_string))
+                        .collect::<Option<Vec<_>>>()?
+                }
+            };
             let expected = parse_expected(sc.get("expected")?)?;
             Some(ShapeDScenario {
                 method,
@@ -619,6 +687,7 @@ fn parse_scenarios_array(scenarios: &[Value]) -> Option<Vec<ShapeDScenario>> {
                 want_error_code: expected.error_code,
                 want_matches_count: expected.matches_count,
                 want_match_summary_contains: expected.match_summary_contains,
+                contributors_for_seed,
             })
         })
         .collect()
@@ -632,7 +701,7 @@ fn parse_scenarios_array(scenarios: &[Value]) -> Option<Vec<ShapeDScenario>> {
 /// A fixture only ever reaches [`replay_shape_d`] once both call sites
 /// agree it parses.
 fn parse_shape_d(fx: &Value) -> Option<ShapeDPlan> {
-    let seeds = parse_seed_plan(fx.get("setup")?)?;
+    let mut seeds = parse_seed_plan(fx.get("setup")?)?;
     // `contexts_published: []` parses to `Some(vec![])` in `parse_seed_plan`
     // -- that shape is a syntactically valid (if useless) seed list, not a
     // parse failure. But `replay_shape_d` asserts its `ctx_map` is
@@ -653,6 +722,57 @@ fn parse_shape_d(fx: &Value) -> Option<ShapeDPlan> {
     if scenarios.is_empty() {
         return None;
     }
+
+    // REG-10 Phase 9a: fold any scenario's `context_subset_for_test.
+    // contributors` onto the seed it targets, applied at seed time (the
+    // registry's only write path is `POST /contexts`, which mints a NEW
+    // ctx_id per call -- there is no in-place "update contributors on this
+    // existing ctx_id" endpoint, so a true "mutate the row immediately
+    // before firing this one scenario" is not expressible through the
+    // public HTTP API at all). Applying it at seed time is observably
+    // identical to that framing for every fixture this reaches: `vis-001`
+    // and `vis-004` are both single-seed, and `contributors` never affects
+    // any OTHER scenario's status/error_code (RFC-ACDP-0002 §7 /
+    // RFC-ACDP-0008 §4.5 -- contributors carries attribution, not
+    // retrieval/search authorization: `can_retrieve` and
+    // `can_surface_in_search` branch only on visibility / agent_id /
+    // audience / anonymous_public_reads), so no earlier scenario in the
+    // same fixture can observe the row having gained a contributor it
+    // didn't ask about.
+    //
+    // SCOPE, and do NOT carry this reasoning further than it goes: the
+    // claim holds on the RETRIEVAL and SEARCH axis only. `contributors`
+    // DOES gate authorization on the supersession producer-continuity
+    // path (`prev_contributors.contains(&req.agent_id)` in the sqlite/pg
+    // stores and in handlers/admin.rs). These two fixtures are
+    // retrieval-only, so seed-time folding is sound here. A future
+    // publish/supersede fixture folded the same way WOULD change
+    // authorization, and must not reuse this justification.
+    //
+    // Second bound: the fold pools contributors from every scenario onto
+    // the single seed. Correct while the single-seed guard below holds --
+    // a fixture with two DIFFERING `context_subset_for_test` scenarios
+    // would hand scenario A's row scenario B's contributor, and the guard
+    // would not fire on it.
+    // Fail closed (`None`) rather than guess when more than one seed
+    // exists -- Shape D doesn't yet know which seed a multi-seed fixture's
+    // `context_subset_for_test` would target, and no pinned fixture at this
+    // pin needs that (both current uses are single-seed).
+    let extra_contributors: Vec<String> = scenarios
+        .iter()
+        .flat_map(|s| s.contributors_for_seed.iter().cloned())
+        .collect();
+    if !extra_contributors.is_empty() {
+        if seeds.len() != 1 {
+            return None;
+        }
+        for c in extra_contributors {
+            if !seeds[0].contributors.contains(&c) {
+                seeds[0].contributors.push(c);
+            }
+        }
+    }
+
     Some(ShapeDPlan { seeds, scenarios })
 }
 
@@ -816,6 +936,18 @@ async fn replay_shape_d(name: &str, plan: &ShapeDPlan) -> ShapeDResult {
             .map(|a| AgentDid::new(did_map.get(a).cloned().unwrap_or_else(|| a.clone())))
             .collect();
 
+        // `contributors` (REG-10 Phase 9a) is exempt from `did_map`
+        // substitution entirely, same as the module doc-block already
+        // established for the pre-existing `pub-010` coverage: contributors
+        // is attribution metadata, not an authorization identity, so it
+        // never needs to be a `did:web` DID this harness holds a key for.
+        let contributors: Vec<AgentDid> = seed
+            .contributors
+            .iter()
+            .cloned()
+            .map(AgentDid::new)
+            .collect();
+
         let mut builder = producer
             .publish_request()
             .title(
@@ -827,6 +959,9 @@ async fn replay_shape_d(name: &str, plan: &ShapeDPlan) -> ShapeDResult {
             .visibility(shape_d_visibility(&seed.visibility));
         if !audience.is_empty() {
             builder = builder.audience(audience);
+        }
+        if !contributors.is_empty() {
+            builder = builder.contributors(contributors);
         }
         let req = builder
             .build()
@@ -1033,10 +1168,13 @@ fn targets_unadvertised_profile(fx: &Value) -> bool {
 ///     `vis-008`, `ret-002`) — Shape D cannot even SEED these yet, so they
 ///     keep the generic `"requires pre-seeded registry state"` reason;
 ///   * its `setup` parses fine (Shape D COULD seed it) but some
-///     scenario/expected key is outside the allowlist (e.g. `vis-001`'s
-///     `context_subset_for_test`, `vis-007`'s `total_estimate`) — these get
+///     scenario/expected key is outside the allowlist (e.g. `vis-007`'s
+///     `total_estimate`, `vis-002`'s `matches_ctx_ids`) — these get
 ///     `"Shape D: unrecognized scenario/expected key"`, naming precisely
-///     what's blocking them: the scenario shape, not the seeding.
+///     what's blocking them: the scenario shape, not the seeding. (As of
+///     REG-10 Phase 9a, `vis-001` and `vis-004` no longer land here —
+///     `context_subset_for_test.contributors` is now recognized; see
+///     [`parse_scenarios_array`] and [`parse_shape_d`]'s fold step.)
 ///
 /// An empty `contexts_published: []` seed list is its own third reason
 /// (`parse_shape_d` treats it as unparseable — see its doc comment — so it
@@ -1320,10 +1458,12 @@ fn resolve_fixture_dir(dir: &str) -> Option<PathBuf> {
 }
 
 /// Exchanges replayable at spec 417211f: pub-004, pub-005, pub-008, ret-001
-/// (Shapes A/C), plus vis-006 (Shape D, REG-10 Phase 8's proof fixture).
-/// A gate that accidentally over-matches must fail loudly, not quietly shrink
-/// coverage to a still-nonzero number. Raise this as coverage grows.
-const MIN_REPLAYED_EXCHANGES: usize = 5;
+/// (Shapes A/C: 4), plus vis-006's 1 scenario (Shape D, REG-10 Phase 8's
+/// proof fixture), plus (REG-10 Phase 9a) vis-001's 5 scenarios and
+/// vis-004's 4 scenarios -- 4 + 1 + 5 + 4 = 14. A gate that accidentally
+/// over-matches must fail loudly, not quietly shrink coverage to a
+/// still-nonzero number. Raise this as coverage grows.
+const MIN_REPLAYED_EXCHANGES: usize = 14;
 
 fn family_of(name: &str) -> String {
     // Prefix up to the digit group: `data-ref-ssrf-001-...` -> `data-ref-ssrf`.
@@ -1773,6 +1913,217 @@ async fn vis006_search_match_public_visibility_disclosure_replays_via_shape_d() 
     );
 }
 
+/// REG-10 Phase 9a: `vis-001` (RFC-ACDP-0008 §4.5 restricted-visibility
+/// existence-leak prevention) through Shape D. 5 scenarios against ONE
+/// seeded restricted context, each a different requester identity: producer
+/// (200), audience member (200), outsider (404 not_found), a request
+/// targeting a genuinely NONEXISTENT ctx_id (404 not_found, byte-
+/// indistinguishable from the outsider case), and a listed *contributor*
+/// who is NOT in `audience` (404 not_found -- contributors carries
+/// attribution, not retrieval authorization; see [`parse_shape_d`]'s fold
+/// step for how `context_subset_for_test.contributors` reaches the seed,
+/// and for why that reasoning stops at the retrieval/search axis).
+///
+/// This is the first fixture in this file whose scenarios require the
+/// bearer path to genuinely DISTINGUISH requester identities against the
+/// SAME seeded ctx_id (`vis-006`, Phase 8's proof fixture, does not: its
+/// requester is `did:agent:any-authenticated-or-anonymous` against a
+/// PUBLIC context, so it behaves identically with auth on or off). If
+/// Phase 8's GAP 2 fix (`shape_d_config().auth.enabled = true`) ever
+/// regressed, every request here would replay anonymously and scenarios 0
+/// (producer, want 200) and 1 (audience member, want 200) would both
+/// mismatch against the anonymous-gets-404 outcome -- so this fixture
+/// passing with zero failures IS the proof the bearer path works, not an
+/// inference from a green suite elsewhere.
+#[tokio::test(flavor = "multi_thread")]
+async fn vis001_restricted_denied_as_404_replays_via_shape_d() {
+    let Some(fixtures) = spec_fixtures() else {
+        eprintln!(
+            "conformance: ACDP_SPEC_DIR unset or no fixtures resolvable; skipping vis-001 \
+             Shape D proof (set ACDP_REQUIRE_CONFORMANCE to make this a hard failure)"
+        );
+        return;
+    };
+    let Some(fx) = find_fixture_by_id(&fixtures, "vis-001") else {
+        return;
+    };
+
+    // Shape A must never capture this fixture unseeded: it carries no
+    // top-level `request` at all, only `setup` + `scenarios`.
+    assert!(
+        fx.get("request").is_none(),
+        "vis-001 must carry no top-level `request` -- otherwise Shape A could capture it \
+         ahead of Shape D and replay it against an empty store"
+    );
+    assert!(
+        is_shape_d_candidate(&fx),
+        "vis-001 must satisfy the Shape D dispatch predicate"
+    );
+
+    let plan =
+        parse_shape_d(&fx).expect("vis-001 must fully parse as Shape D as of REG-10 Phase 9a");
+    assert_eq!(
+        plan.seeds.len(),
+        1,
+        "vis-001 seeds exactly one restricted context"
+    );
+    assert_eq!(plan.scenarios.len(), 5, "vis-001 carries 5 scenarios");
+
+    // The contributor scenario's `context_subset_for_test.contributors`
+    // DID must have been folded onto the (only) seed.
+    assert_eq!(
+        plan.seeds[0].contributors,
+        vec!["did:agent:listed_contributor".to_string()],
+        "vis-001 scenario 5's context_subset_for_test.contributors must be folded onto the \
+         seed, not dropped: {:?}",
+        plan.seeds[0].contributors
+    );
+
+    // Concrete evidence the fixture actually requires identity
+    // differentiation (see doc comment above): the producer scenario wants
+    // 200 from one requester DID, the outsider scenario wants 404 from a
+    // DIFFERENT requester DID against the exact same seeded ctx_id.
+    assert_eq!(plan.scenarios[0].want_status, 200);
+    assert_eq!(plan.scenarios[2].want_status, 404);
+    assert_ne!(
+        plan.scenarios[0].effective_requester_did, plan.scenarios[2].effective_requester_did,
+        "the 200-vs-404 split must come from different requester identities, not path/method"
+    );
+
+    let result = replay_shape_d("vis-001", &plan).await;
+    assert!(
+        result.failures.is_empty(),
+        "vis-001 must replay cleanly via Shape D: {:?}",
+        result.failures
+    );
+    assert_eq!(result.ran, 5);
+
+    // Edge case 1 (REG-10 Phase 9a): scenario 4 targets a genuinely
+    // NONEXISTENT ctx_id (`...000000000000`, distinct from the seeded
+    // `...000000000001`). It must NOT have been seeded and must NOT have
+    // gained a substitution entry -- the ctx_id map must contain ONLY the
+    // one context this fixture actually seeded.
+    assert_eq!(
+        result.ctx_map.len(),
+        1,
+        "vis-001's ctx_id substitution map must contain exactly its one seeded context, not \
+         the nonexistent ctx_id scenario 4 targets: {:?}",
+        result.ctx_map
+    );
+    assert!(
+        result
+            .ctx_map
+            .contains_key("acdp://registry.example.com/00000000-0000-4000-8000-000000000001"),
+        "the seeded ctx_id must be present in the substitution map: {:?}",
+        result.ctx_map
+    );
+    assert!(
+        !result
+            .ctx_map
+            .contains_key("acdp://registry.example.com/00000000-0000-4000-8000-000000000000"),
+        "the NONEXISTENT ctx_id scenario 4 targets must never gain a substitution entry -- it \
+         was never seeded, and must reach the registry as the literal, unmintable string: {:?}",
+        result.ctx_map
+    );
+}
+
+/// REG-10 Phase 9a: `vis-004` (RFC-ACDP-0008 §4.5 / RFC-ACDP-0002 §7
+/// private/audience retrieval asymmetry) through Shape D. 4 scenarios
+/// against ONE seeded private context with `audience: [did:agent:
+/// audience_member]`: producer (200), audience member (200), outsider (404
+/// not_found), and a listed *contributor* who is NOT in `audience` (404
+/// not_found -- same contributors-is-not-authorization proof as vis-001's
+/// scenario 5, via the same `context_subset_for_test.contributors` fold).
+#[tokio::test(flavor = "multi_thread")]
+async fn vis004_private_audience_retrieval_allowed_replays_via_shape_d() {
+    let Some(fixtures) = spec_fixtures() else {
+        eprintln!(
+            "conformance: ACDP_SPEC_DIR unset or no fixtures resolvable; skipping vis-004 \
+             Shape D proof (set ACDP_REQUIRE_CONFORMANCE to make this a hard failure)"
+        );
+        return;
+    };
+    let Some(fx) = find_fixture_by_id(&fixtures, "vis-004") else {
+        return;
+    };
+
+    assert!(
+        fx.get("request").is_none(),
+        "vis-004 must carry no top-level `request` -- otherwise Shape A could capture it \
+         ahead of Shape D and replay it against an empty store"
+    );
+    assert!(
+        is_shape_d_candidate(&fx),
+        "vis-004 must satisfy the Shape D dispatch predicate"
+    );
+
+    let plan =
+        parse_shape_d(&fx).expect("vis-004 must fully parse as Shape D as of REG-10 Phase 9a");
+    assert_eq!(
+        plan.seeds.len(),
+        1,
+        "vis-004 seeds exactly one private context"
+    );
+    assert_eq!(plan.scenarios.len(), 4, "vis-004 carries 4 scenarios");
+    assert_eq!(
+        plan.seeds[0].contributors,
+        vec!["did:agent:listed_contributor".to_string()],
+        "vis-004 scenario 4's context_subset_for_test.contributors must be folded onto the \
+         seed, not dropped: {:?}",
+        plan.seeds[0].contributors
+    );
+    assert_eq!(
+        plan.seeds[0].audience,
+        vec!["did:agent:audience_member".to_string()]
+    );
+
+    let result = replay_shape_d("vis-004", &plan).await;
+    assert!(
+        result.failures.is_empty(),
+        "vis-004 must replay cleanly via Shape D: {:?}",
+        result.failures
+    );
+    assert_eq!(result.ran, 4);
+    assert_eq!(
+        result.ctx_map.len(),
+        1,
+        "vis-004's ctx_id substitution map must contain exactly its one seeded context: {:?}",
+        result.ctx_map
+    );
+
+    // Mutation proof: an in-memory-only clone of the fixture (never written
+    // to the spec checkout) with the seeded context's visibility flipped
+    // from `private` to `public`. Scenario 3 (the outsider, who is neither
+    // producer nor in `audience`) expects 404 not_found specifically
+    // because the context is private; under `public` visibility an outsider
+    // CAN retrieve it (200), so this MUST fail replay -- proving the
+    // harness is exercising the registry's real private/audience scoping,
+    // not trivially returning green regardless of what's seeded. `audience`
+    // must be cleared too -- the SDK's publish-request builder itself
+    // rejects `visibility: public` with a non-empty `audience` (schema
+    // violation), so leaving it in place would fail at SEED time (a hard
+    // panic, per Shape D's "a failed seed panics" rule) rather than
+    // demonstrating the intended REPLAY mismatch.
+    let mut mutated = fx.clone();
+    mutated["setup"]["context_published"]["visibility"] = json!("public");
+    mutated["setup"]["context_published"]["audience"] = json!([]);
+    let mutated_plan =
+        parse_shape_d(&mutated).expect("mutated vis-004 must still parse as Shape D");
+    let mutated_result = replay_shape_d("vis-004-mutated", &mutated_plan).await;
+    assert!(
+        !mutated_result.failures.is_empty(),
+        "mutating vis-004's seeded visibility to `public` MUST fail replay -- if it doesn't, \
+         Shape D isn't actually checking anything: {mutated_result:?}"
+    );
+    assert!(
+        mutated_result.failures.iter().any(|f| f.contains("!= 404")),
+        "mutating vis-004's seeded visibility to `public` must fail specifically on a \
+         404-expected-but-not-gotten mismatch (the outsider scenario, no longer blocked by \
+         privacy), not on some other, unrelated failure: {:?}",
+        mutated_result.failures
+    );
+}
+
 /// REG-10 Phase 8 GAP 1 / GAP 2 regression proof: a synthetic, in-test-only
 /// fixture (never read from the spec checkout -- this exercises a shape no
 /// pinned fixture currently reaches, since `vis-002`/`vis-005`/`vis-009`
@@ -2084,6 +2435,166 @@ async fn playground_compiled_in_but_runtime_disabled_keeps_admin_route() {
     // The admin route is wired in at compile time; the playground flag
     // only affects whether `publish` skips DID verification.
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+// ─── REG-10 Phase 9a: vis-003 (search response field-naming) ─────────────
+
+/// vis-003 (RFC-ACDP-0005 §2.2): the search response's wrapping array MUST
+/// be named `matches`; a registry MUST NOT emit `results` (or any other
+/// alternative spelling). Neither Shape D (no `setup`, only `background`)
+/// nor Shape B (scenarios use `input.endpoint`/`input.received_response`,
+/// never `request.method`/`request.path`) can reach this fixture — see the
+/// module doc-block's `vis-003` paragraph. This test drives it DIRECTLY,
+/// same precedent as `anc-*`/`wit-*`/`can-*` elsewhere in this file:
+///
+///   * **Scenario 0 ("registry-side")** is the one this registry can
+///     actually be checked against: a REAL `GET /contexts/search` fired at
+///     the shared harness, asserting the fixture's own
+///     `expected.response_body_constraints` on the REAL response body --
+///     `matches` MUST be present, `results` (and every listed alternate
+///     spelling) MUST NOT be. Read directly off the fixture rather than
+///     hand-duplicated, so a spec-side rewording of the constraint keys
+///     would fail this test's own parsing rather than silently going stale.
+///   * **Scenarios 1-2 ("consumer-side")** are recorded NOT APPLICABLE, in
+///     this doc comment, with a reason, rather than silently dropped: both
+///     carry `expected.consumer_behavior` (scenario 1: a consumer MUST NOT
+///     silently coerce `results` to `matches`) and scenario 2 additionally
+///     carries `expected.minimum_diagnostic_content` (a consumer SHOULD
+///     surface an observable diagnostic naming the misuse). Both describe
+///     obligations on a CONSUMER of a (deliberately non-conformant, per the
+///     fixture's own `background`) response -- not on this registry's own
+///     behavior. A registry has no consumer role to exercise here, so there
+///     is no HTTP exchange, in-process call, or assertion this repo could
+///     make that would exercise either scenario; the assertions below only
+///     confirm the two scenarios are still shaped exactly the way this
+///     analysis depends on, so a future fixture edit that changed their
+///     meaning would fail loudly here rather than the reasoning silently
+///     going stale.
+#[tokio::test(flavor = "multi_thread")]
+async fn vis003_search_response_emits_matches_not_results() {
+    let Some(fixtures) = spec_fixtures() else {
+        eprintln!(
+            "conformance: ACDP_SPEC_DIR unset or no fixtures resolvable; skipping vis-003 \
+             (set ACDP_REQUIRE_CONFORMANCE to make this a hard failure)"
+        );
+        return;
+    };
+    let Some(fx) = find_fixture_by_id(&fixtures, "vis-003") else {
+        return;
+    };
+    assert!(
+        fx.get("setup").is_none(),
+        "vis-003 must carry no `setup` -- confirms it can never reach Shape D"
+    );
+    let scenarios = fx["scenarios"]
+        .as_array()
+        .expect("vis-003 must carry a scenarios[] array");
+    assert_eq!(scenarios.len(), 3, "vis-003 must carry exactly 3 scenarios");
+
+    // Scenario 0: registry-side, the only HTTP-replayable one.
+    let sc0 = &scenarios[0];
+    assert!(
+        sc0.get("request").is_none(),
+        "vis-003 scenario 0 must carry no `request` key -- confirms Shape B's own predicate \
+         (request + expected) cannot reach it either"
+    );
+    let endpoint = sc0["input"]["endpoint"]
+        .as_str()
+        .expect("vis-003 scenario 0 must carry input.endpoint");
+    let (method, path) = endpoint
+        .split_once(' ')
+        .expect("input.endpoint must be \"METHOD path\"");
+    assert_eq!(method, "GET");
+    let want_status = sc0["expected"]["http_status"]
+        .as_u64()
+        .expect("vis-003 scenario 0 must carry expected.http_status") as u16;
+    let constraints = &sc0["expected"]["response_body_constraints"];
+    let must_have_key = constraints["MUST_have_key"]
+        .as_str()
+        .expect("vis-003 scenario 0 must carry response_body_constraints.MUST_have_key");
+    let must_not_have_key = constraints["MUST_NOT_have_key"]
+        .as_str()
+        .expect("vis-003 scenario 0 must carry response_body_constraints.MUST_NOT_have_key");
+    let must_not_have_alternates: Vec<&str> = constraints["MUST_NOT_have_key_alternates"]
+        .as_array()
+        .expect(
+            "vis-003 scenario 0 must carry response_body_constraints.MUST_NOT_have_key_alternates",
+        )
+        .iter()
+        .map(|v| v.as_str().expect("alternate key must be a string"))
+        .collect();
+    assert!(
+        !must_not_have_alternates.is_empty(),
+        "vis-003's MUST_NOT_have_key_alternates must be non-empty"
+    );
+
+    let app = harness().await;
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let got_status = resp.status().as_u16();
+    let body = body_to_json_lenient(resp).await;
+    assert_eq!(
+        got_status, want_status,
+        "vis-003 scenario 0: GET {path} status; body = {body}"
+    );
+    let obj = body.as_object().unwrap_or_else(|| {
+        panic!("vis-003 scenario 0: search response must be a JSON object: {body}")
+    });
+    assert!(
+        obj.contains_key(must_have_key),
+        "vis-003 scenario 0: search response MUST have key \"{must_have_key}\": {body}"
+    );
+    assert!(
+        !obj.contains_key(must_not_have_key),
+        "vis-003 scenario 0: search response MUST NOT have key \"{must_not_have_key}\": {body}"
+    );
+    for alt in &must_not_have_alternates {
+        assert!(
+            !obj.contains_key(*alt),
+            "vis-003 scenario 0: search response MUST NOT have alternate key \"{alt}\": {body}"
+        );
+    }
+
+    // Scenarios 1-2: consumer-side, not applicable to a registry -- see
+    // this test's doc comment for the full reasoning. Assert their SHAPE
+    // only, so this reasoning cannot silently go stale.
+    for (idx, expect_diagnostic) in [(1usize, false), (2usize, true)] {
+        let sc = &scenarios[idx];
+        assert!(
+            sc.get("request").is_none()
+                && sc.get("input").and_then(|i| i.get("endpoint")).is_none(),
+            "vis-003 scenario {idx} must carry no replayable HTTP request -- it is consumer-side"
+        );
+        assert_eq!(
+            sc["expected"]["outcome"].as_str(),
+            Some("failure"),
+            "vis-003 scenario {idx} must describe a consumer-observed failure outcome"
+        );
+        assert!(
+            sc["expected"]["consumer_behavior"].is_string(),
+            "vis-003 scenario {idx} must carry expected.consumer_behavior -- confirms it's a \
+             consumer-side obligation, not a registry one"
+        );
+        assert_eq!(
+            sc["expected"]["minimum_diagnostic_content"].is_array(),
+            expect_diagnostic,
+            "vis-003 scenario {idx}: minimum_diagnostic_content presence must match the known \
+             fixture shape (only scenario 2 carries it)"
+        );
+    }
+    eprintln!(
+        "conformance: vis-003 scenarios 1-2 (consumer_behavior / minimum_diagnostic_content) \
+         are consumer-side obligations a registry cannot satisfy or violate; not applicable, \
+         see vis003_search_response_emits_matches_not_results's doc comment"
+    );
 }
 
 // ─── ACDP 0.2.0: did:key golden vector + capability gate (sig-003 / dk-003) ───
@@ -3404,6 +3915,24 @@ fn fixture_family_panics_naming_file_when_id_missing() {
 /// either — all 12 of its ids sit in `acdp-registry-core`'s
 /// `required_fixtures`, which makes it mechanically inexcusable under rule
 /// 1 below — so again only its *coverage* changed, not its classification.
+///
+/// `vis` (RFC-ACDP-0008 §4.5 visibility scoping) was never `EXCUSED` and
+/// never classified "non-HTTP" — it is squarely `acdp-registry-core`'s own
+/// business, and REG-10 Phase 8/9a's whole point is widening how much of it
+/// this harness can replay for real. As of Phase 9a: `vis-001` (5
+/// scenarios) and `vis-004` (4 scenarios) join `vis-006` (Phase 8) as
+/// genuinely REPLAYED via Shape D — including, for both, a per-scenario
+/// `context_subset_for_test.contributors` folded onto the seed (see
+/// [`parse_shape_d`]'s fold step). `vis-003` stays classified
+/// "scenarios carried no replayable request" by the generic harness (its
+/// scenarios use `input.endpoint`, never `request.method`/`request.path`,
+/// so no shape's predicate matches) but now has DIRECT coverage, same
+/// `anc`/`can` precedent, via `vis003_search_response_emits_matches_not_results`.
+/// `vis-002`/`vis-005`/`vis-007`/`vis-009` remain "Shape D: unrecognized
+/// scenario/expected key" (`matches_ctx_ids`, `total_estimate`, multi-seed
+/// / capability-toggling shapes — Phase 9b/9c); `vis-008`
+/// (`setup.lineages`) remains "requires pre-seeded registry state" (Phase
+/// 9c). Only `vis`'s *coverage* changed here, never its classification.
 const KNOWN_FAMILIES: &[&str] = &[
     "anc",
     "body",
