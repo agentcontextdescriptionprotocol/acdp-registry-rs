@@ -298,6 +298,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Reworded the wit-001/wit-004 quorum assertion's message and its
+  preceding comment** (`REG-10` Phase 5, GitHub issue #113) in
+  `wit004_key_mismatch_cosignature_is_rejected_and_wit001_golden_is_accepted`.
+  The old message claimed the assertion proved `report_both.witnesses`
+  names *wit-001's* witness and not wit-004's — impossible by
+  construction, since the test pins both fixtures to the same witness
+  assertionMethod key and only ever registers one witness DID. The
+  assertion is unchanged; it actually proves the one verifying
+  cosignature is attributed exactly once in `witnesses`, consistent with
+  `witnessed_count`. No executable change.
+
 - **`storage-memory` gets its first required CI coverage** (`REG-10`,
   issue #109). `.github/workflows/ci.yml`'s `clippy` job gains a fourth
   step, `clippy (memory)`, running
