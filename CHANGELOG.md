@@ -8,6 +8,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The witness aggregator's reject-then-no-write path is now directly
+  tested** (`REG-10` Phase 4, GitHub issue #112). `witness.rs`'s
+  `verify_and_store` was split at the point right after DID resolution:
+  it now resolves the witness DID document and tail-calls a new private
+  `verify_and_store_resolved(store, log, witness_did, doc_value,
+  cosig_value) -> bool`, a verbatim lift of the verify-then-store half
+  (the `verify_cosignature_against_own_log` match through the
+  `upsert_witness_cosignature` call and the three metric-labeled early
+  returns). This is a no-behavior-change refactor — `verify_and_store`'s
+  signature, visibility, and callers are untouched — that makes the
+  store-writing half callable directly against a real `SqliteStore`
+  without a live witness endpoint. Two new tests exercise it:
+  `rejected_cosignature_is_not_persisted_by_the_store_path` (a forged-root
+  cosignature is reported unstored, and leaves no row at either the
+  forged or the honest checkpoint tuple) and
+  `verified_cosignature_is_persisted_by_the_store_path` (the positive
+  control — a genuine cosignature is reported stored and reads back).
+  Previously only the pre-store verification helper had forward-guard
+  assertions; nothing exercised the actual persistence path.
+
 - **`.github/workflows/bump-spec.yml`, a manual and dispatch-driven
   replacement for hand-written spec-pin bumps** (`REG-10` Phase 3, GitHub
   issue #110). It delegates to acdp-ci's reusable `bump-spec-ref.yml@v1`
