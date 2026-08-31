@@ -127,6 +127,28 @@
 //! side scheme-unaware-verifier tolerance -- a registry has no verifier role)
 //! are deliberately out of scope; see the doc-comments on the three tests
 //! above and the CHANGELOG for the full reasoning.
+//!
+//! `can-*` (RFC-ACDP-0001 canonicalization & hashing vectors) is likewise
+//! not HTTP-replayable -- the family carries no request/response shape at
+//! all, just JCS canonicalization/hash golden vectors (`can-*.json`'s
+//! `vectors[]`) and, for `can-007` alone, a registry-clock-truncation
+//! table with no `input`/hash at all. REG-10 Phase 7 gives it DIRECT
+//! fixture-driven coverage, same precedent as `anc`/`wit` above:
+//! `can_vectors_reproduce_canonical_form_and_hash` drives `acdp::crypto`'s
+//! public JCS surface (`canonicalize_value`, `canonical_preimage`,
+//! `derive_lineage_id`) against 30 of the family's 35 vectors, and
+//! `can007_registry_created_at_millisecond_truncation` drives this repo's
+//! own `acdp::time::trunc_ms` -- the function `acdp-registry-sqlite`/
+//! `acdp-registry-pg` actually call when minting `created_at` -- against
+//! the remaining 5. As with `anc-004` above, most of `can`'s vectors
+//! re-test `acdp-crypto`'s own golden vectors rather than this repo's
+//! code; `can_vectors_reproduce_canonical_form_and_hash`'s own doc comment
+//! records the counter-argument (the coverage ratchet makes `can`
+//! mechanically inexcusable, and the conformance claim is about the
+//! binary as shipped, not about which crate owns the tested code). `can`'s
+//! *classification* here is unchanged -- it was never `EXCUSED` and still
+//! isn't (all 12 ids sit in `acdp-registry-core`'s `required_fixtures`,
+//! see `KNOWN_FAMILIES`'s doc comment) -- only its *coverage* changed.
 
 #![cfg(feature = "storage-sqlite")]
 
@@ -142,7 +164,7 @@ use acdp::producer::Producer;
 #[cfg(feature = "playground")]
 use acdp::registry::RegistryServer;
 use acdp::types::capabilities::{CapabilitiesDocument, Limits};
-use acdp::types::primitives::{ContextType, Visibility};
+use acdp::types::primitives::{ContentHash, ContextType, CtxId, Visibility};
 use acdp::types::publish::PublishRequest;
 use acdp::AnchorEntry;
 #[cfg(feature = "playground")]
@@ -1535,6 +1557,412 @@ async fn anc003_empty_anchors_array_is_rejected_with_established_ordering() {
     );
 }
 
+// ─── REG-10 Phase 7 (plans/reg10-conformance-and-ci-hygiene.md): can-*
+// canonicalization & hashing vector coverage ───
+//
+// None of the 12 can-* fixtures is HTTP-replayable (no request/response
+// shape at all -- see the module doc-comment's `can-*` paragraph), yet all
+// 12 ids sit in the pinned spec's `acdp-registry-core.required_fixtures`,
+// which makes `can` mechanically inexcusable under `EXCUSED`'s rule 1
+// (`no_excused_family_is_required_by_our_profile`, below). So, following
+// the same "direct, fixture-driven, in-process" precedent as `anc`/`wit`
+// above, the two tests in this section consume every can-* fixture's own
+// data directly instead of going through the generic replayer.
+//
+// TENSION, recorded rather than left implicit (per the phase plan): the
+// anc-004/anc-005 paragraph above argues AGAINST re-testing an upstream
+// crate's own golden vectors -- "Duplicating anc-004 here would just
+// re-test an upstream crate's own golden vector." That objection applies
+// just as much to can-001..006/008..012: they are `acdp-crypto`'s own JCS/
+// hash golden vectors (`acdp-crypto-0.8.4/src/hash.rs`'s and
+// `acdp-jcs-0.8.4/src/lib.rs`'s own `#[cfg(test)]` modules already cover
+// several of the same values, e.g. `lineage_id_golden`). The counter,
+// which is why this phase exists anyway: unlike anc-004/anc-005 (excused
+// on a *spec-grounded* basis -- neither is in any acdp-registry-core
+// required/conditional fixture list), all 12 can-* ids ARE required by
+// this repo's own advertised profile, so `EXCUSED` mechanically refuses an
+// excuse here regardless of how compelling the "pure library vector"
+// argument sounds. A conformance claim made about this binary has to cover
+// every fixture the binary's own profile requires -- who else in the
+// dependency chain already tested the same value is a cost/duplication
+// argument, not a coverage argument, and the ratchet is deliberately deaf
+// to cost/duplication arguments.
+
+/// can-* vector count pinned at spec `417211f` (REG-10 Phase 7): **35**
+/// total across all 12 can-* fixtures. Split into two constants because
+/// can-007 alone carries no `input`/hash at all (see
+/// `can007_registry_created_at_millisecond_truncation`'s doc comment) and
+/// is therefore asserted by a separate test:
+/// `EXPECTED_CAN_HASH_VECTOR_COUNT` is the other 11 fixtures' 30
+/// canonical-form/hash vectors, and can-007's own 5 are asserted as
+/// `EXPECTED_CAN_VECTOR_COUNT - EXPECTED_CAN_HASH_VECTOR_COUNT` rather than
+/// a third bare literal, so the two constants can't silently drift apart.
+/// Either test's vector count shrinking without this constant moving is
+/// the vacuous-pass failure mode this pair exists to catch.
+const EXPECTED_CAN_VECTOR_COUNT: usize = 35;
+const EXPECTED_CAN_HASH_VECTOR_COUNT: usize = 30;
+
+/// Parse an RFC 3339 timestamp string as `DateTime<Utc>`, panicking
+/// (naming `ctx`) on failure. can-007's fixture-supplied timestamps are
+/// trusted, spec-pinned input -- a parse failure here means the fixture
+/// itself changed shape, which must be loud, not silently skipped.
+fn parse_rfc3339_utc(s: &str, ctx: &str) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .unwrap_or_else(|e| panic!("{ctx}: {s:?} did not parse as RFC 3339: {e}"))
+        .with_timezone(&chrono::Utc)
+}
+
+/// Assert `bytes` (a raw JCS canonicalization) and `hash` (its SHA-256,
+/// `sha256:`-prefixed) both reproduce `expected`'s pinned values. Shared by
+/// every can-* vector shape that carries a hash. Also asserts
+/// `expected.content_hash_field_value` when present (11 of the 12 can-*
+/// fixtures carry it) -- it is the same digest with its wire `sha256:`
+/// prefix, i.e. the exact string RFC-ACDP-0001 §5.7 says would be stored
+/// in `Body.content_hash`, so checking it is free coverage of the wire
+/// format beyond the bare hex digest the plan calls out by name.
+fn assert_canonical_bytes_and_hash(bytes: Vec<u8>, hash: ContentHash, expected: &Value, ctx: &str) {
+    let got_form = String::from_utf8(bytes)
+        .unwrap_or_else(|e| panic!("{ctx}: canonical form is not valid UTF-8: {e}"));
+    let want_form = expected["canonical_form"].as_str().unwrap_or_else(|| {
+        panic!("{ctx}: expected.canonical_form missing or not a string: {expected}")
+    });
+    assert_eq!(got_form, want_form, "{ctx}: canonical_form mismatch");
+
+    let want_hex = expected["sha256_hex"].as_str().unwrap_or_else(|| {
+        panic!("{ctx}: expected.sha256_hex missing or not a string: {expected}")
+    });
+    let got_hex = hash
+        .as_str()
+        .strip_prefix("sha256:")
+        .unwrap_or_else(|| panic!("{ctx}: computed hash has no 'sha256:' prefix: {hash}"));
+    assert_eq!(got_hex, want_hex, "{ctx}: sha256_hex mismatch");
+
+    if let Some(want_field) = expected
+        .get("content_hash_field_value")
+        .and_then(Value::as_str)
+    {
+        assert_eq!(
+            hash.as_str(),
+            want_field,
+            "{ctx}: content_hash_field_value mismatch"
+        );
+    }
+}
+
+/// The Body/ProducerContent path: `canonical_preimage` strips the
+/// RFC-ACDP-0001 §5.7 EXCLUDE set (`content_hash`, `signature`, `ctx_id`,
+/// `lineage_id`, `origin_registry`, `created_at`) by name, JCS-
+/// canonicalizes, and SHA-256 hashes in one call. Safe for every can-*
+/// vector that genuinely represents a (Producer)Content-shaped body -- none
+/// of their `input` objects carry an EXCLUDE-set key name.
+fn assert_body_hash_vector(input: &Value, expected: &Value, ctx: &str) {
+    let (bytes, hash) = acdp::crypto::canonical_preimage(input)
+        .unwrap_or_else(|e| panic!("{ctx}: canonical_preimage failed: {e}"));
+    assert_canonical_bytes_and_hash(bytes, hash, expected, ctx);
+}
+
+/// The no-hash shape: only `expected.canonical_form` exists (can-001's
+/// number-formatting / array-order / null-vs-absent vectors). Uses the raw
+/// `canonicalize_value` JCS API directly rather than the Body-shaped
+/// `canonical_preimage` -- there is no hash to check, so there is no
+/// reason to route through the content_hash-specific function at all.
+fn assert_canonical_form_only(input: &Value, expected: &Value, ctx: &str) {
+    let bytes = acdp::crypto::canonicalize_value(input);
+    let got_form = String::from_utf8(bytes)
+        .unwrap_or_else(|e| panic!("{ctx}: canonical form is not valid UTF-8: {e}"));
+    let want_form = expected["canonical_form"].as_str().unwrap_or_else(|| {
+        panic!("{ctx}: expected.canonical_form missing or not a string: {expected}")
+    });
+    assert_eq!(got_form, want_form, "{ctx}: canonical_form mismatch");
+}
+
+/// can-001's `{lineage_id}`-only vectors: `lineage_id = "lin:sha256:" +
+/// lowercase_hex(SHA-256(utf8(ctx_id)))` (RFC-ACDP-0001 §5.6), computed
+/// directly via `derive_lineage_id` rather than any hash-equality loop
+/// over `sha256_hex` -- these vectors carry no `sha256_hex` at all.
+fn assert_lineage_vector(input: &Value, expected: &Value, ctx: &str) {
+    let ctx_id_str = input["ctx_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{ctx}: input.ctx_id missing or not a string: {input}"));
+    let lineage = acdp::crypto::derive_lineage_id(&CtxId(ctx_id_str.to_string()));
+    let want = expected["lineage_id"].as_str().unwrap_or_else(|| {
+        panic!("{ctx}: expected.lineage_id missing or not a string: {expected}")
+    });
+    assert_eq!(lineage.as_str(), want, "{ctx}: lineage_id mismatch");
+}
+
+/// can-011's vectors: bare `{"values": [...]}` JSON objects, NOT ACDP
+/// bodies -- `canonicalize_value` (raw JCS), not `canonical_preimage`'s
+/// Body/content_hash path, is the semantically correct API. The hash is
+/// still obtained without adding a `sha2` dependency: `canonical_preimage`
+/// is called too, and its canonical bytes are asserted byte-identical to
+/// `canonicalize_value`'s own output BEFORE its hash is trusted -- proving,
+/// per vector, that none of can-011's EXCLUDE-set-free `values` arrays
+/// happened to collide with a §5.7 exclusion-set key name, i.e. that
+/// reusing `canonical_preimage`'s hash here is provably equivalent to
+/// hashing the raw JCS bytes directly, not an accident of today's fixture
+/// contents.
+fn assert_raw_jcs_hash_vector(input: &Value, expected: &Value, ctx: &str) {
+    let raw_bytes = acdp::crypto::canonicalize_value(input);
+    let (preimage_bytes, hash) = acdp::crypto::canonical_preimage(input)
+        .unwrap_or_else(|e| panic!("{ctx}: canonical_preimage failed: {e}"));
+    assert_eq!(
+        raw_bytes, preimage_bytes,
+        "{ctx}: canonical_preimage produced different bytes than raw canonicalize_value -- an \
+         RFC-ACDP-0001 §5.7 EXCLUDE-set key name must have leaked into this vector's input, \
+         which would make reusing canonical_preimage's hash here unsound (can-011's vectors \
+         are bare numeric-formatting objects, not ACDP bodies)"
+    );
+    assert_canonical_bytes_and_hash(raw_bytes, hash, expected, ctx);
+}
+
+/// can-001..006/008..012's 30 canonicalization/hashing vectors (of the
+/// family's 35 total -- can-007 is covered separately below). can-001
+/// alone packs THREE distinct `expected` shapes into its 7 vectors: 1 Body
+/// `{canonical_form, sha256_hex}`, 3 `{lineage_id}`-only, and 3
+/// `{canonical_form}`-only with no hash at all -- a single hash-equality
+/// loop would silently cover only the first of the seven, which is exactly
+/// the vacuous-pass failure mode this whole phase exists to close.
+#[test]
+fn can_vectors_reproduce_canonical_form_and_hash() {
+    let Some(fixtures) = spec_fixtures() else {
+        eprintln!(
+            "conformance: ACDP_SPEC_DIR unset or no fixtures resolvable; skipping can-* \
+             canonicalization/hash vectors (set ACDP_REQUIRE_CONFORMANCE to make this a hard \
+             failure)"
+        );
+        return;
+    };
+
+    let mut asserted = 0usize;
+
+    // can-001: three shapes, dispatched per-vector on which `expected` key
+    // is present.
+    if let Some(fx) = find_fixture_by_id(&fixtures, "can-001") {
+        let vectors = fx["vectors"]
+            .as_array()
+            .unwrap_or_else(|| panic!("can-001: vectors missing or not an array: {fx}"));
+        assert_eq!(
+            vectors.len(),
+            7,
+            "can-001 must carry exactly 7 vectors at spec pin 417211f: {fx}"
+        );
+        for (i, v) in vectors.iter().enumerate() {
+            let ctx = format!("can-001 vector {i} ({})", v["name"].as_str().unwrap_or("?"));
+            let expected = &v["expected"];
+            if expected.get("lineage_id").is_some() {
+                assert_lineage_vector(&v["input"], expected, &ctx);
+            } else if expected.get("sha256_hex").is_some() {
+                assert_body_hash_vector(&v["input"], expected, &ctx);
+            } else {
+                assert!(
+                    expected.get("canonical_form").is_some(),
+                    "{ctx}: expected has none of lineage_id, sha256_hex, canonical_form: {v}"
+                );
+                assert_canonical_form_only(&v["input"], expected, &ctx);
+            }
+            asserted += 1;
+        }
+    }
+
+    // can-011: raw JCS numeric-formatting vectors -- see
+    // assert_raw_jcs_hash_vector's own comment for why they take a
+    // different API than the Body vectors below.
+    if let Some(fx) = find_fixture_by_id(&fixtures, "can-011") {
+        let vectors = fx["vectors"]
+            .as_array()
+            .unwrap_or_else(|| panic!("can-011: vectors missing or not an array: {fx}"));
+        assert_eq!(
+            vectors.len(),
+            6,
+            "can-011 must carry exactly 6 vectors at spec pin 417211f: {fx}"
+        );
+        for (i, v) in vectors.iter().enumerate() {
+            let ctx = format!("can-011 vector {i} ({})", v["name"].as_str().unwrap_or("?"));
+            assert_raw_jcs_hash_vector(&v["input"], &v["expected"], &ctx);
+            asserted += 1;
+        }
+    }
+
+    // can-006: two vectors are the SAME logical instant at different
+    // sub-second precisions. Beyond each vector's own hash matching
+    // (below), explicitly assert they DIVERGE from each other -- per the
+    // fixture's own description, that divergence (not either vector in
+    // isolation) is the whole point.
+    if let Some(fx) = find_fixture_by_id(&fixtures, "can-006") {
+        let vectors = fx["vectors"]
+            .as_array()
+            .unwrap_or_else(|| panic!("can-006: vectors missing or not an array: {fx}"));
+        assert_eq!(
+            vectors.len(),
+            2,
+            "can-006 must carry exactly 2 vectors at spec pin 417211f: {fx}"
+        );
+        let forms: Vec<String> = vectors
+            .iter()
+            .map(|v| {
+                String::from_utf8(acdp::crypto::canonicalize_value(&v["input"]))
+                    .expect("can-006: canonical form is not valid UTF-8")
+            })
+            .collect();
+        let hashes: Vec<String> = vectors
+            .iter()
+            .map(|v| {
+                acdp::crypto::compute_content_hash(&v["input"])
+                    .expect("can-006: compute_content_hash failed")
+                    .as_str()
+                    .to_string()
+            })
+            .collect();
+        assert_ne!(
+            forms[0], forms[1],
+            "can-006: the nanosecond- and millisecond-precision vectors must have DIFFERENT \
+             canonical_form -- that divergence is the fixture's whole point"
+        );
+        assert_ne!(
+            hashes[0], hashes[1],
+            "can-006: the nanosecond- and millisecond-precision vectors must have DIFFERENT \
+             content_hash"
+        );
+        let compliances: Vec<&str> = vectors
+            .iter()
+            .map(|v| {
+                v["producer_compliance"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("can-006: producer_compliance missing: {v}"))
+            })
+            .collect();
+        assert_eq!(
+            compliances,
+            vec!["non-conformant", "conformant"],
+            "can-006: vector 0 (nanosecond) must be labelled non-conformant and vector 1 \
+             (millisecond-truncated) conformant"
+        );
+        for (i, v) in vectors.iter().enumerate() {
+            let ctx = format!("can-006 vector {i} ({})", v["name"].as_str().unwrap_or("?"));
+            assert_body_hash_vector(&v["input"], &v["expected"], &ctx);
+            asserted += 1;
+        }
+    }
+
+    // The remaining 8 fixtures each carry only the single Body
+    // {canonical_form, sha256_hex, content_hash_field_value} shape.
+    for (id, expected_len) in [
+        ("can-002", 1),
+        ("can-003", 1),
+        ("can-004", 1),
+        ("can-005", 2),
+        ("can-008", 1),
+        ("can-009", 1),
+        ("can-010", 1),
+        ("can-012", 7),
+    ] {
+        let Some(fx) = find_fixture_by_id(&fixtures, id) else {
+            continue;
+        };
+        let vectors = fx["vectors"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{id}: vectors missing or not an array: {fx}"));
+        assert_eq!(
+            vectors.len(),
+            expected_len,
+            "{id} must carry exactly {expected_len} vector(s) at spec pin 417211f: {fx}"
+        );
+        for (i, v) in vectors.iter().enumerate() {
+            let ctx = format!("{id} vector {i} ({})", v["name"].as_str().unwrap_or("?"));
+            assert_body_hash_vector(&v["input"], &v["expected"], &ctx);
+            asserted += 1;
+        }
+    }
+
+    assert_eq!(
+        asserted, EXPECTED_CAN_HASH_VECTOR_COUNT,
+        "expected exactly {EXPECTED_CAN_HASH_VECTOR_COUNT} can-* canonical-form/hash vectors at \
+         spec pin 417211f across 11 of the 12 can-* fixtures (can-007 has no input/hash at all \
+         and is covered separately by can007_registry_created_at_millisecond_truncation) -- a \
+         silently-shrinking count here is exactly the vacuous-pass failure mode this ratchet \
+         exists to prevent"
+    );
+}
+
+/// can-007 (registry `created_at` millisecond-truncation table): unlike
+/// every other can-* fixture, this one carries no `input`/`sha256_hex` at
+/// all -- its `expected` is `{registry_compliance, rationale}`, keyed off
+/// `example_created_at` (+, for 2 of 5 vectors, `registry_clock_at_acceptance`).
+/// It isn't a JCS/hash golden vector, so it's asserted separately from
+/// `can_vectors_reproduce_canonical_form_and_hash` above -- and, unlike
+/// that test's re-tested `acdp-crypto` golden vectors (see the TENSION
+/// note above this section), this one genuinely exercises code THIS repo
+/// owns and calls on the publish path: `acdp::time::trunc_ms`, the exact
+/// function `acdp-registry-sqlite`/`acdp-registry-pg`'s stores call when
+/// minting `created_at` (`crates/acdp-registry-sqlite/src/store.rs:1001`,
+/// `crates/acdp-registry-pg/src/store.rs:897`) -- reachable here as a pure
+/// function of a `DateTime<Utc>`, with no server/store/auth needed.
+///
+/// Per vector: truncate `registry_clock_at_acceptance` (or, when absent,
+/// `example_created_at` itself -- for those vectors the pinned timestamp
+/// IS the un-truncated "registry clock reading") with `trunc_ms`, and
+/// compare against `example_created_at`. `"conformant"` vectors must
+/// truncate back to exactly `example_created_at`; `"non-conformant"`
+/// vectors must NOT -- proving both that `trunc_ms` reproduces the
+/// canonical form a conformant registry emits, and that it floors rather
+/// than rounds (vector 5: `.1235` truncates to `.123`, never rounds up to
+/// the vector's own, non-conformant `.124`).
+#[test]
+fn can007_registry_created_at_millisecond_truncation() {
+    let Some(fixtures) = spec_fixtures() else {
+        eprintln!(
+            "conformance: ACDP_SPEC_DIR unset or no fixtures resolvable; skipping can-007 (set \
+             ACDP_REQUIRE_CONFORMANCE to make this a hard failure)"
+        );
+        return;
+    };
+    let Some(fx) = find_fixture_by_id(&fixtures, "can-007") else {
+        return;
+    };
+    let vectors = fx["vectors"]
+        .as_array()
+        .unwrap_or_else(|| panic!("can-007: vectors missing or not an array: {fx}"));
+    let expected_len = EXPECTED_CAN_VECTOR_COUNT - EXPECTED_CAN_HASH_VECTOR_COUNT;
+    assert_eq!(
+        vectors.len(),
+        expected_len,
+        "can-007 must carry exactly {expected_len} vectors at spec pin 417211f: {fx}"
+    );
+
+    for (i, v) in vectors.iter().enumerate() {
+        let ctx = format!("can-007 vector {i} ({})", v["name"].as_str().unwrap_or("?"));
+        let example_str = v["example_created_at"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{ctx}: example_created_at missing or not a string: {v}"));
+        let example = parse_rfc3339_utc(example_str, &ctx);
+        let clock_reading_str = v
+            .get("registry_clock_at_acceptance")
+            .and_then(Value::as_str)
+            .unwrap_or(example_str);
+        let clock_reading = parse_rfc3339_utc(clock_reading_str, &ctx);
+        let truncated = acdp::time::trunc_ms(clock_reading);
+
+        let compliance = v["expected"]["registry_compliance"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{ctx}: expected.registry_compliance missing: {v}"));
+        match compliance {
+            "conformant" => assert_eq!(
+                truncated, example,
+                "{ctx}: trunc_ms(registry clock reading) must reproduce example_created_at for \
+                 a conformant vector"
+            ),
+            "non-conformant" => assert_ne!(
+                truncated, example,
+                "{ctx}: trunc_ms(registry clock reading) must NOT reproduce example_created_at \
+                 for a non-conformant vector -- the vector's own timestamp is the wrong-\
+                 precision or wrong-rounding form a conformant registry must never emit"
+            ),
+            other => panic!("{ctx}: unrecognized registry_compliance {other:?}: {v}"),
+        }
+    }
+}
+
 // ─── Phase 1: harness fidelity gates ───
 
 /// A fixture whose `applies_to_profiles` is disjoint from `HARNESS_PROFILES`
@@ -1761,6 +2189,19 @@ fn fixture_family_panics_naming_file_when_id_missing() {
 /// `anc003_empty_anchors_array_is_rejected_with_established_ordering`, same
 /// precedent as `wit`. `anc`'s *classification* here is unchanged — it was
 /// never `EXCUSED` and still isn't; only its *coverage* changed.
+///
+/// `can` (RFC-ACDP-0001 canonicalization & hashing) is the same story:
+/// still classified "non-HTTP fixture" by the generic replay harness (no
+/// can-* fixture carries a request/response shape), but now has DIRECT
+/// fixture-driven coverage (REG-10 Phase 7,
+/// `plans/reg10-conformance-and-ci-hygiene.md`) via
+/// `can_vectors_reproduce_canonical_form_and_hash` (30 of the family's 35
+/// vectors, across 11 of its 12 fixtures) and
+/// `can007_registry_created_at_millisecond_truncation` (the remaining 5,
+/// can-007's registry-clock-truncation table). `can` was never `EXCUSED`
+/// either — all 12 of its ids sit in `acdp-registry-core`'s
+/// `required_fixtures`, which makes it mechanically inexcusable under rule
+/// 1 below — so again only its *coverage* changed, not its classification.
 const KNOWN_FAMILIES: &[&str] = &[
     "anc",
     "body",

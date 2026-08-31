@@ -8,6 +8,51 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`can-*` (RFC-ACDP-0001 canonicalization & hashing) moves from zero
+  coverage to direct, fixture-driven coverage of all 35 vectors across all
+  12 fixtures** (`REG-10` Phase 7). None of `can-*` is HTTP-replayable —
+  the family carries no request/response shape at all — yet all 12 ids sit
+  in the pinned spec's `acdp-registry-core.required_fixtures`, which makes
+  `can` mechanically inexcusable under this file's `EXCUSED` ratchet. Two
+  new tests in `conformance.rs` consume every fixture's own data directly,
+  same precedent as `anc`/`wit`:
+  `can_vectors_reproduce_canonical_form_and_hash` covers 30 of the 35
+  vectors (can-001 through can-006, can-008 through can-012) by driving
+  `acdp::crypto`'s public JCS surface directly —
+  `canonical_preimage` for the Body/`content_hash`-shaped vectors,
+  `canonicalize_value` for can-011's bare numeric-formatting objects (not
+  ACDP bodies, so the Body-specific exclusion-set path is the wrong tool)
+  and can-001's three `canonical_form`-only vectors, and
+  `derive_lineage_id` for can-001's three `lineage_id`-only vectors. `can-001`
+  alone packs three distinct `expected` shapes into its 7 vectors; a naive
+  hash-equality loop would have silently covered only one of them.
+  `can-006`'s two divergent-precision vectors are additionally asserted to
+  produce different `canonical_form`/hash from each other, not just to
+  each independently match their own pinned value. The second new test,
+  `can007_registry_created_at_millisecond_truncation`, covers the
+  remaining 5 — can-007 alone carries no `input`/hash at all, just a
+  `registry_compliance` table keyed off example timestamps — by driving
+  `acdp::time::trunc_ms` directly, the actual function
+  `acdp-registry-sqlite`/`acdp-registry-pg` call when minting
+  `created_at`, proving both that it reproduces the canonical millisecond
+  form and that it floors rather than rounds. An explicit
+  `EXPECTED_CAN_HASH_VECTOR_COUNT`/`EXPECTED_CAN_VECTOR_COUNT` pair (30 and
+  35) guards against the vacuous-pass failure mode where a loop silently
+  iterates zero vectors and passes green; proven by mutation on three
+  fixtures (can-001, can-002, can-011), each of which fails when its
+  `sha256_hex` is corrupted and passes again once restored. Both new tests'
+  doc comments record the tension with this file's own anc-004 precedent
+  (`conformance.rs`'s module doc-comment already argues against re-testing
+  an upstream crate's golden vectors): most of `can`'s vectors do exactly
+  that, but the coverage ratchet makes `can` inexcusable regardless, and
+  the conformance claim is about this binary, not about which crate owns
+  the tested code. No new dependency: `acdp::crypto` already re-exports
+  `acdp_crypto`'s `canonicalize_value`/`canonical_preimage`/
+  `derive_lineage_id`, and `acdp::time::trunc_ms` was already reachable.
+  `KNOWN_FAMILIES`'s doc comment and the module doc-comment both gain a
+  `can` paragraph mirroring the existing `anc` one — classification
+  unchanged (still "non-HTTP fixture"), only coverage changed.
+
 - **The witness aggregator's reject-then-no-write path is now directly
   tested** (`REG-10` Phase 4, GitHub issue #112). `witness.rs`'s
   `verify_and_store` was split at the point right after DID resolution:
