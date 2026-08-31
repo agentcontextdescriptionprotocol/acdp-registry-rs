@@ -262,3 +262,28 @@ public-API-contract changes, mirroring how the prior wave routed OQ2 (the witnes
 - **Blast radius if wrong:** none beyond the item above; this is bookkeeping on the same
   change.
 - **Status:** UNCONFIRMED
+
+### Memory `test` leg ships without an anti-vacuity guard (Phase 2)
+- **Plan:** plans/reg10-conformance-and-ci-hygiene.md
+- **Assumed:** the `cargo test (memory)` leg's value is that it links and runs the binary's
+  harness under the memory cfg; the load-bearing half of #109's fix is the `clippy (memory)`
+  leg's `--all-targets` compile, which cannot go vacuous.
+- **Chose:** shipped the leg with no assertion on its own test count. Today it runs 40 tests
+  (37 unit + 2 from `tests/anchors_uri_never_dereferenced.rs` + 1 from
+  `tests/conformance_gate.rs`). `conformance.rs`, `http_integration.rs` and
+  `metrics_integration.rs` each run 0, all being `#![cfg(feature = "storage-sqlite")]`;
+  `pg_integration.rs` also runs 0, but because it is `#![cfg(feature = "storage-pg")]`
+  (`tests/pg_integration.rs:20`). If someone later adds a `storage-sqlite` cfg gate to
+  `anchors_uri_never_dereferenced.rs`, the leg silently drops to 37 with no signal.
+- **Alternatives:** (a) reuse `tests/conformance_gate.rs` by setting
+  `ACDP_REQUIRE_CONFORMANCE` on the new memory step — rejected because it does not work:
+  that guard asserts `cfg!(feature = "storage-sqlite")` is *on*
+  (`tests/conformance_gate.rs:15`), so pointing it at the memory leg would make the leg
+  fail, not guard it. A correct guard needs a new always-compiled test file asserting its
+  own presence — a source change outside this phase's scope, which is CI plumbing only;
+  (b) assert a hardcoded test count — rejected, it turns every legitimate new test into a
+  CI failure.
+- **Blast radius if wrong:** low and slow. The compile/lint coverage survives regardless; only
+  the run-the-harness half could erode, and only via a future edit that adds a sqlite cfg gate
+  to a currently-ungated test file.
+- **Status:** UNCONFIRMED

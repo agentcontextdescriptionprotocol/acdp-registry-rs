@@ -53,6 +53,11 @@ jobs:
           cargo clippy -p acdp-registry-server \
             --features storage-sqlite,playground \
             --all-targets -- -D warnings
+      - name: clippy (memory)
+        run: |
+          cargo clippy -p acdp-registry-server \
+            --no-default-features --features storage-memory \
+            --all-targets -- -D warnings
 
   # The workspace declares rust-version = 1.88; make that claim enforceable
   # instead of aspirational. Checks both shipped storage backends.
@@ -127,6 +132,10 @@ jobs:
           cargo test -p acdp-registry-server \
             --no-default-features --features storage-pg \
             --test pg_integration
+      - name: cargo test (memory)
+        run: |
+          cargo test -p acdp-registry-server \
+            --no-default-features --features storage-memory
 
   # Runs the spec conformance suite against a SHA-pinned spec checkout.
   # ACDP_REQUIRE_CONFORMANCE turns a missing spec into a hard failure, so

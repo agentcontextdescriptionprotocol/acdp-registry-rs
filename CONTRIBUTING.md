@@ -24,6 +24,8 @@ Run the feature-flag variants if you touched the server binary or its callers:
 cargo clippy -p acdp-registry-server --no-default-features --features storage-pg --all-targets -- -D warnings
 cargo clippy -p acdp-registry-server --features storage-sqlite,playground   --all-targets -- -D warnings
 cargo test   -p acdp-registry-server --features storage-sqlite,playground
+cargo clippy -p acdp-registry-server --no-default-features --features storage-memory --all-targets -- -D warnings
+cargo test   -p acdp-registry-server --no-default-features --features storage-memory
 ```
 
 CI additionally gates PRs on checks you can reproduce locally:
