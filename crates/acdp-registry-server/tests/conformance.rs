@@ -52,15 +52,51 @@
 //!     fixtures: a per-scenario router rebuild driven by
 //!     `registry_capabilities_subset.anonymous_public_reads`, and ctx_id
 //!     substitution reaching QUERY STRINGS in both raw and percent-encoded
-//!     form (`vis-005`'s `?derived_from=<ctx_id>`).
+//!     form (`vis-005`'s `?derived_from=<ctx_id>`). As of Phase 9c,
+//!     `vis-008` (5 scenarios) joins them: `setup.lineages` — two
+//!     two-version lineages, seeded through REAL supersede-chained
+//!     publishes (never a direct store write) — and a THIRD substitution
+//!     table, `fixture_lineage_id → minted_lineage_id`, alongside the
+//!     ctx_id and DID tables. `GET /lineages/{lineage_id}` and
+//!     `/lineages/{lineage_id}/current` carry two response shapes no
+//!     earlier phase needed: a bare JSON array of `FullContext` (asserted
+//!     empty, explicitly, for the restricted-lineage-stranger scenario —
+//!     not merely inferred from a zero count), and a single `FullContext`
+//!     object with singular `ctx_id` + nested `registry_state.status` (the
+//!     `/current` shape). `status` (`active`/`superseded`) is never a seed
+//!     input — it's computed by the registry from the supersession, and
+//!     asserted as such (see [`replay_shape_d`]'s `want_status_by_ctx`
+//!     cross-check). Vacuity note: TWO of `vis-008`'s five scenarios are
+//!     "vacuum-passable" — their expected response is indistinguishable
+//!     from what an unknown, never-seeded `lineage_id` would ALSO produce,
+//!     were the `lineage_id` substitution to silently no-op. Scenario 0
+//!     expects `{status: 200, body: [], matches_ctx_ids: []}` from
+//!     `GET /lineages/{id}`, which is exactly what an unknown lineage
+//!     returns too (the store's `lineage()` query yields an empty `Vec`,
+//!     never a `NotFound`). Scenario 3 expects `{status: 404,
+//!     error_code: "not_found"}` from `GET /lineages/{id}/current`, which
+//!     is exactly what an unknown lineage's `/current` also returns (`None`
+//!     from the same empty-lineage path, mapped to `NotFound` by the
+//!     handler). For these two scenarios, [`assert_substitution_sound`]'s
+//!     positive-substitution proof is the SOLE guard against a silently
+//!     broken `lineage_id` substitution passing green; see its doc comment
+//!     for the full mechanism and the removal-proof that backs this claim.
 //!   * **Skipped — requires pre-seeded state** — `idem-*` and other
 //!     fixtures whose `setup`/`preconditions` (top-level or under `input`)
 //!     need a context with a specific registry-assigned `ctx_id` the publish
-//!     API won't let us mint, PLUS the `vis-*`/`ret-*` fixtures whose
-//!     `setup` shape Shape D doesn't recognize at all (`setup.lineages` —
-//!     `vis-008`, `ret-002`). As of Phase 9b, `vis-001`, `vis-002`,
-//!     `vis-004`, `vis-005`, `vis-006`, and `vis-009` have all escaped this
-//!     bucket via Shape D (below).
+//!     API won't let us mint, PLUS `ret-002`, excluded from
+//!     [`parse_seed_lineage_version`] for two independent reasons: its
+//!     `setup.lineages` entries carry no `visibility` key at all (unlike
+//!     `vis-008`'s) — a REQUIRED key that's absent, not an unrecognized one
+//!     that was rejected — and separately, one entry carries an `expires_at`
+//!     key, which genuinely IS outside the recognized set. Either reason
+//!     alone would keep it unparseable — AND ret-002's first
+//!     lineage requires an "abnormal state: every version is superseded"
+//!     (the fixture's own words) that is structurally unreachable through
+//!     real publishes: publishing v2 always makes v2 (not v1) the active
+//!     head. As of Phase 9b, `vis-001`, `vis-002`, `vis-004`, `vis-005`,
+//!     `vis-006`, and `vis-009` had escaped this bucket via Shape D; as of
+//!     Phase 9c, `vis-008` joins them too (`ret-002` remains).
 //!   * **Skipped — Shape D: unrecognized scenario/expected key** — `vis-007`
 //!     alone, as of Phase 9b: Shape D CAN seed it (its `setup` fully
 //!     parses), but scenario 2 carries no `status`/`http_status` at all
@@ -105,8 +141,16 @@
 //!     handling), mints a per-scenario bearer from `effective_requester_did`
 //!     (no `Authorization` header when it's `null`), and rebuilds the router
 //!     when a scenario's `registry_capabilities_subset` overrides
-//!     `anonymous_public_reads`. A fixture whose seeding shape or scenario
-//!     assertions Shape D doesn't yet recognize (`setup.lineages`; a
+//!     `anonymous_public_reads`. As of Phase 9c it ALSO seeds
+//!     `setup.lineages` — two-or-more-version lineages, chained through REAL
+//!     `supersede_body()` publishes in `version`-ascending order (never a
+//!     direct store write) — building a THIRD substitution table,
+//!     `fixture_lineage_id → minted_lineage_id`, alongside `ctx_map` and
+//!     `did_map`; see `SeedLineage`/`SeedLineageVersion` and
+//!     [`replay_shape_d`]'s lineage-seeding pass. A fixture whose seeding
+//!     shape or scenario assertions Shape D doesn't yet recognize (`ret-002`'s
+//!     `setup.lineages` shape — missing `visibility`, an `expires_at` key,
+//!     and an all-superseded lineage no real publish sequence can produce; a
 //!     scenario with no `status`/`http_status` at all, as in `vis-007`
 //!     scenario 2; …) is deliberately left to
 //!     `unseeded_precondition_reason`'s skip path rather than partially
@@ -420,8 +464,10 @@ enum Extracted {
 // dispatch block for *why* it runs ahead of Shape B.
 
 /// One `setup.context_published` / one element of `setup.contexts_published`
-/// — the two seeding shapes this phase handles. `setup.lineages` (`vis-008`)
-/// is deliberately NOT modeled here; see [`parse_seed_plan`].
+/// — two of the three seeding shapes this phase handles. `setup.lineages`
+/// (`vis-008`) is a distinct third shape, modeled by [`SeedLineage`] /
+/// [`SeedLineageVersion`] instead — see [`parse_seed_plan`] and
+/// [`parse_seed_lineages`].
 #[derive(Debug, Clone)]
 struct SeedContext {
     /// The fixture's own literal `ctx_id` — never mintable as-is
@@ -445,6 +491,53 @@ struct SeedContext {
     /// "per-scenario mutation of the seeded row" framing rather than an
     /// identity swap.
     contributors: Vec<String>,
+}
+
+/// One element of `setup.lineages[].versions[]` (REG-10 Phase 9c, `vis-008`).
+/// Unlike [`SeedContext`], this is never published standalone — every
+/// version after the first is chained onto the previous one via
+/// `Producer::supersede_body`, in [`SeedLineage::versions`]'s ascending
+/// order — so the fixture's own `supersedes` linkage is never read; version
+/// order alone determines it.
+#[derive(Debug, Clone)]
+struct SeedLineageVersion {
+    /// The fixture's own literal `ctx_id`, same substitution contract as
+    /// [`SeedContext::fixture_ctx_id`].
+    fixture_ctx_id: String,
+    /// The fixture's own `version` field — NOT the registry-assigned
+    /// version (this seed shape has no other way to express order; there is
+    /// no explicit `supersedes` key in the corpus). [`parse_seed_lineage`]
+    /// sorts a lineage's versions by this field before anything is
+    /// published, so publish order always matches ascending `version`
+    /// regardless of the fixture's own array order.
+    version: u64,
+    visibility: String,
+    audience: Vec<String>,
+    agent_id: Option<String>,
+    /// The fixture's own `status` literal (`active` / `superseded` / …).
+    /// This is an EXPECTATION the registry's supersession computes from
+    /// publish order — never an input to the seed publish itself (there is
+    /// no field on `PublishRequest` that sets it). [`replay_shape_d`]
+    /// cross-checks it against what the registry actually returns; it is
+    /// never applied at seed time.
+    want_status: String,
+}
+
+/// One `setup.lineages[]` element (REG-10 Phase 9c) — a lineage seeded as a
+/// chain of REAL, supersede-linked publishes, never a direct store write.
+#[derive(Debug, Clone)]
+struct SeedLineage {
+    /// The fixture's own literal `lineage_id` (e.g. `lin:sha256:aaaa…`) —
+    /// not derivable, so every request path referencing it must be
+    /// rewritten through the THIRD substitution map [`replay_shape_d`]
+    /// builds (`lineage_map`), on top of `ctx_map` and `did_map`.
+    fixture_lineage_id: String,
+    /// Ascending by [`SeedLineageVersion::version`] — sorted by
+    /// [`parse_seed_lineage`], so out-of-file-order fixtures still chain
+    /// correctly and, more importantly, so a MUTATED fixture that swaps two
+    /// versions' `version` fields genuinely reverses the supersession order
+    /// this phase's mutation-proof test relies on.
+    versions: Vec<SeedLineageVersion>,
 }
 
 /// One HTTP exchange inside a Shape D plan: either one element of a
@@ -477,6 +570,25 @@ struct ShapeDScenario {
     /// [`replay_shape_d`] runs, this field is inert. Always empty for the
     /// single-exchange (`vis-006`) shape, which has no `request` at all.
     contributors_for_seed: Vec<String>,
+    /// REG-10 Phase 9c: `expected.body == []`, asserted EXPLICITLY (a
+    /// literal-equality check against the whole response body) rather than
+    /// inferred from `want_matches_ctx_ids` being an empty set — the
+    /// module doc-block's `vis-008` vacuity note: an unknown/unsubstituted
+    /// `lineage_id` also 200s with an empty array, so a set-emptiness
+    /// check alone cannot distinguish "substitution worked and correctly
+    /// found nothing visible" from "substitution silently no-op'd against
+    /// a nonexistent lineage". See [`replay_shape_d`]'s lineage_map
+    /// positive-substitution-proof for the other half of that guard.
+    want_body_empty_array: bool,
+    /// REG-10 Phase 9c: `expected.ctx_id` (singular) — the
+    /// `GET /lineages/{id}/current` response shape, a single `FullContext`
+    /// object rather than a search-style `{matches: [...]}` envelope.
+    /// Translated through `ctx_map` at replay time, same as
+    /// `want_matches_ctx_ids`.
+    want_ctx_id: Option<String>,
+    /// REG-10 Phase 9c: `expected.registry_state.status` — nested one level,
+    /// unlike every other status-shaped assertion in this file.
+    want_registry_state_status: Option<String>,
 }
 
 /// A fully-parsed, fully-understood Shape D fixture: every `setup` entry
@@ -485,6 +597,11 @@ struct ShapeDScenario {
 #[derive(Debug, Clone)]
 struct ShapeDPlan {
     seeds: Vec<SeedContext>,
+    /// REG-10 Phase 9c: `setup.lineages` — mutually exclusive with `seeds`
+    /// in every fixture at this pin (a fixture carries one seeding shape or
+    /// the other, never both), but modeled as a second field rather than an
+    /// enum so `replay_shape_d` can seed either or both without a match.
+    lineages: Vec<SeedLineage>,
     scenarios: Vec<ShapeDScenario>,
 }
 
@@ -542,8 +659,8 @@ fn parse_seed_context(v: &Value) -> Option<SeedContext> {
 /// Parse `setup` into seed contexts. `None` when `setup` carries anything
 /// other than exactly one of `context_published` (object) /
 /// `contexts_published` (array) — in particular `setup.lineages`
-/// (`vis-008`), which is Phase 9c's job and must keep skipping via
-/// `unseeded_precondition_reason` until then.
+/// (`vis-008`, `ret-002`), a structurally different seed shape parsed by
+/// [`parse_seed_lineages`] instead.
 fn parse_seed_plan(setup: &Value) -> Option<Vec<SeedContext>> {
     let obj = setup.as_object()?;
     const KNOWN: &[&str] = &["context_published", "contexts_published"];
@@ -555,6 +672,106 @@ fn parse_seed_plan(setup: &Value) -> Option<Vec<SeedContext>> {
         (None, Some(Value::Array(list))) => list.iter().map(parse_seed_context).collect(),
         _ => None,
     }
+}
+
+/// Parse one `setup.lineages[].versions[]` element. `None` when it carries
+/// any key outside the recognized set, OR — the mechanism that structurally
+/// excludes `ret-002` without naming it — when `visibility` is absent.
+/// `ret-002`'s lineage versions carry no `visibility` key at all (unlike
+/// `vis-008`'s), and one carries an `expires_at` key this phase doesn't
+/// model; both independently fail this parse, the same way
+/// [`parse_seed_context`] already requires `visibility` for
+/// `context_published` / `contexts_published`. `status` is recognized and
+/// captured as [`SeedLineageVersion::want_status`] — an EXPECTATION the
+/// registry's supersession computes, never applied as a seed input (there
+/// is no field on `PublishRequest` that would accept it).
+fn parse_seed_lineage_version(v: &Value) -> Option<SeedLineageVersion> {
+    let obj = v.as_object()?;
+    const KNOWN: &[&str] = &[
+        "ctx_id",
+        "version",
+        "visibility",
+        "audience",
+        "agent_id",
+        "status",
+    ];
+    if obj.keys().any(|k| !KNOWN.contains(&k.as_str())) {
+        return None;
+    }
+    let fixture_ctx_id = obj.get("ctx_id")?.as_str()?.to_string();
+    let version = obj.get("version")?.as_u64()?;
+    let visibility = obj.get("visibility")?.as_str()?.to_string();
+    let agent_id = obj
+        .get("agent_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let audience = obj
+        .get("audience")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let want_status = obj.get("status")?.as_str()?.to_string();
+    Some(SeedLineageVersion {
+        fixture_ctx_id,
+        version,
+        visibility,
+        audience,
+        agent_id,
+        want_status,
+    })
+}
+
+/// Parse one `setup.lineages[]` element. `None` (via `Option`'s
+/// `FromIterator`) as soon as any single version fails
+/// [`parse_seed_lineage_version`], or when `versions` is missing/empty —
+/// same parse-all-or-nothing discipline as [`parse_scenarios_array`].
+/// Versions are sorted ascending by [`SeedLineageVersion::version`] here,
+/// once, so every downstream consumer (seeding order in
+/// [`replay_shape_d`], the mutation-proof test) sees the same order.
+fn parse_seed_lineage(v: &Value) -> Option<SeedLineage> {
+    let obj = v.as_object()?;
+    const KNOWN: &[&str] = &["lineage_id", "note", "versions"];
+    if obj.keys().any(|k| !KNOWN.contains(&k.as_str())) {
+        return None;
+    }
+    let fixture_lineage_id = obj.get("lineage_id")?.as_str()?.to_string();
+    let mut versions: Vec<SeedLineageVersion> = obj
+        .get("versions")?
+        .as_array()?
+        .iter()
+        .map(parse_seed_lineage_version)
+        .collect::<Option<Vec<_>>>()?;
+    if versions.is_empty() {
+        return None;
+    }
+    versions.sort_by_key(|v| v.version);
+    Some(SeedLineage {
+        fixture_lineage_id,
+        versions,
+    })
+}
+
+/// Parse `setup.lineages` (REG-10 Phase 9c). `None` when `setup` carries
+/// anything other than exactly `lineages` (an array), when that array is
+/// empty, or when any element fails [`parse_seed_lineage`] —
+/// `ret-002` fails here structurally (see that function's doc comment), not
+/// by name.
+fn parse_seed_lineages(setup: &Value) -> Option<Vec<SeedLineage>> {
+    let obj = setup.as_object()?;
+    const KNOWN: &[&str] = &["lineages"];
+    if obj.keys().any(|k| !KNOWN.contains(&k.as_str())) {
+        return None;
+    }
+    let arr = obj.get("lineages")?.as_array()?;
+    if arr.is_empty() {
+        return None;
+    }
+    arr.iter().map(parse_seed_lineage).collect()
 }
 
 /// The parts of an `expected` object Shape D actually asserts on. Returned
@@ -604,6 +821,14 @@ struct ParsedExpected {
     /// context) that `matches_count` alone cannot: exactly what `vis-005`'s
     /// two same-agent seeds need this phase to actually distinguish.
     matches_ctx_ids: Option<Vec<String>>,
+    /// REG-10 Phase 9c: `expected.body == []` (`vis-008` scenario 0) —
+    /// see [`ShapeDScenario::want_body_empty_array`].
+    body_empty_array: bool,
+    /// REG-10 Phase 9c: `expected.ctx_id` (singular) — the
+    /// `GET /lineages/{id}/current` response shape.
+    ctx_id: Option<String>,
+    /// REG-10 Phase 9c: `expected.registry_state.status`, nested one level.
+    registry_state_status: Option<String>,
 }
 
 /// Parse an `expected` object shared by both scenario forms. Returns
@@ -639,6 +864,10 @@ fn parse_expected(expected: &Value) -> Option<ParsedExpected> {
         "rationale",
         "implementer_note",
         "notes",
+        // REG-10 Phase 9c (`vis-008`): the lineage-endpoint response shapes.
+        "body",
+        "ctx_id",
+        "registry_state",
     ];
     if obj.keys().any(|k| !RECOGNIZED.contains(&k.as_str())) {
         return None;
@@ -652,6 +881,33 @@ fn parse_expected(expected: &Value) -> Option<ParsedExpected> {
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .collect::<Vec<_>>()
         });
+    // `expected.body` is recognized ONLY in its one observed shape (an
+    // empty array, `vis-008` scenario 0's "stranger sees zero versions, but
+    // it's 200 + [] not 404"). Any other `body` shape fails the parse
+    // rather than being silently ignored -- same discipline as every other
+    // allowlisted key in this function.
+    let body_empty_array = match obj.get("body") {
+        None => false,
+        Some(Value::Array(a)) if a.is_empty() => true,
+        Some(_) => return None,
+    };
+    let ctx_id = expected
+        .get("ctx_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    // `expected.registry_state` is recognized only as exactly
+    // `{"status": "..."}` -- any other shape (e.g. a future fixture nesting
+    // `lifecycle_events` there too) fails the parse.
+    let registry_state_status = match obj.get("registry_state") {
+        None => None,
+        Some(v) => {
+            let rs_obj = v.as_object()?;
+            if rs_obj.len() != 1 {
+                return None;
+            }
+            Some(rs_obj.get("status")?.as_str()?.to_string())
+        }
+    };
     Some(ParsedExpected {
         status,
         error_code: want_error_code(expected),
@@ -659,6 +915,9 @@ fn parse_expected(expected: &Value) -> Option<ParsedExpected> {
         match_summary_contains: expected.get("match_summary_contains").cloned(),
         total_estimate: expected.get("total_estimate").and_then(Value::as_u64),
         matches_ctx_ids,
+        body_empty_array,
+        ctx_id,
+        registry_state_status,
     })
 }
 
@@ -689,6 +948,9 @@ fn parse_single_exchange_scenario(fx: &Value) -> Option<ShapeDScenario> {
         want_total_estimate: expected.total_estimate,
         want_matches_ctx_ids: expected.matches_ctx_ids,
         contributors_for_seed: Vec::new(),
+        want_body_empty_array: expected.body_empty_array,
+        want_ctx_id: expected.ctx_id,
+        want_registry_state_status: expected.registry_state_status,
     })
 }
 
@@ -818,6 +1080,9 @@ fn parse_scenarios_array(scenarios: &[Value]) -> Option<Vec<ShapeDScenario>> {
                 want_total_estimate,
                 want_matches_ctx_ids: expected.matches_ctx_ids,
                 contributors_for_seed,
+                want_body_empty_array: expected.body_empty_array,
+                want_ctx_id: expected.ctx_id,
+                want_registry_state_status: expected.registry_state_status,
             })
         })
         .collect()
@@ -831,15 +1096,27 @@ fn parse_scenarios_array(scenarios: &[Value]) -> Option<Vec<ShapeDScenario>> {
 /// A fixture only ever reaches [`replay_shape_d`] once both call sites
 /// agree it parses.
 fn parse_shape_d(fx: &Value) -> Option<ShapeDPlan> {
-    let mut seeds = parse_seed_plan(fx.get("setup")?)?;
+    let setup = fx.get("setup")?;
+    // Exactly one of the three seeding shapes: `context_published` /
+    // `contexts_published` (`parse_seed_plan`) or `lineages`
+    // (`parse_seed_lineages`, REG-10 Phase 9c). No pinned fixture mixes
+    // them, so trying the flat-context shape first and falling back to
+    // lineages is unambiguous -- `parse_seed_plan` itself returns `None`
+    // immediately on a `setup` object whose only key is `lineages` (outside
+    // its own `KNOWN` allowlist), so this never silently prefers the wrong
+    // shape.
+    let (mut seeds, lineages) = match parse_seed_plan(setup) {
+        Some(seeds) => (seeds, Vec::new()),
+        None => (Vec::new(), parse_seed_lineages(setup)?),
+    };
     // `contexts_published: []` parses to `Some(vec![])` in `parse_seed_plan`
     // -- that shape is a syntactically valid (if useless) seed list, not a
     // parse failure. But `replay_shape_d` asserts its `ctx_map` is
-    // non-empty afterward, so a plan with zero seeds must never reach it:
-    // treat it the same as an unrecognized seed shape here (`None`), which
-    // routes the fixture to `extract()`'s skip path with its own distinct
-    // reason instead of panicking mid-replay.
-    if seeds.is_empty() {
+    // non-empty afterward, so a plan with zero seeds AND zero lineages must
+    // never reach it: treat it the same as an unrecognized seed shape here
+    // (`None`), which routes the fixture to `extract()`'s skip path with
+    // its own distinct reason instead of panicking mid-replay.
+    if seeds.is_empty() && lineages.is_empty() {
         return None;
     }
     let scenarios = if let Some(arr) = fx.get("scenarios").and_then(Value::as_array) {
@@ -903,7 +1180,11 @@ fn parse_shape_d(fx: &Value) -> Option<ShapeDPlan> {
         }
     }
 
-    Some(ShapeDPlan { seeds, scenarios })
+    Some(ShapeDPlan {
+        seeds,
+        lineages,
+        scenarios,
+    })
 }
 
 /// A signing producer whose `agent_id` is exactly `did` -- used both for a
@@ -911,6 +1192,19 @@ fn parse_shape_d(fx: &Value) -> Option<ShapeDPlan> {
 /// needed, e.g. `vis-006`/`vis-007`'s `did:web:agents.example.com:test-producer`)
 /// and for a freshly-minted substitute (`did:web:agents.test:shape-d-{seed}`).
 /// `seed` only needs to be distinct per producer within one fixture replay.
+///
+/// Known harness-fidelity limitation (`vis-008`, REG-10 Phase 9c):
+/// [`replay_shape_d`]'s lineage-seeding loop calls this once PER VERSION,
+/// incrementing `seed_seq` each time, rather than minting one `Producer`
+/// per `agent_id` and reusing it across a lineage's versions -- so lineage
+/// a's v1 and v2 end up signed by DIFFERENT keys under one `agent_id`. A
+/// shared `Producer` per `agent_id` would be the strictly more faithful
+/// construction. This is invisible only because playground mode skips
+/// signature verification. It does not weaken `vis-008` today: `vis-008`
+/// is a retrieval-visibility fixture, no scenario turns on key identity,
+/// and the producer-continuity gate (`conformance_gate.rs`) has been
+/// proven to run under playground. If the harness ever ran with playground
+/// off, this would need fixing to keep the seed path honest.
 fn shape_d_producer(did: &str, seed: u8) -> Producer {
     Producer::new(
         SigningKey::from_bytes(&[seed; 32]),
@@ -951,6 +1245,81 @@ fn substitute_ctx_ids_in_path(
     out
 }
 
+/// Substitution-soundness check shared by every id-substitution table Shape
+/// D builds -- `ctx_map`, and (REG-10 Phase 9c) `lineage_map`:
+///   1. no literal fixture id (raw or percent-encoded) survives into the
+///      built request path;
+///   2. POSITIVE proof -- whenever the scenario's ORIGINAL path referenced
+///      a fixture id at all, the built path now carries its minted
+///      replacement.
+///
+/// (2) is what actually catches a substitution that silently no-ops, as
+/// opposed to merely "nothing survived because there was nothing to
+/// substitute in the first place". This matters because `vis-008` carries
+/// TWO scenarios whose expected response is indistinguishable from what an
+/// UNKNOWN/unsubstituted `lineage_id` would ALSO produce -- for each, this
+/// function is the ONLY thing standing between a silently-broken
+/// substitution and a green run:
+///
+///   * **Scenario 0** (`GET /lineages/{id}`, stranger, lineage a) expects
+///     `{status: 200, body: [], matches_ctx_ids: []}`. `GET /lineages/{id}`
+///     on a nonexistent lineage ALSO returns `200` with an empty array --
+///     the store's `lineage()` query (`acdp-registry-sqlite`'s
+///     `store.rs::lineage`) just returns an empty `Vec` for a `lineage_id`
+///     that matches no rows, and the handler
+///     (`acdp-registry-core`'s `handlers/context.rs::lineage`) never turns
+///     that into a `NotFound`. So a `lineage_id` substitution that silently
+///     no-ops (leaving the fixture's literal, never-seeded id in the
+///     built path) produces the EXACT SAME `200 + []` this scenario expects
+///     from a correctly-substituted, correctly-filtered request.
+///   * **Scenario 3** (`GET /lineages/{id}/current`, stranger, lineage b)
+///     expects `{status: 404, error_code: "not_found"}` because the true
+///     head is `private`. An UNKNOWN lineage's `/current` ALSO 404s with
+///     `not_found`: `acdp-server`'s `RegistryServer::current` returns
+///     `None` when `self.store.lineage(lineage_id)` comes back empty (same
+///     empty-`Vec` path as scenario 0), and
+///     `handlers/context.rs::current` maps that `None` straight to
+///     `RegistryError::Acdp(AcdpError::NotFound(..))`. So a no-op
+///     `lineage_id` substitution here produces the same `404 not_found` a
+///     correct, visibility-driven 404 would.
+///
+/// Scenarios 1, 2, and 4 are NOT exposed to this gap -- each asserts a
+/// non-empty `matches_ctx_ids` or a singular `ctx_id`/`registry_state.status`
+/// that a query against an unseeded, never-substituted lineage could not
+/// produce, so a broken substitution fails them on its own. Proof: with the
+/// substitution deliberately broken AND this assertion removed, only
+/// scenarios 1, 2, and 4 fail -- scenarios 0 and 3 pass silently. This
+/// check is independent of the response body, so it closes that gap
+/// regardless of which scenario is being replayed.
+fn assert_substitution_sound(
+    name: &str,
+    original_path: &str,
+    built_path: &str,
+    map: &std::collections::BTreeMap<String, String>,
+    kind: &str,
+) {
+    for (fixture_id, minted_id) in map {
+        let encoded_fixture = pct_encode_path_segment(fixture_id);
+        assert!(
+            !built_path.contains(fixture_id.as_str())
+                && !built_path.contains(encoded_fixture.as_str()),
+            "{name}: fixture {kind} {fixture_id} (raw or percent-encoded) leaked into request \
+             path unsubstituted: {built_path}"
+        );
+        if original_path.contains(fixture_id.as_str())
+            || original_path.contains(encoded_fixture.as_str())
+        {
+            let encoded_minted = pct_encode_path_segment(minted_id);
+            assert!(
+                built_path.contains(minted_id.as_str()) || built_path.contains(encoded_minted.as_str()),
+                "{name}: scenario path {original_path:?} referenced fixture {kind} {fixture_id}, but \
+                 its minted substitute {minted_id} never appears in the built request path \
+                 {built_path:?} -- substitution silently failed"
+            );
+        }
+    }
+}
+
 /// Result of replaying one Shape D plan: how many scenario exchanges
 /// matched their expectation, every mismatch found (empty ⇒ full pass),
 /// and the substitution maps built while seeding -- exposed so the
@@ -963,6 +1332,10 @@ struct ShapeDResult {
     failures: Vec<String>,
     ctx_map: std::collections::BTreeMap<String, String>,
     did_map: std::collections::BTreeMap<String, String>,
+    /// REG-10 Phase 9c: `fixture_lineage_id -> minted_lineage_id`, built
+    /// only when `plan.lineages` is non-empty. Empty (not just unchecked)
+    /// for every pre-Phase-9c fixture.
+    lineage_map: std::collections::BTreeMap<String, String>,
 }
 
 /// Replay one Shape D plan end-to-end.
@@ -1025,6 +1398,25 @@ async fn replay_shape_d(name: &str, plan: &ShapeDPlan) -> ShapeDResult {
                 mint_seq = mint_seq.wrapping_add(1);
                 minted
             });
+        }
+    }
+    // REG-10 Phase 9c: lineage version `agent_id`s mint through the SAME
+    // pass, the SAME map, before any publish -- `vis-008`'s two lineages
+    // share the single literal `did:agent:owner` across all four versions,
+    // exactly the shared-literal shape the two-pass fix above exists for.
+    for lineage in &plan.lineages {
+        for ver in &lineage.versions {
+            let literal_agent = ver
+                .agent_id
+                .clone()
+                .unwrap_or_else(|| "did:web:agents.test:shape-d-default".to_string());
+            if !literal_agent.starts_with("did:web:") {
+                did_map.entry(literal_agent).or_insert_with(|| {
+                    let minted = format!("did:web:agents.test:shape-d-{mint_seq}");
+                    mint_seq = mint_seq.wrapping_add(1);
+                    minted
+                });
+            }
         }
     }
 
@@ -1111,10 +1503,162 @@ async fn replay_shape_d(name: &str, plan: &ShapeDPlan) -> ShapeDResult {
             .to_string();
         ctx_map.insert(seed.fixture_ctx_id.clone(), minted_ctx);
     }
+
+    // REG-10 Phase 9c: seed every `setup.lineages` entry as a chain of REAL,
+    // supersede-linked publishes -- never a direct store write, and never
+    // faking the `status` the fixture carries (that's an EXPECTATION the
+    // supersession computes, checked below in the scenario loop's
+    // `want_status_by_ctx` cross-check, not an input here). `lineage.versions`
+    // is already sorted ascending by the fixture's own `version` field
+    // (`parse_seed_lineage`), so iterating it in order and calling
+    // `Producer::supersede_body` on each predecessor's freshly-fetched body
+    // reproduces the fixture's intended chain regardless of its file order
+    // -- and, symmetrically, a MUTATED fixture that swaps two versions'
+    // `version` fields genuinely reverses which one gets published first.
+    let mut lineage_map = std::collections::BTreeMap::new();
+    let mut want_status_by_ctx: std::collections::BTreeMap<String, String> = Default::default();
+    for lineage in &plan.lineages {
+        let mut prev_body: Option<acdp::types::body::Body> = None;
+        let mut minted_lineage_id: Option<String> = None;
+        for ver in &lineage.versions {
+            let literal_agent = ver
+                .agent_id
+                .clone()
+                .unwrap_or_else(|| "did:web:agents.test:shape-d-default".to_string());
+            let seeded_agent = did_map
+                .get(&literal_agent)
+                .cloned()
+                .unwrap_or(literal_agent);
+            assert!(
+                seeded_agent.starts_with("did:web:"),
+                "{name}: every seeded lineage version agent_id must be did:web \
+                 (caps().supported_did_methods); got {seeded_agent}"
+            );
+            let producer = shape_d_producer(&seeded_agent, seed_seq);
+            seed_seq = seed_seq.wrapping_add(1);
+
+            let audience: Vec<AgentDid> = ver
+                .audience
+                .iter()
+                .map(|a| AgentDid::new(did_map.get(a).cloned().unwrap_or_else(|| a.clone())))
+                .collect();
+
+            // First version of the lineage: a fresh publish. Every version
+            // after it: a REAL supersession chained from the immediately
+            // preceding version's own just-fetched body -- never faked, and
+            // never targeting anything other than the version this same
+            // loop published one iteration ago (`prev_body` is reassigned
+            // every iteration, right below).
+            let mut builder = match &prev_body {
+                None => producer.publish_request(),
+                Some(prev) => producer.supersede_body(prev),
+            };
+            builder = builder
+                .title(format!("Shape D lineage seed ({name}) v{}", ver.version))
+                .context_type(ContextType::DataSnapshot)
+                .visibility(shape_d_visibility(&ver.visibility));
+            if !audience.is_empty() {
+                builder = builder.audience(audience);
+            }
+            let req = builder.build().unwrap_or_else(|e| {
+                panic!("{name}: Shape D lineage seed request failed to build: {e}")
+            });
+
+            let (status, body) = common::publish(&harness.router, &req, None).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{name}: Shape D lineage seed publish for fixture ctx_id {} (lineage {}) MUST \
+                 succeed -- a failed seed panics, it never skips; body = {body}",
+                ver.fixture_ctx_id,
+                lineage.fixture_lineage_id
+            );
+            let minted_ctx = body["ctx_id"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!("{name}: lineage seed publish response carried no ctx_id: {body}")
+                })
+                .to_string();
+            let minted_lid_here = body["lineage_id"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!("{name}: lineage seed publish response carried no lineage_id: {body}")
+                })
+                .to_string();
+
+            ctx_map.insert(ver.fixture_ctx_id.clone(), minted_ctx.clone());
+            want_status_by_ctx.insert(minted_ctx.clone(), ver.want_status.clone());
+
+            if let Some(existing) = &minted_lineage_id {
+                assert_eq!(
+                    existing, &minted_lid_here,
+                    "{name}: every version of fixture lineage {} MUST mint into the SAME \
+                     lineage_id -- got {existing} then {minted_lid_here}; a real supersession \
+                     chain never changes lineage_id",
+                    lineage.fixture_lineage_id
+                );
+            } else {
+                minted_lineage_id = Some(minted_lid_here);
+            }
+
+            // Fetch the just-published body, as the OWNER, so the NEXT
+            // version (if any) can chain a real `supersede_body()` from it.
+            // Never faked, never a direct store read of internal state --
+            // this is the same public `GET /contexts/{ctx_id}/body` route a
+            // real producer would use.
+            let owner_bearer = common::forged_bearer(
+                &seeded_agent,
+                &format!("{name}-lineage-seed-{minted_ctx}"),
+                300,
+            );
+            let body_resp = harness
+                .router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "/contexts/{}/body",
+                            pct_encode_path_segment(&minted_ctx)
+                        ))
+                        .header("authorization", format!("Bearer {owner_bearer}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                body_resp.status(),
+                StatusCode::OK,
+                "{name}: Shape D must be able to read back its own just-seeded lineage version \
+                 body ({minted_ctx}) as the owner, to chain the next supersession"
+            );
+            let fetched_body: acdp::types::body::Body =
+                serde_json::from_value(body_to_json(body_resp).await).unwrap_or_else(|e| {
+                    panic!("{name}: seeded lineage version body did not parse as acdp::types::body::Body: {e}")
+                });
+            prev_body = Some(fetched_body);
+        }
+        let minted_lineage_id = minted_lineage_id.unwrap_or_else(|| {
+            panic!(
+                "{name}: lineage {} produced no minted lineage_id -- parse_seed_lineage \
+                 guarantees at least one version",
+                lineage.fixture_lineage_id
+            )
+        });
+        lineage_map.insert(lineage.fixture_lineage_id.clone(), minted_lineage_id);
+    }
+
     assert!(
         !ctx_map.is_empty(),
         "{name}: Shape D ctx_id substitution map must be non-empty for every `vis` fixture"
     );
+    if !plan.lineages.is_empty() {
+        assert!(
+            !lineage_map.is_empty(),
+            "{name}: Shape D lineage_id substitution map must be non-empty whenever \
+             setup.lineages is present"
+        );
+    }
 
     let mut current_anon = shape_d_config().auth.anonymous_public_reads;
     let mut ran = 0usize;
@@ -1137,6 +1681,10 @@ async fn replay_shape_d(name: &str, plan: &ShapeDPlan) -> ShapeDResult {
         }
 
         let mut path = substitute_ctx_ids_in_path(&sc.path, &ctx_map);
+        // REG-10 Phase 9c: lineage ids substitute through the SAME raw
+        // text-replace helper -- it never actually inspected ctx_id shape,
+        // only the map it was handed.
+        path = substitute_ctx_ids_in_path(&path, &lineage_map);
         // GET paths may carry a raw `acdp://` ctx_id needing single-segment
         // percent-encoding for axum's `{ctx_id}` matcher -- mirrors the
         // main replay loop's own handling for Shapes A/B/C.
@@ -1146,43 +1694,29 @@ async fn replay_shape_d(name: &str, plan: &ShapeDPlan) -> ShapeDResult {
                 path = format!("{}/{}", &path[..idx], pct_encode_path_segment(seg));
             }
         }
-        // REG-10 Phase 9b: substitution now also has to reach QUERY STRINGS
-        // (`vis-005` scenario 2's `?derived_from=<percent-encoded ctx_id>`),
-        // not just path segments -- and a substitution that silently FAILS
-        // yields an empty result set that reads as a legitimate negative
-        // (the plan's own edge-case warning). Two checks, not one:
-        //   1. no literal fixture ctx_id survives into the built path, in
-        //      EITHER its raw or its percent-encoded form (the query-string
-        //      case embeds the encoded form directly, so checking only the
-        //      raw form -- as Phase 8 did -- would silently miss a failed
-        //      query-string substitution: the encoded literal would still
-        //      be sitting right there in `path`, and this loop would see
-        //      nothing wrong);
-        //   2. POSITIVE proof: whenever the scenario's ORIGINAL, pre-
-        //      substitution path referenced a fixture ctx_id at all (raw or
-        //      encoded), the built path must now carry its MINTED
-        //      replacement (raw or encoded) -- i.e. substitution actually
-        //      fired, not merely "nothing survived to leak because there
-        //      was nothing to substitute in the first place".
-        for (fixture_ctx, minted_ctx) in &ctx_map {
-            let encoded_fixture = pct_encode_path_segment(fixture_ctx);
-            assert!(
-                !path.contains(fixture_ctx.as_str()) && !path.contains(encoded_fixture.as_str()),
-                "{name}: fixture ctx_id {fixture_ctx} (raw or percent-encoded) leaked into \
-                 request path unsubstituted: {path}"
-            );
-            if sc.path.contains(fixture_ctx.as_str()) || sc.path.contains(encoded_fixture.as_str())
-            {
-                let encoded_minted = pct_encode_path_segment(minted_ctx);
-                assert!(
-                    path.contains(minted_ctx.as_str()) || path.contains(encoded_minted.as_str()),
-                    "{name}: scenario path {:?} referenced fixture ctx_id {fixture_ctx}, but its \
-                     minted substitute {minted_ctx} never appears in the built request path \
-                     {path:?} -- substitution silently failed",
-                    sc.path
-                );
+        // REG-10 Phase 9c: minted lineage ids (`lin:sha256:…`) also need
+        // percent-encoding for axum's `{lineage_id}` matcher, but -- unlike
+        // ctx_id's `acdp://…` -- a lineage_id is not always the LAST path
+        // segment (`/lineages/{id}/current` has one more segment after
+        // it), so encode every occurrence directly rather than the
+        // last-segment trick above.
+        if sc.method == "GET" {
+            for minted_lid in lineage_map.values() {
+                if path.contains(minted_lid.as_str()) {
+                    let encoded = pct_encode_path_segment(minted_lid);
+                    path = path.replace(minted_lid.as_str(), &encoded);
+                }
             }
         }
+        // REG-10 Phase 9b (ctx_id) / 9c (lineage_id): substitution has to
+        // reach QUERY STRINGS too, not just path segments, and a
+        // substitution that silently FAILS yields a response that can read
+        // as a legitimate negative -- see `assert_substitution_sound`'s doc
+        // comment for the full vacuity writeup (including the `vis-008`
+        // scenario 0 and scenario 3 cases a response-shape check alone
+        // cannot catch).
+        assert_substitution_sound(name, &sc.path, &path, &ctx_map, "ctx_id");
+        assert_substitution_sound(name, &sc.path, &path, &lineage_map, "lineage_id");
 
         let mut builder = Request::builder().method(sc.method.as_str()).uri(&path);
         if let Some(did) = &sc.effective_requester_did {
@@ -1239,6 +1773,23 @@ async fn replay_shape_d(name: &str, plan: &ShapeDPlan) -> ShapeDResult {
                 }
             }
         }
+        // REG-10 Phase 9c: `GET /lineages/{id}` (not `/current`) returns a
+        // BARE JSON array of `FullContext`, each nesting its ctx_id under
+        // `.body.ctx_id` -- a different shape from the search endpoint's
+        // `{matches: [...]}` envelope every prior Shape D fixture used.
+        let is_lineage_list = sc.path.starts_with("/lineages/") && !sc.path.ends_with("/current");
+
+        // REG-10 Phase 9c, `vis-008` scenario 0: `expected.body == []`,
+        // asserted EXPLICITLY against the whole response body -- not
+        // inferred from `want_matches_ctx_ids` being an empty set, which an
+        // unsubstituted/unknown lineage_id would ALSO satisfy (see
+        // `assert_substitution_sound`'s doc comment).
+        if mismatch.is_none() && sc.want_body_empty_array && body_json != json!([]) {
+            mismatch = Some(format!(
+                "{name}: expected an empty JSON array body (no visible lineage versions), got \
+                 {body_json}"
+            ));
+        }
         if mismatch.is_none() {
             if let Some(fixture_ids) = &sc.want_matches_ctx_ids {
                 // Translate the fixture's own literal ctx_ids through the
@@ -1258,21 +1809,76 @@ async fn replay_shape_d(name: &str, plan: &ShapeDPlan) -> ShapeDResult {
                         })
                     })
                     .collect();
-                let got_minted: std::collections::BTreeSet<String> = body_json
-                    .get("matches")
-                    .and_then(Value::as_array)
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|m| m.get("ctx_id").and_then(Value::as_str))
-                            .map(str::to_string)
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let got_minted: std::collections::BTreeSet<String> = if is_lineage_list {
+                    body_json
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|item| {
+                                    item.get("body")
+                                        .and_then(|b| b.get("ctx_id"))
+                                        .and_then(Value::as_str)
+                                })
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    body_json
+                        .get("matches")
+                        .and_then(Value::as_array)
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|m| m.get("ctx_id").and_then(Value::as_str))
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
                 if got_minted != want_minted {
                     mismatch = Some(format!(
                         "{name}: matches_ctx_ids (minted) {got_minted:?} != {want_minted:?}; \
                          body = {body_json}"
                     ));
+                }
+            }
+        }
+        // REG-10 Phase 9c: opportunistic per-item `registry_state.status`
+        // cross-check against `setup.lineages[].versions[].status` -- this
+        // is what actually proves supersession ORDER, not merely which
+        // ctx_ids are visible (`want_matches_ctx_ids` above is a SET
+        // comparison, so it cannot distinguish "a1, a2 in the right chain
+        // order" from "a1, a2 with the chain reversed"). `status` is never
+        // a seed input (see `SeedLineageVersion::want_status`'s doc
+        // comment); a mismatch here means either the publish order was
+        // wrong, or a genuine, licensed divergence needs the `anc-001`-style
+        // deviation note (see the module doc-block's "Coverage ratchet"
+        // precedent) rather than a silently-passed assertion.
+        if mismatch.is_none() && is_lineage_list && sc.method == "GET" {
+            if let Some(arr) = body_json.as_array() {
+                for item in arr {
+                    let Some(item_ctx) = item
+                        .get("body")
+                        .and_then(|b| b.get("ctx_id"))
+                        .and_then(Value::as_str)
+                    else {
+                        continue;
+                    };
+                    let Some(want) = want_status_by_ctx.get(item_ctx) else {
+                        continue;
+                    };
+                    let got = item
+                        .get("registry_state")
+                        .and_then(|r| r.get("status"))
+                        .and_then(Value::as_str);
+                    if got != Some(want.as_str()) {
+                        mismatch = Some(format!(
+                            "{name}: version {item_ctx} registry_state.status {got:?} != \
+                             fixture-expected {want:?} (status is registry-computed from the \
+                             supersession, never a seed input); body = {body_json}"
+                        ));
+                        break;
+                    }
                 }
             }
         }
@@ -1297,6 +1903,43 @@ async fn replay_shape_d(name: &str, plan: &ShapeDPlan) -> ShapeDResult {
                 }
             }
         }
+        // REG-10 Phase 9c: `expected.ctx_id` (singular) + nested
+        // `expected.registry_state.status` -- the `GET /lineages/{id}/current`
+        // response shape (a single `FullContext` object), distinct from
+        // every other assertion above.
+        if mismatch.is_none() {
+            if let Some(want_id) = &sc.want_ctx_id {
+                let want_minted = ctx_map.get(want_id).cloned().unwrap_or_else(|| {
+                    panic!(
+                        "{name}: expected.ctx_id names {want_id}, which was never seeded by \
+                         this fixture's setup -- ctx_map = {ctx_map:?}"
+                    )
+                });
+                let got = body_json
+                    .get("body")
+                    .and_then(|b| b.get("ctx_id"))
+                    .and_then(Value::as_str);
+                if got != Some(want_minted.as_str()) {
+                    mismatch = Some(format!(
+                        "{name}: ctx_id (minted) {got:?} != {want_minted:?}; body = {body_json}"
+                    ));
+                }
+            }
+        }
+        if mismatch.is_none() {
+            if let Some(want_status) = &sc.want_registry_state_status {
+                let got = body_json
+                    .get("registry_state")
+                    .and_then(|r| r.get("status"))
+                    .and_then(Value::as_str);
+                if got != Some(want_status.as_str()) {
+                    mismatch = Some(format!(
+                        "{name}: registry_state.status {got:?} != {want_status:?}; \
+                         body = {body_json}"
+                    ));
+                }
+            }
+        }
 
         match mismatch {
             Some(f) => failures.push(f),
@@ -1309,6 +1952,7 @@ async fn replay_shape_d(name: &str, plan: &ShapeDPlan) -> ShapeDResult {
         failures,
         ctx_map,
         did_map,
+        lineage_map,
     }
 }
 
@@ -1372,9 +2016,13 @@ fn targets_unadvertised_profile(fx: &Value) -> bool {
 /// reasons, so a future widening of Shape D's allowlist (Phase 9a/9c) is
 /// auditable rather than lumped into one catch-all bucket:
 ///
-///   * its `setup` shape itself is unrecognized (e.g. `setup.lineages` —
-///     `vis-008`, `ret-002`) — Shape D cannot even SEED these yet, so they
-///     keep the generic `"requires pre-seeded registry state"` reason;
+///   * its `setup` shape itself is unrecognized — as of REG-10 Phase 9c
+///     this is `ret-002` alone: its `setup.lineages` entries carry no
+///     `visibility` key (unlike `vis-008`'s, which do) and one carries an
+///     `expires_at` key, both outside [`parse_seed_lineage_version`]'s
+///     recognized set, so `parse_seed_lineages` fails on it and it keeps
+///     the generic `"requires pre-seeded registry state"` reason. (`vis-008`
+///     itself no longer lands here — see the next paragraph.)
 ///   * its `setup` parses fine (Shape D COULD seed it) but some
 ///     scenario/expected key is outside the allowlist (e.g. `vis-007`
 ///     scenario 2's total absence of `status`) — these get
@@ -1390,7 +2038,11 @@ fn targets_unadvertised_profile(fx: &Value) -> bool {
 ///     it, so `parse_expected` fails, and by Shape D's parse-all-or-nothing
 ///     rule the WHOLE fixture stays unparseable; see
 ///     `vis007_search_match_restricted_visibility_disposition` for its
-///     direct, non-Shape-D coverage instead.)
+///     direct, non-Shape-D coverage instead. As of Phase 9c, `vis-008` has
+///     also escaped this bucket entirely — `setup.lineages` is now a
+///     recognized seed shape via [`parse_seed_lineages`], and none of its
+///     5 scenarios use a key outside the allowlist — so it is fully parsed
+///     and replayed, not merely no-longer-skipped-with-a-different-reason.)
 ///
 /// An empty `contexts_published: []` seed list is its own third reason
 /// (`parse_shape_d` treats it as unparseable — see its doc comment — so it
@@ -1678,15 +2330,18 @@ fn resolve_fixture_dir(dir: &str) -> Option<PathBuf> {
 /// proof fixture), plus (REG-10 Phase 9a) vis-001's 5 scenarios and
 /// vis-004's 4 scenarios (4 + 1 + 5 + 4 = 14), plus (REG-10 Phase 9b)
 /// vis-002's 4 scenarios, vis-005's 4 scenarios, and vis-009's 3 scenarios
-/// -- 14 + 4 + 4 + 3 = 25. `vis-007` does NOT add to this count: its
-/// scenario 2 has no assertable `status` at all, so the WHOLE fixture stays
-/// unparseable by Shape D's parse-all-or-nothing rule and it gets direct,
-/// non-Shape-D coverage instead (see
+/// (14 + 4 + 4 + 3 = 25), plus (REG-10 Phase 9c) vis-008's 5 scenarios --
+/// 25 + 5 = 30. `vis-007` does NOT add to this count: its scenario 2 has no
+/// assertable `status` at all, so the WHOLE fixture stays unparseable by
+/// Shape D's parse-all-or-nothing rule and it gets direct, non-Shape-D
+/// coverage instead (see
 /// `vis007_search_match_restricted_visibility_disposition`), which this
-/// counter does not track. A gate that accidentally over-matches must fail
-/// loudly, not quietly shrink coverage to a still-nonzero number. Raise
-/// this as coverage grows.
-const MIN_REPLAYED_EXCHANGES: usize = 25;
+/// counter does not track. Nor does `ret-002`: its `setup.lineages` shape
+/// stays structurally unparseable (see [`parse_seed_lineage_version`]'s doc
+/// comment) and it is not otherwise given direct coverage. A gate that
+/// accidentally over-matches must fail loudly, not quietly shrink coverage
+/// to a still-nonzero number. Raise this as coverage grows.
+const MIN_REPLAYED_EXCHANGES: usize = 30;
 
 fn family_of(name: &str) -> String {
     // Prefix up to the digit group: `data-ref-ssrf-001-...` -> `data-ref-ssrf`.
@@ -2955,6 +3610,222 @@ async fn vis009_anonymous_public_reads_gates_anonymous_not_authenticated() {
     );
     assert_eq!(result.ran, 3);
     assert_eq!(result.ctx_map.len(), 2);
+}
+
+/// REG-10 Phase 9c proof: `vis-008` (RFC-ACDP-0004 §5.4, lineage-endpoint
+/// visibility) replayed end-to-end through Shape D -- the last parked seed
+/// shape, `setup.lineages`. 2 lineages x 2 versions: lineage a (a1 -> a2,
+/// BOTH `restricted`, same `audience`, same owner) and lineage b (b1
+/// `public` -> b2 `private`, same owner) -- b's head is private while its
+/// first version stays public, which is what makes scenarios 3/4 assert
+/// different things. 5 scenarios: 3 on `GET /lineages/{lid}`, 2 on
+/// `GET /lineages/{lid}/current`. Every chain is established through REAL
+/// `supersede_body()`-chained publishes in `version`-ascending order (see
+/// [`replay_shape_d`]'s lineage-seeding pass), never a direct store write,
+/// and `status` is asserted as the registry COMPUTES it (never a seed
+/// input) -- see `SeedLineageVersion::want_status`'s doc comment.
+#[tokio::test(flavor = "multi_thread")]
+async fn vis008_lineage_endpoint_visibility_replays_via_shape_d() {
+    let Some(fixtures) = spec_fixtures() else {
+        eprintln!(
+            "conformance: ACDP_SPEC_DIR unset or no fixtures resolvable; skipping vis-008 \
+             Shape D proof (set ACDP_REQUIRE_CONFORMANCE to make this a hard failure)"
+        );
+        return;
+    };
+    let Some(fx) = find_fixture_by_id(&fixtures, "vis-008") else {
+        return;
+    };
+
+    assert!(
+        fx.get("request").is_none(),
+        "vis-008 must carry no top-level `request` -- otherwise Shape A could capture it \
+         ahead of Shape D and replay it against an empty store"
+    );
+    assert!(
+        is_shape_d_candidate(&fx),
+        "vis-008 must satisfy the Shape D dispatch predicate"
+    );
+
+    let plan =
+        parse_shape_d(&fx).expect("vis-008 must fully parse as Shape D as of REG-10 Phase 9c");
+    assert!(
+        plan.seeds.is_empty(),
+        "vis-008 seeds ONLY through setup.lineages -- no flat context_published/\
+         contexts_published entries"
+    );
+    assert_eq!(plan.lineages.len(), 2, "vis-008 seeds two lineages");
+    assert_eq!(
+        plan.lineages[0].versions.len(),
+        2,
+        "lineage a has two versions"
+    );
+    assert_eq!(
+        plan.lineages[1].versions.len(),
+        2,
+        "lineage b has two versions"
+    );
+    assert_eq!(
+        plan.lineages[0].versions[0].visibility, "restricted",
+        "lineage a: both versions restricted"
+    );
+    assert_eq!(plan.lineages[0].versions[1].visibility, "restricted");
+    assert_eq!(
+        plan.lineages[1].versions[0].visibility, "public",
+        "lineage b: v1 public, v2 private -- the asymmetry scenarios 3/4 exist to pin"
+    );
+    assert_eq!(plan.lineages[1].versions[1].visibility, "private");
+    assert_eq!(plan.scenarios.len(), 5, "vis-008 carries 5 scenarios");
+
+    // Scenario 0: stranger, lineage a -- 200 with an EMPTY list, not 404.
+    // The vacuity trap this fixture exists to guard against: assert the
+    // empty-body expectation was actually parsed, not merely inferred.
+    assert_eq!(plan.scenarios[0].want_status, 200);
+    assert!(
+        plan.scenarios[0].want_body_empty_array,
+        "scenario 0 must carry expected.body == [] -- the explicit empty-list assertion, not \
+         merely an empty matches_ctx_ids set"
+    );
+    assert_eq!(
+        plan.scenarios[0].want_matches_ctx_ids,
+        Some(Vec::new()),
+        "scenario 0 must ALSO carry expected.matches_ctx_ids: [] alongside expected.body: []"
+    );
+    // Scenario 1: authorized, lineage a -- both versions.
+    assert_eq!(plan.scenarios[1].want_status, 200);
+    assert_eq!(
+        plan.scenarios[1]
+            .want_matches_ctx_ids
+            .as_ref()
+            .map(Vec::len),
+        Some(2)
+    );
+    // Scenario 2: stranger, lineage b -- public version only.
+    assert_eq!(plan.scenarios[2].want_status, 200);
+    assert_eq!(
+        plan.scenarios[2]
+            .want_matches_ctx_ids
+            .as_ref()
+            .map(Vec::len),
+        Some(1)
+    );
+    // Scenario 3: stranger, lineage b /current -- 404 not_found (private head).
+    assert_eq!(plan.scenarios[3].want_status, 404);
+    assert_eq!(
+        plan.scenarios[3].want_error_code.as_deref(),
+        Some("not_found")
+    );
+    // Scenario 4: owner, lineage b /current -- 200, singular ctx_id + nested
+    // registry_state.status, neither of which any earlier Shape D fixture
+    // needed.
+    assert_eq!(plan.scenarios[4].want_status, 200);
+    assert!(
+        plan.scenarios[4].want_ctx_id.is_some(),
+        "scenario 4 must carry expected.ctx_id (singular)"
+    );
+    assert_eq!(
+        plan.scenarios[4].want_registry_state_status.as_deref(),
+        Some("active")
+    );
+
+    let result = replay_shape_d("vis-008", &plan).await;
+    assert!(
+        result.failures.is_empty(),
+        "vis-008 must replay cleanly via Shape D: {:?}",
+        result.failures
+    );
+    assert_eq!(result.ran, 5);
+    // Four versions across two lineages -- the ctx_id substitution map.
+    assert_eq!(result.ctx_map.len(), 4);
+    // REG-10 Phase 9c's own contribution: the lineage_id substitution
+    // table, asserted non-empty and exactly the two seeded lineages -- the
+    // acceptance criterion this whole phase exists to satisfy.
+    assert_eq!(
+        result.lineage_map.len(),
+        2,
+        "vis-008 must produce a non-empty, exactly-two-entry lineage_id substitution map"
+    );
+    assert_ne!(
+        result
+            .lineage_map
+            .get("lin:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        None,
+        "the fixture's literal lineage a id must have been substituted"
+    );
+    assert_ne!(
+        result
+            .lineage_map
+            .get("lin:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        None,
+        "the fixture's literal lineage b id must have been substituted"
+    );
+    // `did:agent:owner` is shared by all four versions and must mint to ONE
+    // did:web; `did:agent:authorized` (audience-only, never a seed's own
+    // agent_id) must NOT appear in did_map at all.
+    assert!(
+        result.did_map.contains_key("did:agent:owner"),
+        "did:agent:owner must have minted a substitute did:web producer"
+    );
+    assert_eq!(
+        result.did_map.get("did:agent:authorized"),
+        None,
+        "did:agent:authorized is audience-only and must pass through unminted"
+    );
+}
+
+/// REG-10 Phase 9c mutation proof: reversing a lineage's supersession order
+/// must fail the replay. Swaps the `version` field between lineage b's two
+/// `setup.lineages` entries (b1 <-> b2) -- everything else (ctx_id,
+/// visibility, `status` literal) stays attached to its original entry.
+/// Since [`parse_seed_lineage`] sorts by `version` before seeding, this
+/// makes the (still-`private`) b2 data publish FIRST and the (still-
+/// `public`) b1 data publish SECOND as its supersession -- so the lineage's
+/// real head becomes the PUBLIC one. Scenario 3 (stranger, lineage b
+/// `/current`) expects 404 `not_found` because the true head is private;
+/// with the order reversed, the head is public and a stranger gets 200
+/// instead -- a direct, deterministic status-code divergence, not merely a
+/// weaker signal like a reordered list. If this mutation did NOT fail,
+/// Shape D would not actually be seeding lineages through real,
+/// order-sensitive supersession -- it would be doing something order-
+/// insensitive (or not seeding a real chain at all).
+#[tokio::test(flavor = "multi_thread")]
+async fn vis008_mutated_lineage_version_order_fails_replay() {
+    let Some(fixtures) = spec_fixtures() else {
+        eprintln!(
+            "conformance: ACDP_SPEC_DIR unset or no fixtures resolvable; skipping vis-008 \
+             mutation proof (set ACDP_REQUIRE_CONFORMANCE to make this a hard failure)"
+        );
+        return;
+    };
+    let Some(fx) = find_fixture_by_id(&fixtures, "vis-008") else {
+        return;
+    };
+
+    let mut mutated = fx.clone();
+    let lineage_b_versions = mutated["setup"]["lineages"][1]["versions"]
+        .as_array_mut()
+        .expect("vis-008 lineage b must carry a versions array");
+    assert_eq!(
+        lineage_b_versions.len(),
+        2,
+        "vis-008 lineage b must carry exactly two versions to swap"
+    );
+    let v0 = lineage_b_versions[0]["version"].clone();
+    let v1 = lineage_b_versions[1]["version"].clone();
+    lineage_b_versions[0]["version"] = v1;
+    lineage_b_versions[1]["version"] = v0;
+
+    let mutated_plan = parse_shape_d(&mutated).expect(
+        "mutated vis-008 (version fields swapped, nothing else) must still parse as Shape D",
+    );
+    let mutated_result = replay_shape_d("vis-008-mutated", &mutated_plan).await;
+    assert!(
+        !mutated_result.failures.is_empty(),
+        "reversing lineage b's supersession order MUST fail the replay (scenario 3 expects 404 \
+         for the private head; reversed, the head is public and a stranger gets 200) -- if it \
+         doesn't, Shape D isn't actually seeding lineages through real, order-sensitive \
+         supersession: {mutated_result:?}"
+    );
 }
 
 /// REG-10 Phase 8 GAP 1 / GAP 2 regression proof: a synthetic, in-test-only
@@ -4972,9 +5843,18 @@ fn fixture_family_panics_naming_file_when_id_missing() {
 /// precedent, via `vis007_search_match_restricted_visibility_disposition`
 /// (scenarios 0 and 1 replayed and asserted for real; scenario 2 recorded
 /// not-assertable, in that test's doc comment, since it has no expected
-/// HTTP outcome to replay at all). `vis-008` (`setup.lineages`) remains
-/// "requires pre-seeded registry state" (Phase 9c). Only `vis`'s
-/// *coverage* changed here, never its classification.
+/// HTTP outcome to replay at all). As of Phase 9c, `vis-008` (5 scenarios,
+/// `setup.lineages`) joins the genuinely-REPLAYED set too — the THIRD
+/// substitution table this phase adds, `fixture_lineage_id →
+/// minted_lineage_id`, seeded through real `supersede_body()`-chained
+/// publishes (two two-version lineages, never a direct store write). `ret`
+/// stays classified "requires pre-seeded registry state" for `ret-002`
+/// alone: its `setup.lineages` entries carry no `visibility` key and one
+/// carries `expires_at`, both outside [`parse_seed_lineage_version`]'s
+/// recognized set, and its first lineage requires an all-superseded state
+/// no real publish sequence can produce (publishing v2 always makes v2,
+/// not v1, the active head) — structurally excluded, not by fixture id.
+/// Only `vis`'s *coverage* changed here, never its classification.
 const KNOWN_FAMILIES: &[&str] = &[
     "anc",
     "body",
