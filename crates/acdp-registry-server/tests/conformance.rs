@@ -304,6 +304,81 @@
 //! this registry's response must behave, not this registry's own behavior --
 //! and are recorded not-applicable, with this reasoning, in that same test's
 //! doc comment rather than silently dropped.
+//!
+//! ## Coverage completeness ratchet (`COVERED` / `DEFERRED`, REG-10 Phase 11)
+//!
+//! The four tests above (`all_conformance_fixtures_are_bucketed_into_known_families`,
+//! `known_families_are_declared_by_the_spec`, `excused_families_are_known_and_present`,
+//! `no_excused_family_is_required_by_our_profile`) fail on an *unclassified* family or an
+//! *illegitimate excuse* -- never on a *classified-but-uncovered* one. A family with a
+//! logged skip reason and no coverage at all passes all four, which is exactly how `vis`
+//! and `idem` sat uncovered before Phases 8-10, and how `caps`/`lin`/`lc` still do (#115).
+//! Phase 11 closes that gap with a fifth, deliberately UNCONDITIONAL test,
+//! `known_families_partition_into_covered_excused_or_deferred`: every family in
+//! `KNOWN_FAMILIES` must appear in exactly one of `COVERED`, `EXCUSED`, or `DEFERRED`.
+//! "Uncovered" stops being a silent default and becomes something a contributor must
+//! declare.
+//!
+//! Unlike the four tests above (gated on `bucketed_fixtures()`, which skips when
+//! `ACDP_SPEC_DIR` is unreachable), this fifth test and
+//! `covered_direct_families_have_present_test_functions` (below) touch no spec data at
+//! all -- they compare in-file consts against each other and against this file's own
+//! embedded source. The required `tests` CI job runs `cargo test --workspace` with no
+//! `ACDP_SPEC_DIR` set, so every spec-gated test above skips there; leaving these two
+//! ungated is what makes them actually block a merge instead of only advising the
+//! separate, non-required `conformance` job.
+//!
+//! **`COVERED` models two legitimate coverage mechanisms, not one.** The plan driving
+//! this phase originally preferred deriving `COVERED` purely from replayed-exchange
+//! counts ("every `COVERED` family produced >= 1 replayed exchange"). That is
+//! demonstrably wrong: `anc`, `can`, `idem`, and `wit` are genuinely covered by direct,
+//! in-process test functions and produce **zero** replayed exchanges -- they sit in the
+//! generic replayer's own skip manifest above. A purely-replay-derived `COVERED` would
+//! brand all four uncovered, including `can` (Phase 7) and `idem` (Phase 10), the very
+//! families this plan added. So `COVERED` is `&[(&str, &[CoverageMechanism])]`, and a
+//! family may claim `CoverageMechanism::Replayed`, one or more named
+//! `CoverageMechanism::Direct(&[fn_name, ...])` entries, or both (`vis` claims both: it
+//! clears `MIN_REPLAYED_EXCHANGES` via Shape A/B/C/D AND carries 10 dedicated
+//! `visNNN_*`/Shape-D-driving test functions for scenarios the generic loop can't reach).
+//!
+//! Both mechanisms are DERIVED, not merely hand-asserted, but by two different oracles:
+//! `Replayed` is checked against `replays_spec_fixtures_when_present`'s own per-family
+//! `ran` tally -- a real count of exchanges that actually ran and passed in this test
+//! run -- so it needs the spec and lives in the `conformance` job. `Direct` is checked by
+//! `covered_direct_families_have_present_test_functions` scanning this file's own
+//! compiled-in source (`include_str!`) for each named function, confirming it still
+//! exists with a test attribute directly above it. Be honest about what that check CAN
+//! and CANNOT detect: it is an EXISTENCE check, not a correctness check. It proves a
+//! named test has not been deleted or silently de-registered (attribute stripped,
+//! renamed away from `COVERED`'s literal string) -- exactly the mutation this phase must
+//! catch -- but it cannot prove the test's assertions still say anything meaningful; a
+//! gutted `assert!(true)` body would still read as "present," and so would `#[ignore]`
+//! written above `#[test]` (the reverse, idiomatic order is caught) or the whole function
+//! wrapped in a `/* ... */` block comment. A const naming test functions and re-deriving
+//! "present + still a test" from source is the best a self-contained, spec-independent
+//! check can do; genuinely re-executing every direct test's assertions as part of this
+//! ratchet would just be running the suite, not ratcheting it.
+//!
+//! `DEFERRED` is `&[(&str, &str, u32)]` -- family, a non-empty written reason, and an
+//! open GitHub issue number. `caps`, `lin`, and `lc` cite **#115**, filed for exactly
+//! those three; the remaining 15 cite **#130**, filed enumerating each with its own
+//! reason. `known_families_partition_into_covered_excused_or_deferred` checks both:
+//! reason non-empty, issue is one of the two known-open numbers, and the `caps`/`lin`/
+//! `lc` trio specifically cites #115.
+//!
+//! **Required-checks decision (recorded here, not executed):** `conformance (spec
+//! fixtures)` is currently NOT among this repo's required status-check contexts
+//! (verified directly against branch protection: `rustfmt`, `clippy`, `tests` only).
+//! With the coverage story now split across a spec-dependent half (`Replayed`, the
+//! `conformance` job) and a spec-independent half (`Direct` and the set-equality ratchet
+//! itself, the `tests` job), leaving `conformance` advisory means only the WEAKER half of
+//! this ratchet -- the part expressible without executing HTTP replay -- ever blocks a
+//! merge; a regression that silently drops a fixture's replayed exchanges (while its
+//! `COVERED` entry and direct tests stay intact) would go unnoticed by required checks.
+//! The decision, per this phase's own acceptance criteria: `conformance (spec fixtures)`
+//! SHOULD join the required contexts. This is a repo-admin action (branch protection
+//! settings), deliberately left undone by this change -- see `CHANGELOG.md` and
+//! `ASSUMPTIONS.md` for the follow-up recorded for a human to action.
 
 #![cfg(feature = "storage-sqlite")]
 
@@ -2616,6 +2691,28 @@ async fn replays_spec_fixtures_when_present() {
         "replayed {replayed} exchange(s), expected at least {MIN_REPLAYED_EXCHANGES} \
          (a fidelity gate may be over-matching and silently shrinking coverage)"
     );
+
+    // REG-10 Phase 11: the `Replayed` half of the `COVERED` coverage-mechanism proof.
+    // Every family that claims `CoverageMechanism::Replayed` must have actually produced
+    // >= 1 exchange in THIS run's own `ran` tally above -- a real, derived signal, not a
+    // trusted assertion. This is the spec-gated half; `Direct` families are checked
+    // unconditionally by `covered_direct_families_have_present_test_functions`. See the
+    // module doc-comment's "Coverage completeness ratchet" section.
+    for (family, mechanisms) in COVERED {
+        let claims_replayed = mechanisms
+            .iter()
+            .any(|m| matches!(m, CoverageMechanism::Replayed));
+        if !claims_replayed {
+            continue;
+        }
+        let count = ran.get(*family).copied().unwrap_or(0);
+        assert!(
+            count >= 1,
+            "COVERED family \"{family}\" claims CoverageMechanism::Replayed, but produced \
+             0 replayed exchanges in this run's per-family tally -- either its coverage \
+             regressed or it should be reclassified"
+        );
+    }
 }
 
 /// REG-10 Phase 8 regression canary. The gravest failure mode of this phase
@@ -6335,6 +6432,18 @@ fn fixture_family_panics_naming_file_when_id_missing() {
 /// spec adding a new fixture prefix) is what turns
 /// `all_conformance_fixtures_are_bucketed_into_known_families` red.
 ///
+/// **REG-10 Phase 11:** being *classified* here (replayed, or skipped with a
+/// logged reason) is necessary but was never sufficient to claim real
+/// coverage — a family can sit classified-but-uncovered indefinitely, which
+/// is exactly what happened to `vis`/`idem` before Phases 8-10 and what
+/// still holds for `caps`/`lin`/`lc` (#115) and 15 others (#130) today.
+/// Every family in this list must now ALSO appear in exactly one of
+/// `COVERED`, `EXCUSED`, or `DEFERRED` — enforced unconditionally by
+/// `known_families_partition_into_covered_excused_or_deferred`, which needs
+/// no spec checkout and so runs in the required `tests` job. See the module
+/// doc-comment's "Coverage completeness ratchet" section for the full
+/// design.
+///
 /// `anc` (RFC-ACDP-0016 anchors) stays classified "non-HTTP fixture" by the
 /// generic replay harness (`extract_shapes`'s Shape A refuses `anc-001`'s
 /// positive/placeholder-signature publish outcome by design, and
@@ -6507,6 +6616,343 @@ const EXCUSED: &[(&str, &str)] = &[
          would make this registry responsible for it.",
     ),
 ];
+
+/// The two legitimate mechanisms by which a `KNOWN_FAMILIES` entry can earn
+/// a place in `COVERED` (REG-10 Phase 11). See the module doc-comment's
+/// "Coverage completeness ratchet" section for the full reasoning behind
+/// modelling both rather than deriving `COVERED` from replay results alone.
+#[derive(Clone, Copy)]
+enum CoverageMechanism {
+    /// The family produced at least one *replayed* HTTP exchange in
+    /// `replays_spec_fixtures_when_present`'s own per-family `ran` tally.
+    /// Verified there, which needs `ACDP_SPEC_DIR` and so runs only in the
+    /// `conformance` CI job.
+    Replayed,
+    /// The family is covered by these exact test-function names, each
+    /// still present in this file and still wearing a test attribute
+    /// (`#[test]` / `#[tokio::test(...)]`) directly above it. Verified
+    /// unconditionally (no spec needed) by
+    /// `covered_direct_families_have_present_test_functions`, which scans
+    /// this file's own embedded source. EXISTENCE-only: proves the named
+    /// test hasn't been deleted or silently de-registered, not that its
+    /// body still asserts anything meaningful -- see the module doc-comment
+    /// for the evasions (attribute order, block comments) this cannot
+    /// catch either.
+    Direct(&'static [&'static str]),
+}
+
+/// Every family with real coverage, and by which mechanism(s). A family may
+/// list more than one entry (`vis` lists both `Replayed` and `Direct`: it
+/// clears `MIN_REPLAYED_EXCHANGES` through the generic replayer AND carries
+/// dedicated per-fixture test functions for scenarios the generic loop
+/// can't reach). Checked two ways -- see the module doc-comment:
+/// `Replayed` entries against `replays_spec_fixtures_when_present`'s `ran`
+/// tally (spec-gated, `conformance` job); `Direct` entries against this
+/// file's own source (unconditional, `covered_direct_families_have_present_
+/// test_functions`, runs in the required `tests` job).
+const COVERED: &[(&str, &[CoverageMechanism])] = &[
+    ("pub", &[CoverageMechanism::Replayed]),
+    ("ret", &[CoverageMechanism::Replayed]),
+    (
+        "vis",
+        &[
+            CoverageMechanism::Replayed,
+            CoverageMechanism::Direct(&[
+                "vis001_restricted_denied_as_404_replays_via_shape_d",
+                "vis002_search_excludes_restricted_and_router_rebuilds_on_capability_toggle",
+                "vis003_search_response_emits_matches_not_results",
+                "vis004_private_audience_retrieval_allowed_replays_via_shape_d",
+                "vis005_private_audience_search_excluded_via_derived_from",
+                "vis006_search_match_public_visibility_disclosure_replays_via_shape_d",
+                "vis007_search_match_restricted_visibility_disposition",
+                "vis008_lineage_endpoint_visibility_replays_via_shape_d",
+                "vis008_mutated_lineage_version_order_fails_replay",
+                "vis009_anonymous_public_reads_gates_anonymous_not_authenticated",
+            ]),
+        ],
+    ),
+    (
+        "anc",
+        &[CoverageMechanism::Direct(&[
+            "anc001_well_formed_anchor_is_accepted_and_round_trips",
+            "anc002_malformed_anchor_content_hash_is_rejected",
+            "anc003_empty_anchors_array_is_rejected_with_established_ordering",
+        ])],
+    ),
+    (
+        "can",
+        &[CoverageMechanism::Direct(&[
+            "can_vectors_reproduce_canonical_form_and_hash",
+            "can007_registry_created_at_millisecond_truncation",
+        ])],
+    ),
+    (
+        "idem",
+        &[CoverageMechanism::Direct(&[
+            "idem001_004_publish_idempotency_key_lifecycle_and_restart_durability",
+            "idem005_no_support_ignores_idempotency_key_header",
+        ])],
+    ),
+    (
+        "wit",
+        &[CoverageMechanism::Direct(&[
+            "wit004_key_mismatch_cosignature_is_rejected_and_wit001_golden_is_accepted",
+        ])],
+    ),
+];
+
+/// Families with no coverage yet, each with a non-empty written reason and
+/// an open tracking-issue number. `caps`, `lin`, and `lc` cite **#115**
+/// (filed exactly for those three, per Q1 of
+/// `plans/reg10-conformance-and-ci-hygiene.md`); the remaining 15 cite
+/// **#130** (filed for this phase, enumerating each with its own reason).
+/// `known_families_partition_into_covered_excused_or_deferred` checks: the
+/// reason is non-empty, the issue is one of the two known-open numbers, and
+/// the `caps`/`lin`/`lc` trio specifically cites #115.
+const DEFERRED: &[(&str, &str, u32)] = &[
+    (
+        "caps",
+        "required-but-uncovered: all 7 caps-* ids sit in acdp-registry-core's \
+         required_fixtures, so this is mechanically inexcusable (same rule that makes \
+         `can` inexcusable) -- but the generic replayer skips them as non-HTTP and no \
+         direct test exists yet.",
+        115,
+    ),
+    (
+        "lin",
+        "required-but-uncovered: lin-001-lineage-derivation-golden sits in \
+         acdp-registry-core's required_fixtures. derive_lineage_id is already exported \
+         from acdp_crypto, so this may close as cheaply as the can-* vectors did in \
+         Phase 7 -- just not yet done.",
+        115,
+    ),
+    (
+        "lc",
+        "profile-gated-uncovered: lc-*'s 3 fixtures target a profile this harness does \
+         not advertise, so they are skipped by the runtime profile gate rather than \
+         required -- plausibly excusable, but that has never been declared, so it stays \
+         DEFERRED rather than silently assumed EXCUSED.",
+        115,
+    ),
+    (
+        "body",
+        "schema/vector fixtures with no HTTP shape; needs a direct-vector pass like \
+         `can`'s (REG-10 Phase 7 precedent).",
+        130,
+    ),
+    (
+        "schema",
+        "same shape as `body` -- absent-vs-null wire conventions, vector-shaped, needs a \
+         direct-vector pass.",
+        130,
+    ),
+    (
+        "sig",
+        "signature goldens; needs synthesized bodies bound to fixture hashes before a \
+         direct pass is possible.",
+        130,
+    ),
+    (
+        "dk",
+        "did:key goldens; conditional on advertising did:key (acdp-registry-core's \
+         conditional_fixtures), currently unowed under this harness's advertised \
+         capabilities.",
+        130,
+    ),
+    (
+        "did-ssrf",
+        "producer-DID-resolution SSRF refusal; needs a controlled resolver seam this \
+         harness doesn't have yet.",
+        130,
+    ),
+    (
+        "data-ref",
+        "DataRef openness vectors; consumer-leaning obligations, needs its own look \
+         before committing to a coverage shape.",
+        130,
+    ),
+    (
+        "cur",
+        "cursor/pagination semantics; no direct or replayed coverage yet.",
+        130,
+    ),
+    (
+        "err",
+        "error-envelope shape; no direct or replayed coverage yet.",
+        130,
+    ),
+    (
+        "meta",
+        "metadata conventions; no direct or replayed coverage yet.",
+        130,
+    ),
+    (
+        "rate",
+        "rate-limiting obligations; needs a clock/limiter seam this harness doesn't have \
+         yet.",
+        130,
+    ),
+    (
+        "status",
+        "lifecycle status transitions; no direct or replayed coverage yet.",
+        130,
+    ),
+    (
+        "rcpt",
+        "receipt verification (RFC-ACDP-0010); a verification-side family needing a new \
+         seam.",
+        130,
+    ),
+    (
+        "lhr",
+        "lineage-head receipts (RFC-ACDP-0011); a verification-side family needing a new \
+         seam.",
+        130,
+    ),
+    (
+        "log",
+        "transparency-log verification (RFC-ACDP-0012); a verification-side family \
+         needing a new seam.",
+        130,
+    ),
+    (
+        "rev",
+        "key revocation (RFC-ACDP-0014); a verification-side family needing a new seam.",
+        130,
+    ),
+];
+
+/// This file's own source, embedded at compile time so
+/// `covered_direct_families_have_present_test_functions` can check
+/// test-function presence by pure self-inspection -- no `ACDP_SPEC_DIR`
+/// needed, so it runs in the required `tests` job.
+const OWN_SOURCE: &str = include_str!("conformance.rs");
+
+/// True when `name` appears in [`OWN_SOURCE`] as a `fn NAME(` or `async fn
+/// NAME(` definition whose nearest preceding non-blank line is a test
+/// attribute (`#[test]` or `#[tokio::test`). EXISTENCE-only, by design --
+/// see [`CoverageMechanism::Direct`]'s doc comment for what this can and
+/// cannot detect. Note the attribute must be the *immediately* preceding
+/// non-blank line: any other attribute between it and the `fn` (e.g.
+/// `#[cfg(feature = "playground")]`, `#[should_panic]`, `#[serial]`) will
+/// make a genuinely-covered family read as false here -- fails safe (red,
+/// not green), but worth knowing before adding one to a `COVERED` function.
+fn source_has_present_test_fn(name: &str) -> bool {
+    let def_needle = format!("fn {name}(");
+    let lines: Vec<&str> = OWN_SOURCE.lines().collect();
+    let Some(def_line) = lines.iter().position(|line| {
+        let t = line.trim_start();
+        (t.starts_with("fn ") || t.starts_with("async fn ")) && t.contains(&def_needle)
+    }) else {
+        return false;
+    };
+    let mut j = def_line;
+    while j > 0 {
+        j -= 1;
+        let t = lines[j].trim();
+        if t.is_empty() {
+            continue;
+        }
+        return t.starts_with("#[test]") || t.starts_with("#[tokio::test");
+    }
+    false
+}
+
+/// Unconditional (no spec needed) half of Phase 11's mutation proof: every
+/// `CoverageMechanism::Direct` test-function name in `COVERED` genuinely
+/// exists in this file's own source, still wearing a test attribute.
+/// Deleting or de-registering one of these functions -- the exact mutation
+/// this phase's blocking correction worried a purely-replay-derived
+/// `COVERED` could never catch for `anc`/`can`/`idem`/`wit` -- turns this
+/// test red. Complements `replays_spec_fixtures_when_present`'s per-family
+/// `ran`-tally assertion below, which verifies the `Replayed` mechanism the
+/// same way but only when the spec is reachable.
+#[test]
+fn covered_direct_families_have_present_test_functions() {
+    for (family, mechanisms) in COVERED {
+        assert!(
+            !mechanisms.is_empty(),
+            "COVERED family \"{family}\" claims no coverage mechanism at all"
+        );
+        for mechanism in *mechanisms {
+            if let CoverageMechanism::Direct(names) = mechanism {
+                assert!(
+                    !names.is_empty(),
+                    "COVERED family \"{family}\" has an empty Direct(...) test-function list"
+                );
+                for name in *names {
+                    assert!(
+                        source_has_present_test_fn(name),
+                        "COVERED family \"{family}\" claims direct coverage via `{name}`, but \
+                         that function no longer exists in this file as a present, \
+                         test-attribute-registered function -- coverage was removed without \
+                         updating COVERED"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The set-equality ratchet Phase 11 exists to add, and the one that MUST
+/// run without a spec checkout: `KNOWN_FAMILIES` must equal, as a set, the
+/// union of `COVERED`, `EXCUSED`, and `DEFERRED` -- no family left
+/// unclassified, none double-classified, and nothing named here that isn't
+/// in `KNOWN_FAMILIES`. Deliberately NOT gated on `bucketed_fixtures()`
+/// (unlike the four tests above): this comparison is pure in-file data, and
+/// the required `tests` CI job runs `cargo test --workspace` with no
+/// `ACDP_SPEC_DIR` set, so leaving it ungated is what makes an unclassified
+/// family block a merge instead of silently passing. See the module
+/// doc-comment's "Coverage completeness ratchet" section.
+#[test]
+fn known_families_partition_into_covered_excused_or_deferred() {
+    let mut classified: std::collections::BTreeMap<&str, Vec<&str>> = Default::default();
+
+    for (family, _) in COVERED {
+        classified.entry(family).or_default().push("COVERED");
+    }
+    for (family, _) in EXCUSED {
+        classified.entry(family).or_default().push("EXCUSED");
+    }
+    for (family, reason, issue) in DEFERRED {
+        assert!(
+            !reason.trim().is_empty(),
+            "DEFERRED family \"{family}\" has an empty reason"
+        );
+        assert!(
+            *issue == 115 || *issue == 130,
+            "DEFERRED family \"{family}\" cites issue #{issue}, expected #115 (caps/lin/lc) \
+             or #130 (everything else)"
+        );
+        if matches!(*family, "caps" | "lin" | "lc") {
+            assert_eq!(
+                *issue, 115,
+                "DEFERRED family \"{family}\" must cite #115 (filed exactly for \
+                 caps/lin/lc, per Q1)"
+            );
+        }
+        classified.entry(family).or_default().push("DEFERRED");
+    }
+
+    for family in KNOWN_FAMILIES {
+        let buckets = classified.get(family).cloned().unwrap_or_default();
+        assert!(
+            !buckets.is_empty(),
+            "KNOWN_FAMILIES family \"{family}\" is not classified in COVERED, EXCUSED, or \
+             DEFERRED -- \"uncovered\" must be declared, not silently defaulted"
+        );
+        assert!(
+            buckets.len() == 1,
+            "KNOWN_FAMILIES family \"{family}\" is classified more than once: {buckets:?}"
+        );
+    }
+    for family in classified.keys() {
+        assert!(
+            KNOWN_FAMILIES.contains(family),
+            "\"{family}\" appears in COVERED/EXCUSED/DEFERRED but is not in KNOWN_FAMILIES"
+        );
+    }
+}
 
 /// Returns the `acdp-registry-core` profile object from `registries/
 /// profiles.json`'s `profiles[]` array, panicking (naming the checked path)

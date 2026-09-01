@@ -8,6 +8,66 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A coverage-completeness ratchet closes the gap Phases 7-10 left open**
+  (`REG-10` Phase 11): the existing four `KNOWN_FAMILIES`/`EXCUSED` ratchet
+  tests fail only on an *unclassified* family or an *illegitimate excuse* —
+  never on zero coverage, which is exactly how `vis`/`idem` sat uncovered
+  before Phases 8-10, and how `caps`/`lin`/`lc` (#115) and 15 more families
+  (#130) still do today. Two new consts and two new tests in
+  `crates/acdp-registry-server/tests/conformance.rs` close it:
+  - **`COVERED: &[(&str, &[CoverageMechanism])]`** models the two legitimate
+    coverage mechanisms a family can claim — `Replayed` (produced >= 1
+    exchange in `replays_spec_fixtures_when_present`'s own per-family
+    tally) and `Direct(&[fn_names])` (named in-process test functions).
+    Modelling both, rather than deriving `COVERED` purely from replay
+    results as originally preferred, is load-bearing: `anc`, `can`,
+    `idem`, and `wit` are genuinely covered by direct tests and produce
+    **zero** replayed exchanges, so a replay-only derivation would have
+    branded all four uncovered — including `can` (Phase 7) and `idem`
+    (Phase 10), the two families this very effort added. `vis` claims
+    both mechanisms (it clears `MIN_REPLAYED_EXCHANGES`, currently
+    confirmed still 30, AND carries 10 dedicated per-fixture test
+    functions).
+  - **`DEFERRED: &[(&str, &str, u32)]`** lists the 18 families with no
+    coverage yet, each with a non-empty reason and an open tracking-issue
+    number: `caps`/`lin`/`lc` cite #115; the remaining 15
+    (`body`/`schema`/`sig`/`dk`/`did-ssrf`/`data-ref`/`cur`/`err`/`meta`/
+    `rate`/`status`/`rcpt`/`lhr`/`log`/`rev`) cite #130.
+  - **`known_families_partition_into_covered_excused_or_deferred`** is the
+    new fifth ratchet test, and the one point of this phase: it asserts
+    `KNOWN_FAMILIES == COVERED ∪ EXCUSED ∪ DEFERRED` as a set. Unlike the
+    four existing ratchet tests, it is deliberately **unconditional** — it
+    touches no spec data, so it does not skip when `ACDP_SPEC_DIR` is
+    unset. The required `tests` CI job runs `cargo test --workspace` with
+    no spec configured, so this is what actually blocks a merge; verified
+    directly by temporarily adding an unclassified 30th family and
+    confirming only this test goes red under that exact job configuration.
+  - **`covered_direct_families_have_present_test_functions`** is the
+    mutation-proof half for `Direct`-mechanism families: it scans this
+    file's own compiled-in source (`include_str!`) for each named test
+    function, confirming it still exists with a test attribute directly
+    above it. This is deliberately an EXISTENCE check, not a correctness
+    check — the honest limit of what a spec-independent, self-inspecting
+    const can verify; documented as such rather than overclaimed, including
+    the two evasions it cannot catch (`#[ignore]` written above `#[test]`,
+    and the whole function wrapped in a `/* ... */` block comment).
+    Verified by temporarily stripping a `#[test]` attribute and observing
+    the expected failure, then reverting.
+  - The `Replayed` half of the same mutation proof lives inside
+    `replays_spec_fixtures_when_present` itself: every family claiming
+    `CoverageMechanism::Replayed` must have produced >= 1 exchange in that
+    very run's tally, checked against the spec at the pinned SHA.
+  - **Required-checks decision, recorded but not executed** (a repo-admin
+    action, out of scope for this diff): `conformance (spec fixtures)`
+    should join `rustfmt`/`clippy`/`tests` as a required branch-protection
+    context. Confirmed directly against this repo's branch protection that
+    it is not currently required. Leaving it advisory means only the
+    spec-independent half of this ratchet (the set-equality test and the
+    direct-mechanism scan) can ever block a merge; a regression that
+    silently drops a family's replayed exchanges while its `COVERED` entry
+    and direct tests stay intact would go unnoticed by required checks
+    alone. Flagged as a follow-up for a human with repo-admin access.
+
 - **`idem-001` through `idem-005` (RFC-ACDP-0003 §6 idempotency-key
   lifecycle) now have DIRECT, fixture-driven coverage** (`REG-10` Phase 10).
   These five fixtures don't fit Shape D — their top-level key is

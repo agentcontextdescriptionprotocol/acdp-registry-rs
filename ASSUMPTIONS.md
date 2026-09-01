@@ -314,3 +314,37 @@ public-API-contract changes, mirroring how the prior wave routed OQ2 (the witnes
   rewrite, or any `git push` — nothing reaches `main` and no PR opens. The fix would be an
   org App-settings grant, not a code change here.
 - **Status:** CONFIRMED (2026-08-31)
+
+### `conformance (spec fixtures)` should join the required branch-protection contexts (Phase 11)
+- **Plan:** plans/reg10-conformance-and-ci-hygiene.md
+- **Assumed:** the plan's Phase 11 acceptance criteria require recording an explicit
+  decision on whether `conformance (spec fixtures)` joins `rustfmt`/`clippy`/`tests` as a
+  required status-check context, with the plan itself recommending "yes," and explicitly
+  forbidding the executor from changing branch protection directly (repo-admin action,
+  out of this diff's scope).
+- **Verified, not assumed:** read this repo's actual branch protection via
+  `gh api repos/agentcontextdistributionprotocol/acdp-registry-rs/branches/main/protection`
+  — `required_status_checks.contexts` is exactly `["rustfmt", "clippy", "tests"]`.
+  `conformance (spec fixtures)` is confirmed NOT currently required, read-only, no change
+  made.
+- **Decision recorded (adopting the plan's recommendation):** `conformance (spec
+  fixtures)` SHOULD be added to the required contexts. Reasoning: Phase 11's coverage
+  ratchet now has two halves — a spec-independent half (the new
+  `known_families_partition_into_covered_excused_or_deferred` set-equality test and
+  `covered_direct_families_have_present_test_functions`'s source-presence scan, both in
+  the required `tests` job) and a spec-dependent half (the `Replayed`-mechanism assertion
+  inside `replays_spec_fixtures_when_present`, which needs `ACDP_SPEC_DIR` and lives only
+  in the advisory `conformance` job). Leaving `conformance` advisory means a regression
+  that silently drops a `COVERED`-`Replayed` family's exchanges (e.g. `pub`/`ret`/`vis`)
+  while `COVERED` itself and any `Direct` tests stay textually intact would pass every
+  required check and merge clean — exactly the failure mode this whole phase exists to
+  close, just moved one layer down.
+- **Not executed:** changing `required_status_checks.contexts` is a repo-admin branch
+  protection change, explicitly out of scope for this diff per the phase brief. Recorded
+  here as the decision + reasoning; the actual settings change is a follow-up for a human
+  with admin access on this repository.
+- **Blast radius if wrong:** low. If a human disagrees and leaves `conformance` advisory,
+  nothing in this diff breaks — the ratchet still gains real teeth in the required `tests`
+  job via the two unconditional tests; only the `Replayed`-mechanism half stays
+  advisory-only, the same gap that exists today for the whole ratchet.
+- **Status:** UNCONFIRMED (awaiting a repo admin to action the branch-protection change).
