@@ -57,9 +57,9 @@ serde          = { workspace = true }
 serde_json     = { workspace = true }
 sqlx           = { workspace = true }
 tempfile       = "3"
-ed25519-dalek  = { version = "2.2", features = ["rand_core"] }
+ed25519-dalek  = { version = "3.0", features = ["rand_core"] }
 uuid           = { workspace = true }
 # Serialize PG integration tests so they don't fight over the shared
 # truncate-and-test database. SQLite tests use disposable tempfiles so
 # they don't need this.
-serial_test    = "3"
+serial_test    = "4"
