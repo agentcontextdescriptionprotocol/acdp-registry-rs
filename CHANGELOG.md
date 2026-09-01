@@ -8,6 +8,94 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`vis-002` (4 scenarios), `vis-005` (4 scenarios), and `vis-009` (3
+  scenarios) — multi-context, capability-toggling visibility fixtures — now
+  replay end-to-end through Shape D, and `vis-007` gets direct in-process
+  coverage** (`REG-10` Phase 9b). `MIN_REPLAYED_EXCHANGES` rises from 14 to
+  25 (14 + `vis-002`'s 4 + `vis-005`'s 4 + `vis-009`'s 3). Two Shape D
+  capabilities Phase 8 built and proved only synthetically are exercised
+  against real fixtures for the first time: a per-scenario router rebuild
+  driven by `registry_capabilities_subset.anonymous_public_reads`
+  (`vis-002` scenarios 2/3 toggle `true`→`false` back-to-back against the
+  identical anonymous requester; `vis-009` toggles `false`→`true`→`false`
+  across all three scenarios), and ctx_id substitution reaching QUERY
+  STRINGS in both raw and percent-encoded form (`vis-005` scenario 2's
+  `search?derived_from=<percent-encoded private ctx_id>`). The
+  substitution-occurred check inside `replay_shape_d` was strengthened
+  alongside this: previously it only asserted no *raw* literal ctx_id
+  leaked into the built request path, which would have silently missed a
+  failed *query-string* substitution (the percent-encoded literal would
+  sit unnoticed in the path); it now also asserts, positively, that
+  whenever a scenario's original path referenced a fixture ctx_id at all,
+  the built path carries the MINTED replacement — catching exactly the
+  "substitution silently failed, empty result reads as a legitimate
+  negative" failure mode the Phase 8/9b plans both flag. `expected`
+  parsing gains two new assertable (not merely recognized) keys,
+  `total_estimate` and `matches_ctx_ids` — the latter translated through
+  the fixture's ctx_id substitution map at replay time, so a search that
+  returns the right *count* but the wrong *identity* (exactly what
+  `vis-005`'s two same-`did:agent:owner` seeds could produce if the Phase
+  8 `did_map` two-pass fix ever regressed) is caught, not just an
+  off-by-one. `vis-005`'s two seeds sharing one literal `agent_id` is the
+  exact shape Phase 8's GAP 1 (`did_map` overwrite on a shared literal
+  agent) was fixed for but never exercised by a real fixture until now;
+  `vis005_private_audience_search_excluded_via_derived_from` asserts
+  `did_map.len() == 1` on it directly. Across `vis-002` (3), `vis-005` (4),
+  `vis-007` (1, direct coverage), and `vis-009` (2), the pinned spec
+  fixtures carry exactly 10 `expected.total_estimate` occurrences; 9 of the
+  10 are asserted on their exact value, alongside `matches_count`. The
+  tenth — `vis-005` scenario 2, `search?derived_from=<private ctx_id>` — is
+  **not** a conformance divergence: the spec explicitly licenses an
+  approximate `total_estimate` ("May be approximate; not guaranteed to be
+  exact", `schemas/json/acdp-search-response.schema.json`; "SHOULD NOT be
+  relied upon for exact counts", `rfcs/RFC-ACDP-0005-discovery.md:219`; the
+  spec's own `examples/search/empty-page-post-filter-response.json` ships
+  the identical shape — an empty post-filtered page with a non-zero
+  estimate). One genuine, pre-existing registry characteristic surfaced
+  while building this: `total_estimate` (both `acdp-registry-sqlite` and
+  `acdp-registry-pg`, `DESIGN-01`) is computed from the same SQL scan that
+  applies RFC-ACDP-0008 §4.5 visibility, but `derived_from` (like
+  `status`/`tags`) is a documented *post*-SQL refinement applied afterward
+  in Rust — so it is a pre-refinement upper bound for a `derived_from`-
+  filtered search, not the post-filter count `vis-005` scenario 2's fixture
+  happens to pin at `0`; that `0` is one of several conformant values, and
+  this registry emits another. Verified live: `matches` correctly scopes to
+  empty (proving both the `derived_from` filter and the ctx_id substitution
+  work), while `total_estimate` returns the harmless pre-refinement scan
+  count instead. Exact-value assertion is therefore skipped for that one
+  `derived_from`-filtered scenario (see the carve-out in
+  `parse_scenarios_array`, and the corpus-wide tripwire
+  `derived_from_carve_out_matches_exactly_one_corpus_scenario`, which fails
+  loudly if a second such fixture ever appears); every other scenario
+  across all four fixtures keeps the full exact-value assertion. What the
+  carve-out does *not* skip: leak-invariance (RFC-ACDP-0005 §2.5.5 Q2's
+  MUST that a registry "avoid leaking their existence via per-requester
+  variance in the estimate") is asserted directly against a live registry
+  response in `vis005_private_audience_search_excluded_via_derived_from` —
+  the audience member and an outsider get the identical `total_estimate` on
+  the same `derived_from` query, both strictly below the producer's.
+  `anonymous_public_reads: false`
+  is NOT an unconditional "403" rule: `vis-009` scenario 2 sets the flag
+  `false` but expects a *successful* search because its requester is
+  authenticated — the flag gates anonymous reads only, and both the
+  `vis-002`/`vis-009` dedicated tests assert this directly rather than
+  the naive stricter reading. `vis-007` cannot reach Shape D at all: its
+  scenario 2 (`expected: {outcome:
+  "registry_must_not_emit_this_response", rationale}`) carries no `status`
+  whatsoever, so `parse_expected` fails on it and, by Shape D's
+  parse-all-or-nothing rule, the whole fixture stays unparseable there —
+  `vis007_search_match_restricted_visibility_disposition` seeds the one
+  restricted context directly and replays scenarios 0 and 1 for real
+  (`status`/`matches_count`/`total_estimate` all asserted), same
+  direct-coverage precedent as `vis-003`; only the MAY-shaped
+  `match_visibility_field_disposition`/`consumer_invariant` keys and
+  scenario 2 wholesale are recorded not-assertable. Mutation proofs (an
+  in-memory-only fixture clone, never written to the spec checkout) on
+  both `vis-002` (restricted context flipped to `public`) and `vis-005`
+  (the private seed flipped to `public`) fail replay specifically on a
+  `matches_count`/`matches_ctx_ids` mismatch. Shapes A, B, and C remain
+  textually unchanged.
+
 - **`vis-001` (5 scenarios) and `vis-004` (4 scenarios) — single-context
   restricted/private visibility fixtures — now replay end-to-end through
   Shape D, and `vis-003` (search response field-naming) gets direct
