@@ -8,6 +8,74 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`idem-001` through `idem-005` (RFC-ACDP-0003 §6 idempotency-key
+  lifecycle) now have DIRECT, fixture-driven coverage** (`REG-10` Phase 10).
+  These five fixtures don't fit Shape D — their top-level key is
+  `preconditions` (an existing idempotency record, never a literal
+  `ctx_id`), not `setup`, and `idem-005`'s `input` is a bare array of
+  publish descriptors, not `scenarios[]` — and none of Shape D's seeding
+  machinery has anything to seed here: the object under test IS the
+  publish response itself. So, same precedent as `anc`/`can`/`vis-003`/
+  `vis-007`: two direct tests, run beside the generic replayer (which
+  still, correctly, shows all five as unreached — "requires pre-seeded
+  state"). `idem001_004_publish_idempotency_key_lifecycle_and_restart_durability`
+  runs the full, mutually-dependent `idem-001`→`idem-002`→`idem-003`→
+  `idem-004` sequence against one shared, file-backed harness: `idem-001`
+  (fresh publish), a genuine registry-restart proof (reconnect to the same
+  on-disk SQLite file as a NEW `SqliteStore`/`RegistryServer`/`Router`,
+  proving the idempotency record — not just the context row — survives),
+  `idem-002` (same key + hash → byte-identical stored response returned,
+  not re-executed), `idem-003` (same key, different hash → 409
+  `duplicate_publish`, with a mutation proof that `idem-001`'s record is
+  unmodified AND that the rejected body was never persisted), and
+  `idem-004` (new key, same content → a fresh `ctx_id` AND `lineage_id`
+  despite byte-identical content). `idem005_no_support_ignores_idempotency_key_header`
+  runs against a SEPARATE, non-playground harness (a did:key producer
+  through the SDK's verified publish path) that genuinely does not
+  advertise `supports_idempotency_key`, proven by reading it back off
+  `GET /.well-known/acdp.json`, and asserts two independent publishes with
+  the same key both succeed with DIFFERENT `ctx_id`s. This repo's
+  `POST /contexts` returns HTTP **200** on success, not the fixtures' own
+  literal `201`, and never sets a `Location` header at all — both
+  deviations are recorded in a doc comment following the `anc-001`
+  precedent, not "fixed". `idem-002`'s `registry_must_not` clause (no
+  re-DID-resolution, no re-signature-verification) is stated honestly as
+  un-observable to a black-box HTTP assertion — the full-response-body
+  equality is the closest indirect evidence available, not a claim of
+  having observed the internals. `idem-006` (a concurrency-race fixture)
+  and `idem-007` (a capabilities-document validation check gated on
+  `acdp_version >= 0.3.0`) are recorded not-owed with their real reasons:
+  `idem-006` sits in the pinned spec's `tolerated_outcomes` — a THIRD
+  obligation category this repo's model didn't previously name, alongside
+  `required_fixtures`/`conditional_fixtures` — not a strict requirement;
+  `idem-007`'s version gate never fires against this harness's advertised
+  `0.1.0`. `MIN_REPLAYED_EXCHANGES` is unchanged at 30 — neither test
+  replays through the generic harness.
+  **Finding recorded, not fixed (out of this phase's scope — test file and
+  CHANGELOG only):** `acdp-registry-core`'s playground publish branch
+  (`crates/acdp-registry-core/src/handlers/context.rs`, the manual
+  idempotency lookup/record dance around `publish_unverified_for_tests`)
+  honors ANY `Idempotency-Key` header whenever one is present, with no
+  check of `supports_idempotency_key` anywhere in that branch — unlike
+  every other publish path (verified did:web, did:key, pinned-verified),
+  which routes through the upstream `acdp-server` SDK's own
+  `RegistryServer::commit_via_store` and gates correctly. It is
+  unreachable in a deployed registry, though not for the reason one might
+  assume: the playground publish branch carries no
+  `#[cfg(feature = "playground")]` (only the admin router does), so it
+  compiles into a stock build and activates on the runtime toggle alone.
+  What actually makes the divergence unrealizable is that
+  `crates/acdp-registry-server/src/main.rs:1026` hardcodes
+  `supports_idempotency_key: true` with no config knob, so the shipped
+  binary can never advertise `false` — the state in which honoring the
+  header would be wrong. It becomes live the moment that field is made
+  config-driven, as every other capability already is. Filed as an issue
+  rather than fixed here; it meant `idem-005` had to be
+  built against a non-playground, did:key harness instead of the shared
+  playground harness `idem-001`..`004` use — see the doc comment on
+  `idem005_no_support_ignores_idempotency_key_header` for the full
+  write-up.
+
 - **`vis-008` (5 scenarios) — the last parked `vis` seed shape,
   `setup.lineages` — now replays end-to-end through Shape D** (`REG-10`
   Phase 9c). `MIN_REPLAYED_EXCHANGES` rises from 25 to 30. This is the last

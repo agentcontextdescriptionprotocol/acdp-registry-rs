@@ -81,10 +81,10 @@
 //!     positive-substitution proof is the SOLE guard against a silently
 //!     broken `lineage_id` substitution passing green; see its doc comment
 //!     for the full mechanism and the removal-proof that backs this claim.
-//!   * **Skipped — requires pre-seeded state** — `idem-*` and other
-//!     fixtures whose `setup`/`preconditions` (top-level or under `input`)
-//!     need a context with a specific registry-assigned `ctx_id` the publish
-//!     API won't let us mint, PLUS `ret-002`, excluded from
+//!   * **Skipped — requires pre-seeded state** — fixtures whose
+//!     `setup`/`preconditions` (top-level or under `input`) need a context
+//!     with a specific registry-assigned `ctx_id` the publish API won't
+//!     let us mint, PLUS `ret-002`, excluded from
 //!     [`parse_seed_lineage_version`] for two independent reasons: its
 //!     `setup.lineages` entries carry no `visibility` key at all (unlike
 //!     `vis-008`'s) — a REQUIRED key that's absent, not an unrecognized one
@@ -96,7 +96,32 @@
 //!     real publishes: publishing v2 always makes v2 (not v1) the active
 //!     head. As of Phase 9b, `vis-001`, `vis-002`, `vis-004`, `vis-005`,
 //!     `vis-006`, and `vis-009` had escaped this bucket via Shape D; as of
-//!     Phase 9c, `vis-008` joins them too (`ret-002` remains).
+//!     Phase 9c, `vis-008` joins them too (`ret-002` remains). `idem-001`
+//!     through `idem-005` land in this same replayer-skip bucket
+//!     structurally (their `preconditions` — an existing idempotency
+//!     record, not a literal ctx_id — gate them off Shape D, which only
+//!     ever dispatches on `setup`) but, as of REG-10 Phase 10, now have
+//!     DIRECT fixture-driven coverage instead, same `anc`/`can`/`vis-003`/
+//!     `vis-007` precedent:
+//!     `idem001_004_publish_idempotency_key_lifecycle_and_restart_durability`
+//!     (the full `idem-001` → `idem-002` → `idem-003` → `idem-004`
+//!     sequence, sharing one file-backed harness so `idem-001`'s own
+//!     `post_publish_invariants[1]` — the idempotency record surviving a
+//!     registry restart — can be proven against a genuinely rebuilt
+//!     `Router`/`RegistryServer`/`SqliteStore` connection over the same
+//!     on-disk file, not merely inferred from the still-alive in-process
+//!     harness) and `idem005_no_support_ignores_idempotency_key_header` (a
+//!     SEPARATE harness that genuinely does not advertise
+//!     `supports_idempotency_key`). `idem-006` (a concurrency-race fixture
+//!     the pinned spec itself lists under `tolerated_outcomes`, not
+//!     `required_fixtures`/`conditional_fixtures` — RFC-ACDP-0003 §6.2.1
+//!     step 4's atomicity bound, non-deterministic by the fixture's own
+//!     `implementation_note`) and `idem-007` (conditional on
+//!     `acdp_version >= 0.3.0`; this harness advertises `0.1.0`, so the
+//!     condition never fires) are NOT owed by this repo's advertised
+//!     capabilities and get no coverage here — see the doc comment on
+//!     `idem001_004_publish_idempotency_key_lifecycle_and_restart_durability`
+//!     for the full not-owed reasoning.
 //!   * **Skipped — Shape D: unrecognized scenario/expected key** — `vis-007`
 //!     alone, as of Phase 9b: Shape D CAN seed it (its `setup` fully
 //!     parses), but scenario 2 carries no `status`/`http_status` at all
@@ -4773,6 +4798,534 @@ fn wit004_key_mismatch_cosignature_is_rejected_and_wit001_golden_is_accepted() {
     );
 }
 
+// ─── REG-10 Phase 10 (plans/reg10-conformance-and-ci-hygiene.md): idem-001
+// through idem-005 direct, fixture-driven coverage ───
+//
+// **Shape E vs. direct tests -- decision.** `idem-001` through `idem-005` do
+// NOT fit Shape D: their top-level key is `preconditions` (an existing
+// idempotency RECORD -- `(agent_id, idempotency_key, content_hash)` --
+// never a literal, unmintable `ctx_id`), not `setup`, and `idem-005`'s
+// `input` is a bare two-element ARRAY of publish descriptors, not a
+// `scenarios[]` array of `{request, expected}` pairs. None of Shape D's
+// actual machinery -- `SeedContext`/`SeedLineage` parsing, the ctx_id/DID/
+// lineage_id substitution tables, per-scenario bearer minting, or the
+// scenario-level `registry_capabilities_subset` router rebuild -- has
+// anything to seed here: the object under test on every one of these five
+// fixtures IS the publish response itself, not a read against a
+// pre-existing row Shape D would have to seed first. Bolting a narrow
+// "Shape E" onto `extract_shapes` for a five-fixture family whose real work
+// is a strictly ORDERED, mutually dependent sequence of publishes
+// (`idem-002`/`003`/`004` all replay against the record `idem-001` itself
+// creates) would buy nothing Shape D already has and would cost the flat,
+// single-exchange replay contract every other shape keeps. So, same
+// precedent as `anc-*`/`can-*`/`vis-003`/`vis-007` above: DIRECT,
+// fixture-driven coverage below, run BESIDE the generic replayer, not
+// instead of it -- the replayer's own skip manifest (module doc-block,
+// "Skipped -- requires pre-seeded state") still (correctly) shows
+// `idem-001`..`idem-005` as unreached by `extract_shapes`, because direct
+// coverage bypasses shape-dispatch entirely. `MIN_REPLAYED_EXCHANGES` is
+// UNCHANGED by this phase for the same reason `anc`/`can`/`vis-003`/
+// `vis-007`'s direct tests never moved it: none of these five exchanges
+// pushes through `replayed`.
+//
+// **Deviation, following the `anc-001` precedent verbatim (see
+// `anc001_well_formed_anchor_is_accepted_and_round_trips`'s own doc comment
+// above; also `CHANGELOG.md`).** This repo's `POST /contexts` returns HTTP
+// **200** on a successful publish
+// (`crates/acdp-registry-core/src/handlers/context.rs:635`,
+// `Ok(Json(response))`), never the fixtures' own literal `201`. Every
+// status this section asserts is the CORRECTED value (200/200/409/200/200
+// for `idem-001`..`005`), not the fixture literal -- each test below also
+// asserts the fixture's OWN literal separately, as a sanity check that the
+// deviation is real and not invented. Relatedly, `idem-001`'s
+// `expected.headers.Location` has NO counterpart to assert: this repo never
+// sets a `Location` header anywhere (grepped `crates/acdp-registry-core/
+// src/` -- zero hits), so it is a second, silent deviation from the
+// fixture and is likewise NOT asserted, NOT synthesized, and NOT "fixed" --
+// both deviations are recorded here, in prose, as the `anc-001` precedent
+// requires, rather than either faked or fixed (a wire-contract change this
+// plan forbids).
+//
+// **idem-006 / idem-007 -- not owed, with their real reasons (per the
+// pinned spec's own `registries/profiles.json`, `acdp-registry-core`
+// profile).** `idem-006` sits in `tolerated_outcomes` (`profiles.json:140`
+// at pin `417211f`), a THIRD obligation category alongside
+// `required_fixtures` and `conditional_fixtures` -- its own notes call it a
+// fixture that "documents a tolerated race outcome and is not a strict
+// requirement". It pins RFC-ACDP-0003 §6.2.1 step 4's atomicity BOUND under
+// concurrent same-key-same-hash publishes, and its own `implementation_note`
+// says black-box testing of the race is non-deterministic and wants "a
+// stress harness that submits N>=100 paired publishes" -- a dedicated
+// concurrency-stress instrument, not a single deterministic HTTP exchange
+// this file's harness can produce. Tolerated, not required or conditional:
+// NOT owed, and deliberately out of scope for this phase. `idem-007` is in
+// `conditional_fixtures`, gated on `acdp_version >= 0.3.0`
+// (`profiles.json:128`); this harness's `caps()` (`:327` above) advertises
+// `"0.1.0"`, so the condition never fires and the fixture is NOT owed
+// either. (Separately, even if it WERE owed: `idem-007` pins a CONSUMER-side
+// cross-field check over a capabilities document -- "a 0.3.0 document with
+// supports_idempotency_key absent/false is self-contradictory; consumers
+// MUST reject it" -- not a registry HTTP endpoint. This registry doesn't
+// reject its own capabilities document at serve time; a downstream consumer
+// library enforces this when deciding whether to trust a FETCHED document,
+// which is out of this repo's remit regardless of the version gate.)
+fn idem_producer(seed: u8) -> Producer {
+    common::producer("idem", seed)
+}
+
+/// Reconnects to the SAME on-disk SQLite file a [`common::StoreMode::File`]
+/// harness was built against, as a genuinely NEW `SqliteStore` connection,
+/// `RegistryServer`, `AuthService`, and `Router` -- simulating an operator
+/// restarting the registry process. Same technique as `http_integration.rs`'s
+/// own restart-style reconnect (`SqliteStore::connect(h.db_path(), 1)`, its
+/// capability-downgrade-across-restart test); used below to prove
+/// `idem-001`'s own `post_publish_invariants[1]` ("An idempotency record
+/// exists ... and survives a registry restart") against a REAL rebuild, not
+/// merely inferred from the still-alive in-process `Harness`. WAL mode
+/// (`SqliteStore::connect`'s own `journal_mode(Wal)`) is what makes this
+/// safe to run while the original `Harness`'s own connection pool is still
+/// alive in the same process -- the exact same coexistence
+/// `http_integration.rs`'s precedent already relies on.
+async fn idem_rebuild_router_over_same_file(
+    db_path: &Path,
+    caps: CapabilitiesDocument,
+    cfg: RegistryConfig,
+) -> axum::Router {
+    use acdp::registry::RegistryServer;
+    use acdp_registry_auth::{
+        AuthService, ChallengeStore, InMemoryChallengeStore, JwtSecret, JwtSigner,
+    };
+    use acdp_registry_core::{build_router, AppStateInner};
+    use acdp_registry_sqlite::SqliteStore;
+    use std::sync::Arc;
+
+    let store = SqliteStore::connect(db_path, 1).await.unwrap();
+    let server = Arc::new(RegistryServer::try_new(store, caps, AUTHORITY).unwrap());
+    let challenges: Arc<dyn ChallengeStore> = Arc::new(InMemoryChallengeStore::new());
+    let secret = JwtSecret::from_bytes(&[42u8; 32]);
+    let signer = JwtSigner::new(secret, format!("did:web:{AUTHORITY}"), AUTHORITY.into(), 30);
+    let resolver = Arc::new(acdp::did::WebResolver::new());
+    let auth = Arc::new(AuthService::new(
+        AuthConfig::default(),
+        challenges,
+        signer,
+        resolver,
+        AUTHORITY.into(),
+    ));
+    let state = AppStateInner::new(server, auth, None, cfg, None);
+    build_router(state)
+}
+
+/// `idem-001` -> `idem-002` -> `idem-003` -> `idem-004`: the RFC-ACDP-0003
+/// §6 idempotency-key lifecycle, sequential and mutually dependent
+/// (`idem-002`/`003`/`004` all replay against the very record `idem-001`
+/// creates), so all four run against ONE `StoreMode::File` harness in this
+/// one test, in fixture order, with a genuine process-restart proof spliced
+/// in immediately after `idem-001` (before `idem-002` runs) -- both to
+/// discharge `idem-001`'s own restart invariant AND so `idem-002`/`003`/
+/// `004` themselves exercise state that has genuinely round-tripped through
+/// a rebuild, not merely survived within one long-lived `Router`.
+#[tokio::test(flavor = "multi_thread")]
+async fn idem001_004_publish_idempotency_key_lifecycle_and_restart_durability() {
+    let Some(fixtures) = spec_fixtures() else {
+        eprintln!(
+            "conformance: ACDP_SPEC_DIR unset or no fixtures resolvable; skipping \
+             idem-001..004 (set ACDP_REQUIRE_CONFORMANCE to make this a hard failure)"
+        );
+        return;
+    };
+    let Some(fx1) = find_fixture_by_id(&fixtures, "idem-001") else {
+        return;
+    };
+    let Some(fx2) = find_fixture_by_id(&fixtures, "idem-002") else {
+        return;
+    };
+    let Some(fx3) = find_fixture_by_id(&fixtures, "idem-003") else {
+        return;
+    };
+    let Some(fx4) = find_fixture_by_id(&fixtures, "idem-004") else {
+        return;
+    };
+
+    // Sanity: every one of the four fixtures' own preconditions is exactly
+    // what this harness's caps() (`:327` above) advertises --
+    // supports_idempotency_key: true, limits.idempotency_key_ttl_seconds:
+    // 86400 -- so this harness is a faithful stand-in for what each fixture
+    // asks to be tested against.
+    for (label, fx) in [
+        ("idem-001", &fx1),
+        ("idem-002", &fx2),
+        ("idem-003", &fx3),
+        ("idem-004", &fx4),
+    ] {
+        let subset = &fx["preconditions"]["registry_capabilities_subset"];
+        assert_eq!(
+            subset["supports_idempotency_key"], true,
+            "{label} precondition: {fx}"
+        );
+        assert_eq!(
+            subset["limits"]["idempotency_key_ttl_seconds"], 86400,
+            "{label} precondition: {fx}"
+        );
+    }
+    // Sanity: the fixtures' own literals are what motivate the deviation
+    // note above -- 201 where this repo returns 200.
+    assert_eq!(
+        fx1["expected"]["http_status"], 201,
+        "idem-001 fixture literal (pre-correction)"
+    );
+    assert_eq!(
+        fx4["expected"]["http_status"], 201,
+        "idem-004 fixture literal (pre-correction)"
+    );
+    // idem-002 and idem-003 need NO correction -- their own literals are
+    // already 200 and 409 respectively.
+    assert_eq!(
+        fx2["expected"]["http_status"], 200,
+        "idem-002 fixture literal"
+    );
+    assert_eq!(
+        fx3["expected"]["http_status"], 409,
+        "idem-003 fixture literal"
+    );
+    let want_error_code = fx3["expected"]["error_code"]
+        .as_str()
+        .expect("idem-003 carries expected.error_code")
+        .to_string();
+
+    let h = common::build_harness_with_webhook(
+        config(),
+        caps(),
+        AUTHORITY,
+        common::StoreMode::File,
+        None,
+        None,
+    )
+    .await;
+
+    // req1 is reused byte-for-byte for idem-002's "retry" and idem-004's
+    // "same content, new key" -- so its content_hash is bound, by
+    // construction, to whatever this SDK actually computes (same technique
+    // as anc-001's H1/H2 binding), never a literal from the fixture.
+    let p = idem_producer(1);
+    let req1 = p
+        .publish_request()
+        .title("idem-key-cycle: first publish, content_hash sha256:H1")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+
+    // ── idem-001: first publish with a fresh Idempotency-Key ──
+    let (s1, v1) = common::publish(&h.router, &req1, Some("idem-key-AAAA")).await;
+    assert_eq!(
+        s1,
+        StatusCode::OK,
+        "idem-001: this repo's POST /contexts returns 200 on success (not the fixture's own \
+         literal 201); body = {v1}"
+    );
+    // response_shape: exactly the five registry-assigned fields -- no
+    // registry_receipt (this harness's caps() advertises no receipts
+    // profile) and no Location header to check (see the section doc
+    // comment's deviation note -- none exists anywhere in this repo).
+    let mut keys: Vec<&str> = v1.as_object().unwrap().keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec!["created_at", "ctx_id", "lineage_id", "status", "version"],
+        "idem-001 response_shape: exactly the five standard publish-response fields; body = {v1}"
+    );
+    let ctx_id_1 = v1["ctx_id"].as_str().unwrap().to_string();
+
+    // post_publish_invariants[0]: GET /contexts/{ctx_id}/body serves the
+    // body byte-identically to what was signed -- checked both as a
+    // producer-controlled field (title) and, rigorously, as the recomputed
+    // content_hash reproducing what was signed (same invariant-2 technique
+    // as anc-001, since content_hash IS the byte-identity check:
+    // `compute_content_hash` strips exactly the registry-assigned +
+    // integrity fields the served Body carries on top of what was signed --
+    // acdp-crypto's own EXCLUDE set).
+    let (gs, served) = anc_get(
+        &h.router,
+        &format!("/contexts/{}/body", pct_encode_path_segment(&ctx_id_1)),
+    )
+    .await;
+    assert_eq!(gs, StatusCode::OK, "idem-001 GET body = {served}");
+    assert_eq!(
+        served["title"], req1.title,
+        "idem-001: served title must match what was signed"
+    );
+    let recomputed = acdp::crypto::compute_content_hash(&served).unwrap();
+    assert_eq!(
+        recomputed, req1.content_hash,
+        "idem-001 post_publish_invariants[0]: recomputed content_hash over the served body \
+         must reproduce what was signed"
+    );
+
+    // post_publish_invariants[1]: the idempotency record survives a
+    // registry restart. Reconnect to the SAME on-disk file as a genuinely
+    // NEW SqliteStore/RegistryServer/Router -- not the still-alive
+    // `h.router`.
+    let restarted = idem_rebuild_router_over_same_file(h.db_path(), caps(), config()).await;
+    // (a) the context row itself survives, byte-identically:
+    let (gs2, served2) = anc_get(
+        &restarted,
+        &format!("/contexts/{}/body", pct_encode_path_segment(&ctx_id_1)),
+    )
+    .await;
+    assert_eq!(gs2, StatusCode::OK, "post-restart GET body = {served2}");
+    assert_eq!(
+        served2, served,
+        "context body must survive a registry restart byte-identically"
+    );
+    // (b) the IDEMPOTENCY RECORD survives too, not just the context row:
+    // replaying idem-001's own (key, content_hash) against the RESTARTED
+    // router must short-circuit to the ORIGINAL ctx_id, which is only
+    // possible if the idempotency_records row was read back off disk by the
+    // freshly-reconnected store.
+    let (s_restart_replay, v_restart_replay) =
+        common::publish(&restarted, &req1, Some("idem-key-AAAA")).await;
+    assert_eq!(
+        s_restart_replay,
+        StatusCode::OK,
+        "body = {v_restart_replay}"
+    );
+    assert_eq!(
+        v_restart_replay, v1,
+        "idem-001 post_publish_invariants[1]: the idempotency record (not just the context \
+         row) must survive a registry restart -- replaying the same key+hash after a genuine \
+         store reconnect must return the ORIGINAL stored response byte-identically"
+    );
+
+    // idem-002/003/004 continue against `restarted` -- proving they too
+    // exercise state that has genuinely round-tripped through a rebuild,
+    // not merely a long-lived in-process Router.
+    let app = restarted;
+
+    // ── idem-002: retry, same key AND same content_hash -> 200, stored
+    // response returned byte-identically (NOT re-executed) ──
+    let (s2, v2) = common::publish(&app, &req1, Some("idem-key-AAAA")).await;
+    assert_eq!(s2, StatusCode::OK, "idem-002: body = {v2}");
+    assert_eq!(
+        v2, v1,
+        "idem-002 expected.response_body: byte-identical to the response stored for idem-001 \
+         (ctx_id, lineage_id, created_at, status, version all equal)"
+    );
+    // expected.registry_must_not lists un-observable internals -- "re-execute
+    // DID resolution", "re-execute signature verification" -- that no
+    // black-box HTTP assertion can see directly. Stated plainly rather than
+    // overclaimed: the full-body equality just above is the closest
+    // INDIRECT evidence this harness can produce (identical ctx_id AND
+    // created_at is only explicable by a short-circuited lookup, since two
+    // independent full pipeline runs would mint a new ctx_id and a new
+    // created_at) -- it does not, and cannot, observe whether the DID
+    // resolver or signature verifier were actually invoked or skipped.
+
+    // ── idem-003: same key, DIFFERENT content_hash -> 409
+    // duplicate_publish; mutation-proof idem-001's record is unmodified
+    // afterward ──
+    let req3 = p
+        .publish_request()
+        .title("idem-key-cycle: corrected title, content_hash sha256:H2 -- must-not-persist")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    assert_ne!(
+        req3.content_hash.0, req1.content_hash.0,
+        "sanity: req3's recomputed content_hash must genuinely differ from req1's (H2 != H1)"
+    );
+    let (s3, v3) = common::publish(&app, &req3, Some("idem-key-AAAA")).await;
+    assert_eq!(
+        s3,
+        StatusCode::CONFLICT,
+        "idem-003 expected.http_status: 409; body = {v3}"
+    );
+    assert_eq!(
+        v3["error"]["code"], want_error_code,
+        "idem-003 expected.error_code"
+    );
+    // Mutation proof 1: idem-001's own record must be UNCHANGED -- replay
+    // the ORIGINAL (key, H1) again; it must still return the ORIGINAL
+    // stored response, not something the rejected H2 attempt could have
+    // clobbered.
+    let (s3b, v3b) = common::publish(&app, &req1, Some("idem-key-AAAA")).await;
+    assert_eq!(s3b, StatusCode::OK, "body = {v3b}");
+    assert_eq!(
+        v3b, v1,
+        "idem-003 registry_must_not: idem-001's record must be unmodified after a rejected \
+         different-hash reuse of its key"
+    );
+    // Mutation proof 2: req3's body was never persisted at all -- search
+    // for the marker unique to req3's title and confirm zero matches.
+    let (ss, sv) = anc_get(&app, "/contexts/search?q=must-not-persist").await;
+    assert_eq!(ss, StatusCode::OK, "body = {sv}");
+    assert!(
+        sv["matches"].as_array().unwrap().is_empty(),
+        "idem-003 registry_must_not: the rejected H2 body must never have been persisted; \
+         search body = {sv}"
+    );
+
+    // ── idem-004: NEW key, SAME content_hash -> 200 (corrected), a FRESH
+    // ctx_id AND a fresh lineage_id despite byte-identical content ──
+    let (s4, v4) = common::publish(&app, &req1, Some("idem-key-BBBB")).await;
+    assert_eq!(
+        s4,
+        StatusCode::OK,
+        "idem-004: this repo's POST /contexts returns 200 on success (not the fixture's own \
+         literal 201); body = {v4}"
+    );
+    assert_ne!(
+        v4["ctx_id"], v1["ctx_id"],
+        "idem-004 response_constraints: a new Idempotency-Key MUST mint a new ctx_id even for \
+         byte-identical content"
+    );
+    assert_ne!(
+        v4["lineage_id"], v1["lineage_id"],
+        "idem-004 response_constraints: a new ctx_id deterministically produces a new \
+         lineage_id (RFC-ACDP-0001 §5.6)"
+    );
+    assert_eq!(
+        v4["version"], fx4["expected"]["response_constraints"]["version"],
+        "idem-004 response_constraints: version"
+    );
+    assert_eq!(
+        v4["status"], fx4["expected"]["response_constraints"]["status"],
+        "idem-004 response_constraints: status"
+    );
+}
+
+/// `idem-005`: a registry that does NOT advertise
+/// `supports_idempotency_key` must ignore the `Idempotency-Key` header
+/// entirely -- every publish is fresh, even repeated with the same header
+/// value. Runs against a SEPARATE harness (never the shared `caps()`/
+/// `harness()` pair the rest of this file uses, which DOES advertise
+/// support) -- and proves that harness genuinely does not advertise the
+/// capability by reading it back off `GET /.well-known/acdp.json`, not by
+/// assuming the local `CapabilitiesDocument` construction was honored.
+///
+/// **Deliberately NOT playground** (unlike `idem-001`..`004` above), and
+/// this is itself a finding worth recording plainly rather than papering
+/// over: `acdp-registry-core`'s OWN playground publish branch
+/// (`crates/acdp-registry-core/src/handlers/context.rs`, the manual
+/// idempotency lookup/record dance around `publish_unverified_for_tests`)
+/// honors ANY `Idempotency-Key` header whenever one is present, with no
+/// check of `state.server.capabilities().supports_idempotency_key`
+/// anywhere in that branch -- unlike the upstream `acdp-server` SDK's own
+/// `RegistryServer::commit_via_store` (`registry/server.rs:587`,
+/// `let idempotency = if self.caps.supports_idempotency_key { ... } else
+/// { None }`), which every OTHER publish path (verified did:web, did:key,
+/// pinned-verified) routes through and which gates correctly. A first
+/// attempt at this test, built on the shared playground harness like
+/// `idem-001`..`004`, demonstrated this directly: two identical publishes
+/// with the same key came back with the SAME ctx_id even with
+/// `supports_idempotency_key: false` on the capabilities document --
+/// because the playground branch never consulted it. That is a real
+/// behavioral gap in this repo's TEST-ONLY playground shortcut, not a
+/// production-conformance failure (an operator serving real traffic uses
+/// the did:web/did:key verified paths, which gate correctly), and fixing
+/// production code is out of this phase's scope (`crates/
+/// acdp-registry-server/tests/conformance.rs` and `CHANGELOG.md` only) --
+/// so this test instead exercises the path that actually pins `idem-005`'s
+/// contract: a did:key producer (offline-verifiable, no network resolver
+/// needed) against a NON-playground harness, which routes through
+/// `RegistryServer::publish_verified_did_key_in_tenant` ->
+/// `commit_via_store` and therefore genuinely respects
+/// `supports_idempotency_key: false`. Recorded here, and in the section's
+/// CHANGELOG entry, as an honest finding rather than silently worked
+/// around.
+#[tokio::test(flavor = "multi_thread")]
+async fn idem005_no_support_ignores_idempotency_key_header() {
+    let Some(fixtures) = spec_fixtures() else {
+        eprintln!(
+            "conformance: ACDP_SPEC_DIR unset or no fixtures resolvable; skipping idem-005 \
+             (set ACDP_REQUIRE_CONFORMANCE to make this a hard failure)"
+        );
+        return;
+    };
+    let Some(fx5) = find_fixture_by_id(&fixtures, "idem-005") else {
+        return;
+    };
+    assert_eq!(
+        fx5["preconditions"]["registry_capabilities_subset"]["supports_idempotency_key"], false,
+        "idem-005 precondition: {fx5}"
+    );
+    // Sanity: the fixture's own literal is 201 for both publishes (this
+    // repo's 200 is the same deviation noted in the section doc comment).
+    assert_eq!(
+        fx5["expected"]["first_publish"]["http_status"], 201,
+        "idem-005 fixture literal (pre-correction)"
+    );
+    assert_eq!(
+        fx5["expected"]["second_publish"]["http_status"], 201,
+        "idem-005 fixture literal (pre-correction)"
+    );
+
+    let mut no_support_caps = caps();
+    no_support_caps.supported_did_methods = vec!["did:web".into(), "did:key".into()];
+    no_support_caps.supports_idempotency_key = false;
+    let mut no_support_cfg = config();
+    // Non-playground: force every publish through the SDK's verified
+    // did:key path (`RegistryServer::publish_verified_did_key_in_tenant` ->
+    // `commit_via_store`), the one that actually gates on
+    // `caps.supports_idempotency_key` -- see the doc comment above.
+    no_support_cfg.playground.enabled = false;
+    let app = common::build_harness_with_webhook(
+        no_support_cfg,
+        no_support_caps,
+        AUTHORITY,
+        common::StoreMode::Memory,
+        None,
+        None,
+    )
+    .await
+    .router;
+
+    // Proof this harness genuinely does not advertise the capability --
+    // read it back off the wire, not off the local construction.
+    let (caps_status, caps_body) = anc_get(&app, "/.well-known/acdp.json").await;
+    assert_eq!(caps_status, StatusCode::OK, "body = {caps_body}");
+    assert_eq!(
+        caps_body["supports_idempotency_key"], false,
+        "idem-005 harness must genuinely NOT advertise idempotency support: {caps_body}"
+    );
+
+    let p = Producer::new_did_key(SigningKey::from_bytes(&[205u8; 32]));
+    let req = p
+        .publish_request()
+        .title("idem-005: no-support registry ignores Idempotency-Key")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+
+    let (s1, v1) = common::publish(&app, &req, Some("idem-key-AAAA")).await;
+    assert_eq!(
+        s1,
+        StatusCode::OK,
+        "idem-005 first_publish: this repo's POST /contexts returns 200 on success (not the \
+         fixture's own literal 201); body = {v1}"
+    );
+    let (s2, v2) = common::publish(&app, &req, Some("idem-key-AAAA")).await;
+    assert_eq!(
+        s2,
+        StatusCode::OK,
+        "idem-005 second_publish: this repo's POST /contexts returns 200 on success (not the \
+         fixture's own literal 201); body = {v2}"
+    );
+    assert_ne!(
+        v1["ctx_id"], v2["ctx_id"],
+        "idem-005 constraint: C2 MUST NOT equal C1 -- the second publish is fresh despite the \
+         identical Idempotency-Key header value, because the capability isn't advertised"
+    );
+    // registry_must_not: never a 200-with-replay-semantics response
+    // (already ruled out by the differing ctx_ids above -- both DID return
+    // 200, but for the OK-general-publish reason, not an idempotent-replay
+    // reason) and never duplicate_publish (the header has no semantics at
+    // all here, so same-key-same-hash can never collide) -- s2 == OK (not
+    // CONFLICT) already rules the latter out.
+}
+
 // ─── REG-3 Phase 7 (plans/reg3-anchors.md): anc-001/002/003 direct,
 // fixture-driven coverage ───
 //
@@ -5855,6 +6408,29 @@ fn fixture_family_panics_naming_file_when_id_missing() {
 /// no real publish sequence can produce (publishing v2 always makes v2,
 /// not v1, the active head) — structurally excluded, not by fixture id.
 /// Only `vis`'s *coverage* changed here, never its classification.
+///
+/// `idem` (RFC-ACDP-0003 §6 idempotency keys) was never `EXCUSED` either —
+/// `idem-001`..`idem-005` sit in `acdp-registry-core`'s own
+/// `conditional_fixtures`, gated on `supports_idempotency_key: true`, which
+/// `caps()` (`:327` above) advertises, making them live obligations. The
+/// generic replay harness still classifies all five "requires pre-seeded
+/// state" (their `preconditions` key — an existing idempotency record —
+/// isn't a shape any of A/B/C/D dispatch on), but REG-10 Phase 10 gives
+/// them DIRECT fixture-driven coverage, same `anc`/`can`/`vis-003`/
+/// `vis-007` precedent:
+/// `idem001_004_publish_idempotency_key_lifecycle_and_restart_durability`
+/// (the full `idem-001`→`idem-002`→`idem-003`→`idem-004` sequence, one
+/// shared file-backed harness, with a genuine store-reconnect proving
+/// `idem-001`'s restart invariant) and
+/// `idem005_no_support_ignores_idempotency_key_header` (a second harness
+/// that genuinely does not advertise the capability). `idem-006` is
+/// unowed but for a THIRD reason this repo's `EXCUSED`/obligation model
+/// didn't previously have a name for: the pinned spec's own
+/// `tolerated_outcomes` array (`profiles.json:140`), not `required_
+/// fixtures` or `conditional_fixtures` — see the doc comment on
+/// `idem001_004_publish_idempotency_key_lifecycle_and_restart_durability`
+/// for the full reasoning, including `idem-007`'s separate (version-gated)
+/// not-owed reason.
 const KNOWN_FAMILIES: &[&str] = &[
     "anc",
     "body",
