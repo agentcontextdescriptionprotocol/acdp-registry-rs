@@ -73,6 +73,27 @@ closes out `ASSUMPTIONS.md`'s 8 `UNCONFIRMED` entries logged during implementati
   needs correcting for both `acdp-rs` and this repo.
 - **Status:** CONFIRMED (2026-08-29). **Follow-up owed:** file the `acdp-ci` issue
   (tracked below, not yet filed as of this entry — see Follow-ups).
+- **Correction (2026-09-01):** the `acdp-ci` issue was filed and resolved —
+  `acdp-ci#9` ("Move the v1 tag — CI-1/CI-6/CI-7 hardening is merged to main
+  but unreachable at v1"), now CLOSED. `acdp-ci`'s `v1` tag has been re-tagged
+  to the current `main` HEAD (`015910153b61c32abbe018afe85d44868897bf3b`,
+  verified via `git rev-parse v1^{commit}`/`git rev-parse main` in a local `acdp-ci`
+  checkout) and now contains `actions/checkout-spec` (`git ls-tree -r v1`
+  lists `actions/checkout-spec/action.yml`). The premise that motivated
+  "confirm as-is" (an unusable `v1`) no longer holds; this repo still does
+  inline checkout rather than adopting `checkout-spec@v1`, which is fine —
+  nothing requires the change — but the DELIVERY-STANDARD.md staleness this
+  entry flagged for `acdp-ci` is only PARTIALLY fixed: `acdp-ci#9` (closed) was
+  scoped solely to re-tagging `v1` and never mentions the status-line text, and
+  a byte-for-byte diff of `DELIVERY-STANDARD.md`'s status paragraph between
+  `22dd548` and current `acdp-ci` HEAD (`0159101`) shows no change — it still
+  reads "As of 2026-08-28: `acdp-rs` pins via this action; `acdp-verifier-py`
+  (PY-2) and `acdp-registry-rs` (REG-1) are scheduled to adopt it — until they
+  do, their CI does not enforce this rule." That line is now factually wrong
+  about this repo: `acdp-registry-rs` already pins the spec at a 40-hex SHA
+  inline (`.github/workflows/ci.yml:161`), just not via `checkout-spec@v1`.
+  Part (b) of the original follow-up (correcting the status line) was never
+  filed and remains outstanding.
 
 ### 2. `bump-spec.yml` scope
 - **Assumption:** no `bump-spec.yml` in this repo; the pinned spec SHA will never
@@ -91,6 +112,13 @@ closes out `ASSUMPTIONS.md`'s 8 `UNCONFIRMED` entries logged during implementati
   already shipped. **Follow-up owed:** (a) add `bump-spec.yml` to this repo, (b) file an
   issue/PR against the spec repo's `notify-spec-consumers.yml` matrix + update
   DELIVERY-STANDARD.md's status line for this repo.
+- **Correction (2026-09-01):** part (a) shipped — `.github/workflows/bump-spec.yml`
+  exists (commit `87e4127`, "ci: add bump-spec.yml for spec-pin bumps (#110) (#119)").
+  Part (b) is still outstanding: the spec repo's
+  `.github/workflows/notify-spec-consumers.yml` dispatch matrix (line 25) is still
+  hardcoded `repo: [acdp-rs, acdp-verifier-py]` — `acdp-registry-rs` has not been added,
+  verified directly against that file. **Status:** part (a) DONE, part (b) still
+  NEEDS-FOLLOWUP.
 
 ### 4. REG-1 acceptance criterion — the "as applicable" reading
 - **Assumption:** REG-1's acceptance criterion named six families (`pub-, vis-, idem-,
@@ -114,6 +142,20 @@ closes out `ASSUMPTIONS.md`'s 8 `UNCONFIRMED` entries logged during implementati
 - **Status:** NEEDS-FOLLOWUP (2026-08-29). Shipped code is sound; a scheduling gap, not
   a code defect. **Follow-up owed:** schedule "stateful replay" as a new REG-item
   (numbering TBD by whoever next touches `plans/00-overview.md`'s status board).
+- **Correction (2026-09-01):** the "`lc`/`fed` and `caps` are legitimately not
+  applicable" claim above does not match the shipped `EXCUSED`/`DEFERRED` split.
+  Verified directly against `crates/acdp-registry-server/tests/conformance.rs`: `EXCUSED`
+  (~6585-6618) is exactly `fp`, `data-ref-ssrf`, `fed`, `rot` — only `fed` of the three
+  named here actually got the "not applicable" treatment. `caps` is `DEFERRED`
+  (~6714-6719) with the reason "required-but-uncovered: ... mechanically inexcusable" —
+  the opposite of not-applicable. `lc` is `DEFERRED` (~6730-6735), reason: "plausibly
+  excusable, but that has never been declared, so it stays DEFERRED rather than silently
+  assumed EXCUSED" — i.e. this entry's own "not applicable" framing is precisely the
+  unearned assumption that DEFERRED status was created to refuse. The stateful-replay
+  follow-up this entry scheduled did ship (REG-10 Phases 5-11): `vis` and `idem` are now
+  both `COVERED` in the same file (Replayed + Direct for `vis`; Direct for `idem`),
+  closing the gap this entry flagged for those two families. `caps` and `lc` remain
+  open, tracked as `DEFERRED` under issue #115, not closed by this correction.
 
 ### 3. `can`/`lin` deliberately not excused from the coverage ratchet
 - **Assumption:** `can` (12 fixtures) and `lin` (1 fixture) stay in `KNOWN_FAMILIES`
@@ -183,6 +225,13 @@ closes out `ASSUMPTIONS.md`'s 8 `UNCONFIRMED` entries logged during implementati
 - **Status:** NEEDS-FOLLOWUP (2026-08-29). **Follow-up owed:** file a backlog item (new
   REG-item or a note on `plans/00-overview.md`'s status board) for
   `storage-memory` CI coverage.
+- **Correction (2026-09-01):** shipped — commit `57d74e9` ("ci: build and lint
+  storage-memory in required checks (REG-10, #109) (#118)"). `.github/workflows/ci.yml`
+  now runs a `clippy (memory)` step (`--no-default-features --features storage-memory`,
+  lines 56-60) and a `cargo test (memory)` step (lines 135-138) inside the `test` job
+  (`test:` at line 97, display name `tests`) — not the `msrv` job (lines 64-80), which
+  only runs `cargo check (sqlite default)` (line 74) and `cargo check (postgres)`
+  (line 76) and never touches `storage-memory`. **Status:** DONE.
 
 ---
 
@@ -203,6 +252,26 @@ yet done as of this reconcile pass:**
 
 None of these are blocking anything already merged. They are new, separately-scoped
 work items for a future session.
+
+**Correction (2026-09-01) — status of the five follow-ups above, re-verified against
+current `main`:**
+1. PARTIAL — `acdp-ci#9` filed and closed; `acdp-ci`'s `v1` tag now points at `main` and
+   contains `checkout-spec`. But `acdp-ci#9`'s scope was the `v1` tag only — it never
+   mentions DELIVERY-STANDARD.md's status lines, which remain byte-identical to
+   `22dd548` and are now factually wrong about this repo (see entry #1's correction
+   above). The stale-status-line half of this follow-up was never filed and is still
+   owed.
+2. DONE — `.github/workflows/bump-spec.yml` shipped (commit `87e4127`, #119).
+3. STILL OWED — the spec repo's `notify-spec-consumers.yml` dispatch matrix (line 25) is
+   still `[acdp-rs, acdp-verifier-py]`; `acdp-registry-rs` has not been added.
+4. DONE — `vis`/`idem` are both `COVERED` in
+   `crates/acdp-registry-server/tests/conformance.rs` as of REG-10 Phases 5-11 (see entry
+   #4's correction above). Note `caps`/`lc` were never claimed closeable by this
+   follow-up and remain `DEFERRED` (#115).
+5. DONE — `storage-memory` runs in `.github/workflows/ci.yml`'s required checks (commit
+   `57d74e9`, #118; see entry #7's correction above).
+
+Item 3 is fully open; item 1's status-line half is also still open (see above).
 
 ---
 
@@ -280,6 +349,16 @@ items.
      `witnessed_count` checks just above it.
 - **Status:** CONFIRMED (2026-08-29). **Follow-ups owed:** the two items above, both low
   priority, not scheduled.
+- **Correction (2026-09-01):** both follow-ups shipped in commit `0d26107` ("refactor
+  (core): split verify_and_store for testability; state what the quorum assertion proves
+  (#112, #113) (#121)"). (1) `verify_and_store` is now split at the DID-resolution
+  boundary into a private `verify_and_store_resolved` in
+  `crates/acdp-registry-core/src/witness.rs`, with two new tests exercising the
+  post-resolution store path directly against a real `SqliteStore`. (2) The quorum
+  assertion's message and surrounding comment at
+  `crates/acdp-registry-server/tests/conformance.rs:4893` now states the honest
+  limitation — it proves consistency with `witnessed_count` but cannot discriminate
+  which of the two cosignatures verified. **Status:** DONE.
 
 ### OQ3 — file a spec-repo issue for the assumed `rev-001` profiles.md/profiles.json divergence
 - **Assumption:** at spec pin `31cf874`, `profiles.md`'s `acdp-registry-core` row lists
@@ -315,6 +394,17 @@ items.
   between the two repos, not a defect in this decision; (b) `ci.yml:63`'s
   `dtolnay/rust-toolchain@master` is a mutable branch ref, the loosest pin in the repo —
   cheapest single hardening pickup if a future pass wants one.
+- **Correction (2026-09-01):** both follow-ups shipped, commit `9313267` ("ci(security):
+  SHA-pin third-party actions and replace two unreachable pins (#116)"). (a) Every
+  third-party `uses:` line in `.github/workflows/ci.yml` is now SHA-pinned — 15 of 15
+  (`grep -c 'uses:.*@[0-9a-f]\{40\}' .github/workflows/ci.yml` → 15); only the deliberate
+  first-party `actions/checkout@v4` / `actions/upload-artifact@v4` carve-outs remain on
+  tags, matching the posture this entry already treated as acceptable. (b)
+  `dtolnay/rust-toolchain` is now pinned to
+  `6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master` (a real commit SHA, not a floating
+  branch ref); `ci.yml:63` no longer refers to that line at all — the file has grown, and
+  line 63 is now a comment ("instead of aspirational. Checks both shipped storage
+  backends."). **Status:** DONE.
 
 ### OQ5 — PR count: kept PR C (axum-server 0.8) and PR D (axum 0.8 migration) separate
 - **Assumption:** isolating the axum-server security fix from the larger HTTP-stack
@@ -351,3 +441,14 @@ one-way-door ambiguity found on the one item (OQ2) that warranted a dedicated lo
 
 All five are new, separately-scoped, low-priority items for a future session — none
 require action before anything already merged is considered done.
+
+**Correction (2026-09-01) — status of the five follow-ups above, re-verified against
+current `main`:**
+1. DONE — shipped in `0d26107` (#112). See OQ1's correction above.
+2. DONE — shipped in `0d26107` (#113). See OQ1's correction above.
+3. Not re-verified by this pass — `acdp-playground` is a sibling repo outside this
+   correction's scope; status unchanged.
+4. DONE — `ci.yml`'s third-party actions are now all SHA-pinned (`9313267`, #116). See
+   OQ4's correction above.
+5. DONE — `dtolnay/rust-toolchain` is SHA-pinned, not a floating `@master` ref (`9313267`,
+   #116). See OQ4's correction above.

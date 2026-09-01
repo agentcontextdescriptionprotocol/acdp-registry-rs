@@ -1172,3 +1172,41 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `README.md`, `CONTRIBUTING.md`, and `SECURITY.md` corrected to reflect
   that `acdp` is consumed from crates.io (no sibling path dependency) and
   the current auth/hardening surface.
+- **Documentation-accuracy pass (`REG-10` docs follow-up) — two inaccuracies
+  corrected, both in the permissive direction (docs described the code as
+  safer/more restricted than it actually is). Two source comments carrying
+  the same false permissive framing were also corrected
+  (`crates/acdp-registry-core/src/lib.rs`, `crates/acdp-registry-core/src/handlers/admin.rs`)
+  — comments only, no logic or signature changes, no behavior change.**
+  - `CONFIGURATION.md`'s `[playground]` section and `README.md`'s feature
+    list said the DID-signature bypass itself was "compiled in only with
+    the `playground` Cargo feature." It is not: only the two `/admin/*`
+    routes (`admin_router` in `crates/acdp-registry-core/src/lib.rs`) are
+    `#[cfg(feature = "playground")]`-gated. The publish handler's
+    DID-verification skip
+    (`crates/acdp-registry-core/src/handlers/context.rs`, the
+    `playground_snapshot.enabled` branch) is a plain runtime `if` present in
+    every build, including a stock release binary — verified directly: that
+    file's only `cfg` attributes are three `#[cfg(test)]` blocks. Corrected
+    to say so; the existing "never enable
+    in production" warning is retained and strengthened — it now leads the
+    section (previously buried behind a paragraph of compile-gating detail)
+    and reads as the stronger, accurate claim (the risk exists regardless of
+    how the binary was built, and is scoped to non-`did:key` publishes),
+    not weakened. `OPERATIONS.md` and `HTTP-API.md` already scoped
+    the feature-gate claim correctly, to the admin routes only.
+  - `HTTP-API.md`'s endpoint table and Admin section said `GET
+    /admin/contexts` requires the admin bearer (`auth.admin_tokens`), like
+    the other `/admin/*` routes. It does not: `admin_list`
+    (`crates/acdp-registry-core/src/handlers/admin.rs`) calls only
+    `caller_from_headers`/`tenant_for_request` — the same resolution the
+    regular tenant-scoped read routes use — and never
+    `require_admin_bearer`, unlike `reload_pinned_keys`, `admin_status`,
+    `lineage_audit`, and the lifecycle-transition handlers, which do.
+    With `auth.enabled = false` the route is fully anonymous — and even with
+    `auth.enabled = true`, no bearer is required at all when the
+    `Authorization` header is simply absent (`caller_from_headers` returns
+    `Ok(None)`), so an unauthenticated request still enumerates public
+    contexts. This is a pre-existing gap between the route's `/admin/` path
+    and its actual authorization, not a behavior change — `OPERATIONS.md`
+    and `README.md`'s endpoint table corrected to match.
