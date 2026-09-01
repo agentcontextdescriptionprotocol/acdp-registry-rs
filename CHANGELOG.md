@@ -8,6 +8,49 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`vis-008` (5 scenarios) — the last parked `vis` seed shape,
+  `setup.lineages` — now replays end-to-end through Shape D** (`REG-10`
+  Phase 9c). `MIN_REPLAYED_EXCHANGES` rises from 25 to 30. This is the last
+  fixture needing a THIRD substitution table, `fixture_lineage_id ->
+  minted_lineage_id`, built alongside the existing ctx_id and DID tables
+  (`SeedLineage`/`SeedLineageVersion`, `parse_seed_lineages`) rather than
+  special-cased outside the substitution layer. `vis-008` seeds two
+  two-version lineages (`a1 -> a2`, both `restricted`, same audience/owner;
+  `b1` `public` -> `b2` **`private`**, same owner — the head is private
+  while v1 stays public) through REAL `Producer::supersede_body()`-chained
+  publishes, in ascending `version`-field order (the fixture carries no
+  explicit `supersedes` key), never a direct store write. `status`
+  (`active`/`superseded`) is never a seed input — `PublishRequest` has no
+  such field — it is asserted as the registry COMPUTES it from the
+  supersession, cross-checked against the fixture's own `status` literal
+  per lineage version; at pin `417211f` the registry's computed status
+  matches every one of the fixture's four literals exactly, so no
+  `anc-001`-style deviation note was needed. Two response shapes no earlier
+  phase needed: `GET /lineages/{lineage_id}` returns a bare JSON array
+  (scenario 0's `stranger on a fully-restricted lineage gets 200 + []`, not
+  404 — asserted via an EXPLICIT `body == []` equality check, not inferred
+  from `matches_ctx_ids` being an empty set, because an unsubstituted or
+  unknown `lineage_id` also 200s with an empty array); `GET
+  /lineages/{lineage_id}/current` returns a single `FullContext` object
+  with singular `ctx_id` and a nested `registry_state.status` (scenario 4).
+  A new `assert_substitution_sound` helper generalizes the existing
+  raw-and-percent-encoded substitution-occurred proof (previously inline
+  and ctx_id-specific) so it covers the lineage_id table too — closing the
+  one place a wrong-but-200 answer could otherwise read as correct.
+  Mutation-proven: `vis008_mutated_lineage_version_order_fails_replay`
+  swaps the `version` field between lineage b's two entries (nothing
+  else), which reverses which version publishes first and flips the
+  lineage's real head from private to public — scenario 3 then gets 200
+  instead of its expected 404, failing the replay. `ret-002` (also
+  `setup.lineages`) was checked deliberately and does NOT become
+  replayable as a side effect: its lineage versions carry no `visibility`
+  key and one carries `expires_at`, both outside
+  `parse_seed_lineage_version`'s recognized set, and its first lineage
+  requires an "abnormal state: every version is superseded" that a real
+  publish sequence cannot produce (publishing v2 always makes v2, not v1,
+  the active head) — it remains classified `requires pre-seeded registry
+  state`, unchanged from before this phase.
+
 - **`vis-002` (4 scenarios), `vis-005` (4 scenarios), and `vis-009` (3
   scenarios) — multi-context, capability-toggling visibility fixtures — now
   replay end-to-end through Shape D, and `vis-007` gets direct in-process
