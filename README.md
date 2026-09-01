@@ -42,8 +42,10 @@ see [docs/HTTP-API.md](docs/HTTP-API.md).
   `search.executed`.
 - **Abuse controls & observability** — per-IP and global `/auth/*` rate
   limiting, and an optional Prometheus `/metrics` endpoint.
-- **Playground mode** — compile-time + runtime feature that skips DID
-  verification for hands-on demos.
+- **Playground mode** — a runtime config flag (`[playground] enabled = true`,
+  compiled into every build) that skips DID verification for hands-on demos;
+  never enable in production. Only its admin routes are compile-gated behind
+  the `playground` Cargo feature.
 
 ## Repository layout
 
@@ -144,7 +146,7 @@ Selected routes (the full surface, including request/response shapes, is in
 | GET    | `/admin/lineages/{id}/audit`      | On-demand lineage integrity audit (admin bearer). |
 | POST   | `/admin/contexts/{id}/retract`    | Admin retraction (admin bearer). |
 | POST   | `/admin/contexts/{id}/republish`  | Admin republish (admin bearer). |
-| GET    | `/admin/contexts`                 | Compile-gated by `playground` (admin bearer). |
+| GET    | `/admin/contexts`                 | Compile-gated by `playground`; **not** admin-bearer gated — see [docs/HTTP-API.md#admin](docs/HTTP-API.md#admin). |
 | POST   | `/admin/pinned-keys/reload`       | Compile-gated by `playground` (admin bearer). |
 
 Visibility (`public` / `restricted` / `private`) is enforced server-side per

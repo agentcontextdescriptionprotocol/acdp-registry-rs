@@ -1,8 +1,12 @@
 //! Admin endpoints.
 //!
 //! `admin_status` ships in every build (auth-gated by `auth.admin_tokens`).
-//! The mutating playground helpers (`admin_list`, `reload_pinned_keys`) are
-//! compiled only with the `playground` feature.
+//! `admin_list` (read-only tenant-scoped listing) and `reload_pinned_keys`
+//! (the one mutating helper here — hot-swaps the `[playground]` config
+//! section) are compiled only with the `playground` feature. Unlike every
+//! other `/admin/*` handler, `admin_list` does NOT call
+//! `require_admin_bearer` / check `auth.admin_tokens` — see its doc comment
+//! below and `docs/HTTP-API.md`'s `## Admin` section.
 
 use std::sync::Arc;
 
@@ -38,6 +42,12 @@ pub struct AdminListResponse {
     pub next_cursor: Option<String>,
 }
 
+/// Paginated tenant-scoped context listing (playground feature).
+///
+/// NOT admin-bearer gated: resolves the caller/tenant via
+/// `caller_from_headers`/`tenant_for_request`, the same helpers the regular
+/// read routes use, and never calls `require_admin_bearer` or checks
+/// `auth.admin_tokens`. See `docs/HTTP-API.md`'s `## Admin` section.
 #[cfg(feature = "playground")]
 pub async fn admin_list<S: ExtendedRegistryStore + 'static>(
     State(state): State<Arc<AppState<S>>>,

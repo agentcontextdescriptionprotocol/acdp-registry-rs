@@ -75,16 +75,22 @@ path. Never edit an applied migration.
 
 ## Admin endpoints
 
-Bearer-gated against `auth.admin_tokens` (constant-time compare; an empty list
-disables every admin route). Generate tokens out of band and distribute them to
+Most are bearer-gated against `auth.admin_tokens` (constant-time compare; an
+empty list disables every route that checks it). `GET /admin/contexts` is an
+exception — see below and [HTTP-API.md](HTTP-API.md#admin) for the full
+picture. Generate admin tokens out of band and distribute them to
 operators / monitoring.
 
-- `GET /admin/status` — always shipped. An operational snapshot: storage health,
-  idempotency record count, webhook queue depth, configured revocation feeds,
-  and migration state. Good for a readiness probe richer than `/healthz`. Shape
-  in [HTTP-API.md](HTTP-API.md#get-adminstatus).
+- `GET /admin/status` — always shipped, admin-bearer gated. An operational
+  snapshot: storage health, idempotency record count, webhook queue depth,
+  configured revocation feeds, and migration state. Good for a readiness
+  probe richer than `/healthz`. Shape in
+  [HTTP-API.md](HTTP-API.md#get-adminstatus).
 - `GET /admin/contexts`, `POST /admin/pinned-keys/reload` — only in builds with
-  the `playground` Cargo feature.
+  the `playground` Cargo feature. `POST /admin/pinned-keys/reload` is
+  admin-bearer gated; `GET /admin/contexts` is **not** — despite its path, it
+  uses the same tenant/caller resolution as the regular read routes, not
+  `auth.admin_tokens`.
 
 ```bash
 curl -H "Authorization: Bearer $ADMIN_TOKEN" https://registry.example.com/admin/status

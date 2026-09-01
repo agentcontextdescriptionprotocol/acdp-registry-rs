@@ -24,6 +24,13 @@ full recommendation + human decision on each. This file is kept as the original 
    `fed`/`caps` are legitimately not-applicable; `vis`/`idem` are core-required and the
    gap should be scheduled, not left indefinite. Shipped code stands; NEEDS-FOLLOWUP for
    a stateful-replay phase.
+   **Correction (2026-09-01):** the "`lc`/`fed`/`caps` legitimately not-applicable"
+   framing was wrong — verified against
+   `crates/acdp-registry-server/tests/conformance.rs`'s shipped `EXCUSED`/`DEFERRED`
+   lists (~6585-6735): only `fed` is `EXCUSED`; `caps` and `lc` are `DEFERRED` (open,
+   #115), not not-applicable. The
+   `vis`/`idem` stateful-replay follow-up did ship (REG-10 Phases 5-11) and both are now
+   `COVERED`. Full detail in `DECISIONS.md`'s 2026-09-01 correction on entry #4.
 
 5. **`h2` advisory fix bundled into REG-7's PR.** CONFIRMED — no bundling policy
    violated, fix was a prerequisite for REG-7's own acceptance criterion, already merged.
@@ -348,3 +355,12 @@ public-API-contract changes, mirroring how the prior wave routed OQ2 (the witnes
   job via the two unconditional tests; only the `Replayed`-mechanism half stays
   advisory-only, the same gap that exists today for the whole ratchet.
 - **Status:** UNCONFIRMED (awaiting a repo admin to action the branch-protection change).
+- **Executed (2026-09-01):** a repo admin actioned the recorded recommendation.
+  Re-verified via the same read-only call,
+  `gh api repos/agentcontextdistributionprotocol/acdp-registry-rs/branches/main/protection`
+  — `required_status_checks.contexts` is now exactly `["rustfmt", "clippy", "tests",
+  "conformance (spec fixtures)"]`. All other protection settings were left unchanged:
+  `strict: true`, `enforce_admins: false`, `allow_force_pushes: false`,
+  `allow_deletions: false`, `required_linear_history: false`.
+- **Status (updated 2026-09-01):** CONFIRMED — the branch-protection change recommended
+  above has been made, flipping the original UNCONFIRMED status above.
