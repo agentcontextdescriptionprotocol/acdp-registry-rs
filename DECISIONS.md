@@ -452,3 +452,152 @@ current `main`:**
    OQ4's correction above.
 5. DONE — `dtolnay/rust-toolchain` is SHA-pinned, not a floating `@master` ref (`9313267`,
    #116). See OQ4's correction above.
+
+---
+
+# RECONCILED (2026-09-01) — `reg10-conformance-and-ci-hygiene`
+
+Four `UNCONFIRMED` entries from the REG-10 plan, walked in blast-radius order. Each was
+given to a fresh **Opus** recommender (Opus substituted for Fable per standing
+instruction); every recommendation was input only. All four verdicts are the human's.
+
+## 1. First-party reusable workflows trusted by mutable `@v1` (Phase 3)
+
+- **Assumption:** #111's SHA-pinning mandate scopes to third-party actions;
+  `agentcontextdistributionprotocol/*` reusable workflows are trusted by major tag.
+  `bump-spec.yml:18` uses `bump-spec-ref.yml@v1` with `secrets: inherit`. Ranked first:
+  the only entry touching a trust boundary, and the only one that can change without a
+  commit in this repo. **This assumption had never been logged** — it surfaced from
+  review of the phase, not from `ASSUMPTIONS.md`; it is now recorded there retroactively.
+- **Recommendation (Opus):** CONFIRM as-is. It is an existing convention, not a new risk —
+  all three first-party refs in this repo use `@v1`, and the convention is stated upstream
+  at `acdp-ci/.github/workflows/auto-merge.yml:10-11`. SHA-pinning the outer hop would be
+  partly illusory, since the callee itself consumes `actions/checkout@v7` and
+  `create-github-app-token@v3`. Its own strongest counter: the ruleset's admin bypass makes
+  it a speed bump, and "we already do it elsewhere" is precedent, not justification.
+- **Correction to that recommendation (found on the ship gate, after the decision):** the
+  upstream citation does not carry the weight it was given. `auto-merge.yml:10-11` says
+  first-party `actions/*` — GitHub's own namespace — are trusted by major tag; it says
+  nothing about `agentcontextdistributionprotocol/*` reusable workflows, and the same file
+  SHA-pins the third-party `dependabot/fetch-metadata`. So the "existing convention"
+  support reduces to the three in-repo `@v1` refs, which the recommendation itself already
+  labelled precedent rather than justification. The verdict is unchanged — it was confirmed
+  on the reachability and trigger analysis, not on this citation — but the citation is
+  narrower than the recommendation implied and should not be leaned on again.
+- **Two of its claims were independently re-verified before the decision, because both
+  changed the answer:**
+  - An earlier check in this session found `acdp-ci` had **no** rulesets. That is now
+    stale. Ruleset `21899019` `protect-v-tags` exists, `enforcement: active`, created
+    `2026-08-30T21:36:03-07:00`, covering `refs/tags/v*` with
+    `creation`/`update`/`deletion`/`non_fast_forward`, `bypass_actors` = `RepositoryRole 5`
+    (admin) only. The force-move vector the assumption was written about closed between
+    the two checks.
+  - **The recommender was corrected on one point.** It treated `bump-spec.yml` and
+    `auto-merge.yml` as comparably exposed and concluded auto-merge should be fixed first.
+    They differ in kind: `bump-spec.yml` has `secrets: inherit` (org bot App key +
+    `CARGO_REGISTRY_TOKEN`) but only `repository_dispatch`/`workflow_dispatch` triggers, so
+    it is not fork-reachable; `auto-merge.yml` runs `on: pull_request` but has **no**
+    `secrets: inherit`, receiving only `contents: write`/`pull-requests: write`, which
+    GitHub downgrades to read-only for fork PRs. High-privilege/low-reach vs.
+    lower-privilege/high-reach — its "fix auto-merge first" conclusion does not follow.
+- **Decision:** **Confirm as-is.** No code change. The `auto-merge.yml` observation was
+  reviewed and deliberately left as-is — no issue filed, recorded here instead so it is not
+  rediscovered as novel.
+- **Status:** CONFIRMED (2026-09-01).
+
+## 2. Memory `test` leg ships without an anti-vacuity guard (Phase 2)
+
+- **Assumption:** the load-bearing half of #109's fix is `clippy (memory)`'s `--all-targets`
+  compile, which cannot go vacuous; the `cargo test (memory)` leg therefore ships with no
+  assertion on its own test count.
+- **Recommendation (Opus):** CONFIRM the entry as written — and file the *real* gap
+  separately rather than amending this one. The feared regression is near-unreachable:
+  `tests/anchors_uri_never_dereferenced.rs` is a source-grep test that never constructs a
+  store, so gating it on `storage-sqlite` would defeat its own purpose; even if someone did,
+  the leg drops to 38, not 0 (`conformance_gate.rs` is ungated and survives; the "37" in the
+  recommendation and in `ASSUMPTIONS.md` was off by one, corrected in both).
+  The count is read off the sources, not off a run — see the evidence caveat below. It cannot go vacuous, only thinner. The
+  `ACDP_REQUIRE_CONFORMANCE` precedent does not transfer — that guards a suite compiling to
+  literally zero, and there is no such cliff here. Its own strongest counter: under memory
+  the harness exercises `MemoryStore` zero times, so the run half is substantively
+  decorative either way.
+- **The larger gap it identified:** `MemoryStore` overrides only `migrate`/`health`/
+  `list_contexts` (`crates/acdp-registry-server/src/memory_ext.rs:98-119`), so tenancy runs
+  on trait defaults. Traced through, tenancy **fails closed** on memory — a non-default
+  tenant sees nothing — which is a broken demo, not a data leak, on a backend documented as
+  ephemeral. Its proportionate fix is not a behavioral suite but one startup refusal
+  mirroring the existing guard at `crates/acdp-registry-server/src/main.rs:317-323`.
+- **Evidence limits, stated rather than papered over:** the recommender could not run
+  `cargo test` (sandbox denied `target/` writes). Neither could this pass — cargo fails to
+  write `.d` files in *any* directory in this environment, including a freshly created one,
+  though it succeeded earlier in the session. **Entry 2 therefore rests on static
+  verification of the cfg gates, not on a measured test count.** Gates confirmed from
+  source: `conformance.rs:383`, `http_integration.rs:26`, `metrics_integration.rs:8` are
+  `#![cfg(feature = "storage-sqlite")]`; `pg_integration.rs:20` is `storage-pg`;
+  `anchors_uri_never_dereferenced.rs` and `conformance_gate.rs` carry no crate-level cfg.
+- **Decision:** **Confirm, and file the real gap as its own issue.** The count guard stays
+  unbuilt — it is a tripwire for a door nobody uses, priced in false positives on every new
+  test. The startup-refusal fix is tracked separately, not folded into a CI-plumbing phase.
+- **Status:** CONFIRMED (2026-09-01). Follow-up filed as #137; not blocking.
+
+## 3. Pin durability generalized to `taiki-e/install-action` (Phase 1)
+
+- **Assumption:** the human's ruling on `dtolnay/rust-toolchain` — prefer a default-branch-
+  reachable SHA plus an explicit input over a convenient-but-unreachable ref-selector SHA —
+  is a principle that generalizes, not a one-off.
+- **Recommendation (Opus):** CONFIRM. Verified: the pin `1ed6d7be` is a true ancestor of
+  `main` (`compare` → `behind 14`); the `cargo-llvm-cov` tool tag is off `main`'s history
+  entirely (`ahead 1, behind 0`), and the tag has since moved off the entry's earlier
+  `ea647c55` to `2af88edc` — which is the point, these commits are regenerated per release.
+  Stated precisely, because an earlier draft of this line overstated it: `ea647c55` still
+  resolves (HTTP 200, `ahead 1, behind 14`); it is dangling — referenced by no tag or
+  branch — not deleted. Upstream's own framing of the hazard is a commit *not present on
+  the repository*, which is a stronger condition than this one and is not what happened
+  here. Upstream's own security section
+  *discourages* hash-pinning tool tags and routes pinners to a version tag, so the chosen
+  shape follows vendor guidance rather than deviating from it. The "version bumps now need a
+  deliberate commit" objection is answered in-repo by `.github/dependabot.yml:13-19`.
+- **Decision:** **Confirm as-is.** No code change.
+- **Status:** CONFIRMED (2026-09-01).
+
+## 4. Amended acceptance criterion 4 (Phase 1)
+
+- **Assumption:** AC4's wording ("the coverage job's install-action pin still defaults
+  `tool: cargo-llvm-cov`") encoded a *means*, not the *end*, and was amended to "the coverage
+  job installs `cargo-llvm-cov`, via an explicitly passed `tool:` input on a `main`-reachable
+  pin."
+- **Recommendation (Opus):** CONFIRM. AC4's letter was unsatisfiable — `tool` is required
+  with no default on `v2`/`main`; a `default:` exists only in the generated tool-tag commit,
+  i.e. only on the ref the phase existed to stop using. AC4 thus encoded "keep the orphan
+  pin" as a hidden premise. What makes the amendment legitimate rather than
+  criterion-shopping: the *end* was preserved verbatim, only the *means* clause moved, and it
+  was logged rather than quietly applied. Its own strongest counter: amendment-by-implementer
+  erodes if unpoliced.
+- **Decision:** **Confirm as-is.** Adopted as the standing rule for future phases: **amend a
+  criterion only when the new wording is strictly narrower than or equal to the original on
+  the outcome; escalate when it would weaken what is being verified. Always log the
+  amendment.**
+- **Status:** CONFIRMED (2026-09-01).
+
+## Standing rule adopted this pass — extending a prior human ruling
+
+Entry 3 raised a question larger than itself: a ruling given on one action was extended to a
+second without re-asking. Put to the human directly, since it sets precedent. **Ruling: a
+prior decision may be extended to a new instance without re-asking only when all three
+hold —**
+
+1. the **reason given** applies unchanged, not merely the outcome;
+2. the second instance sits inside the **same unit of work** already under review;
+3. the blast radius is **bounded and fails loudly**.
+
+Anything failing one of the three gets asked. Logging to `ASSUMPTIONS.md` as `UNCONFIRMED`
+remains mandatory either way — that log, not the good outcome, is what made this entry
+reviewable at all.
+
+## Summary
+
+4 entries: **4 confirmed, 0 changed, 0 deferred.** No code follow-up blocks the next
+`/ship`. One non-blocking issue filed (#137 — entry 2's `MemoryStore` startup refusal). One
+previously-unlogged Phase 3 assumption recorded retroactively in `ASSUMPTIONS.md`. Two
+standing rules adopted: the criterion-amendment rule (entry 4) and the ruling-extension bar
+(above).
