@@ -242,7 +242,9 @@ public-API-contract changes, mirroring how the prior wave routed OQ2 (the witnes
   unreachable ref-selector SHA — is a *principle* that generalizes, not a one-off ruling on
   that single action.
 - **Chose:** applied the same resolution to `taiki-e/install-action` without stopping to ask
-  again. Pinned `1ed6d7be…  # v2.87.2` (`compare main...` → `identical`) and passed
+  again. Pinned `1ed6d7be…  # v2.87.2` (`compare main...` → `identical` when measured for
+  this entry; re-measured 2026-09-01 it reads `ahead 0, behind 14` — same conclusion, a true
+  ancestor of `main`, which has simply advanced since) and passed
   `tool: cargo-llvm-cov` explicitly, replacing `ea647c55… # cargo-llvm-cov` (`ahead 1,
   behind 0` — not in `main`'s history; upstream's README calls hash-pinning tool tags
   "strongly discouraged" for exactly this reason).
@@ -254,7 +256,7 @@ public-API-contract changes, mirroring how the prior wave routed OQ2 (the witnes
 - **Blast radius if wrong:** near zero. One workflow line plus a `with:` block; revert is a
   one-line change. If the explicit `tool:` were wrong the coverage job fails loudly at
   `cargo llvm-cov`, in CI, before merge.
-- **Status:** UNCONFIRMED
+- **Status:** CONFIRMED (2026-09-01) — see `DECISIONS.md`. The generalization itself was also ruled on; the standing bar is recorded there.
 
 ### Amended acceptance criterion 4 (Phase 1)
 - **Plan:** plans/reg10-conformance-and-ci-hygiene.md
@@ -268,7 +270,7 @@ public-API-contract changes, mirroring how the prior wave routed OQ2 (the witnes
   let a criterion written before the facts were known dictate a worse outcome.
 - **Blast radius if wrong:** none beyond the item above; this is bookkeeping on the same
   change.
-- **Status:** UNCONFIRMED
+- **Status:** CONFIRMED (2026-09-01) — see `DECISIONS.md`.
 
 ### Memory `test` leg ships without an anti-vacuity guard (Phase 2)
 - **Plan:** plans/reg10-conformance-and-ci-hygiene.md
@@ -281,7 +283,8 @@ public-API-contract changes, mirroring how the prior wave routed OQ2 (the witnes
   `metrics_integration.rs` each run 0, all being `#![cfg(feature = "storage-sqlite")]`;
   `pg_integration.rs` also runs 0, but because it is `#![cfg(feature = "storage-pg")]`
   (`tests/pg_integration.rs:20`). If someone later adds a `storage-sqlite` cfg gate to
-  `anchors_uri_never_dereferenced.rs`, the leg silently drops to 37 with no signal.
+  `anchors_uri_never_dereferenced.rs`, the leg silently drops to 38 with no signal
+  (`conformance_gate.rs` is ungated and survives).
 - **Alternatives:** (a) reuse `tests/conformance_gate.rs` by setting
   `ACDP_REQUIRE_CONFORMANCE` on the new memory step — rejected because it does not work:
   that guard asserts `cfg!(feature = "storage-sqlite")` is *on*
@@ -293,7 +296,7 @@ public-API-contract changes, mirroring how the prior wave routed OQ2 (the witnes
 - **Blast radius if wrong:** low and slow. The compile/lint coverage survives regardless; only
   the run-the-harness half could erode, and only via a future edit that adds a sqlite cfg gate
   to a currently-ungated test file.
-- **Status:** UNCONFIRMED
+- **Status:** CONFIRMED (2026-09-01) — see `DECISIONS.md`. The count guard stays unbuilt; a separate, larger gap (the leg exercises `MemoryStore` essentially zero times) was filed as its own issue (#137) rather than folded in here.
 
 ### `acdp-deps-bot` holds `workflows: write` in this repo (Phase 3)
 - **Plan:** plans/reg10-conformance-and-ci-hygiene.md
@@ -364,3 +367,41 @@ public-API-contract changes, mirroring how the prior wave routed OQ2 (the witnes
   `allow_deletions: false`, `required_linear_history: false`.
 - **Status (updated 2026-09-01):** CONFIRMED — the branch-protection change recommended
   above has been made, flipping the original UNCONFIRMED status above.
+
+### First-party reusable workflows are trusted by mutable major tag (Phase 3)
+- **Plan:** plans/reg10-conformance-and-ci-hygiene.md
+- **Logged retroactively 2026-09-01.** This assumption was made during Phase 3 but never
+  written down at the time — it surfaced during `/reconcile`'s review of the phase, not
+  from the log. Recording it here so the decision is durable rather than transcript-only.
+- **Assumed:** Phase 1's SHA-pinning mandate (#111) scopes to *third-party* actions, and
+  first-party `agentcontextdistributionprotocol/*` reusable workflows are legitimately
+  trusted by major tag.
+- **Chose:** `bump-spec.yml:18` references
+  `agentcontextdistributionprotocol/acdp-ci/.github/workflows/bump-spec-ref.yml@v1` with
+  `secrets: inherit`, matching the two first-party refs already in this repo
+  (`auto-merge.yml:8`, `bump-acdp.yml:13`). A related convention is stated upstream in
+  `acdp-ci/.github/workflows/auto-merge.yml:10-11` — "third-party actions are SHA-pinned
+  (matching acdp-rs); first-party actions/* are trusted by major tag" — but read it
+  narrowly: the literal token is `actions/*`, GitHub's own namespace, so the sentence does
+  *not* itself sanction trusting `agentcontextdistributionprotocol/*` reusable workflows by
+  major tag. The support for those is the three `@v1` refs already in this repo, which is
+  precedent, not justification. Do not cite this line as though it settled the question.
+- **Alternatives:** SHA-pin the reusable-workflow ref — rejected as only partly effective:
+  the callee itself consumes `actions/checkout@v7` and `actions/create-github-app-token@v3`
+  (those two and no others), so pinning the outer hop moves the mutable edge inward
+  rather than removing it, while costing a commit here per upstream fix across ~10 sibling
+  repos with no bump automation for it.
+- **Blast radius if wrong:** high in principle. `secrets: inherit` exposes the org
+  `ACDP_BOT_APP_ID`/`ACDP_BOT_PRIVATE_KEY` and this repo's `CARGO_REGISTRY_TOKEN` to
+  whatever `v1` resolves to at run time. Mitigating: `bump-spec.yml` triggers only on
+  `repository_dispatch`/`workflow_dispatch`, so it is not fork-reachable; and since
+  2026-08-30 an active `protect-v-tags` ruleset on `acdp-ci` (id `21899019`) blocks
+  `creation`/`update`/`deletion`/`non_fast_forward` on `refs/tags/v*`, admin-bypass only.
+  The residual actor who can move `v1` is the same sole org admin who can already push
+  directly to this repo.
+- **Observed, not actioned:** `auto-merge.yml` carries the same `@v1` on an `on:
+  pull_request` trigger — far more reachable — but has no `secrets: inherit`, so it
+  receives only the job's `contents: write`/`pull-requests: write` token, which GitHub
+  further downgrades to read-only for fork PRs. Different risk shape, not strictly worse;
+  reviewed and deliberately left as-is.
+- **Status:** CONFIRMED (2026-09-01) — see `DECISIONS.md`.
