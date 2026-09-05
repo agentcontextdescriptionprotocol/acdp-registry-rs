@@ -24,6 +24,8 @@ Run the feature-flag variants if you touched the server binary or its callers:
 cargo clippy -p acdp-registry-server --no-default-features --features storage-pg --all-targets -- -D warnings
 cargo clippy -p acdp-registry-server --features storage-sqlite,playground   --all-targets -- -D warnings
 cargo test   -p acdp-registry-server --features storage-sqlite,playground
+cargo clippy -p acdp-registry-server --no-default-features --features storage-memory --all-targets -- -D warnings
+cargo test   -p acdp-registry-server --no-default-features --features storage-memory
 ```
 
 CI additionally gates PRs on checks you can reproduce locally:
@@ -63,11 +65,34 @@ ACDP_REQUIRE_CONFORMANCE=1 ACDP_SPEC_DIR=/path/to/spec/checkout \
 CI's `conformance` job checks out the spec at a SHA pinned in
 `.github/workflows/ci.yml` (the `conformance` job's `ref:`), so a push to the
 spec repo cannot silently change this repo's CI result. When adopting new
-fixtures, bump that SHA deliberately in its own commit.
+fixtures, bump that SHA deliberately in its own commit. The bump can be
+driven by running the `bump spec` workflow from the Actions tab (optionally
+with an explicit SHA), which opens a PR for review rather than committing
+directly.
 
 CI also measures coverage with `cargo llvm-cov` (summary on the run page, lcov
 artifact attached) and smoke-tests the Docker image on every PR — it builds the
 `storage-pg` image, boots it against Postgres, and curls `/healthz`.
+
+### Declaring coverage for a new fixture family
+
+If the pinned spec adds a new fixture-id family (`KNOWN_FAMILIES` in
+`crates/acdp-registry-server/tests/conformance.rs` grows to 30), every plain
+`cargo test --workspace` run — no spec checkout required — fails at
+`known_families_partition_into_covered_excused_or_deferred` until the new
+family is classified as exactly one of:
+
+- **`COVERED`** — real coverage exists, via `CoverageMechanism::Replayed`
+  (the family produces >= 1 exchange through the generic HTTP replayer),
+  `CoverageMechanism::Direct(&[...])` (named in-process test functions), or
+  both.
+- **`EXCUSED`** — a spec-grounded, structural reason this repo doesn't owe
+  HTTP-replay coverage for it (mechanically checked against the spec's
+  `required_fixtures`/`conditional_fixtures`; see `EXCUSED`'s doc comment).
+- **`DEFERRED`** — not yet covered, with a non-empty written reason and an
+  open GitHub issue number tracking it.
+
+"Uncovered with no entry anywhere" is not an option the ratchet allows.
 
 ## Commit messages
 

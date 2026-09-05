@@ -8,6 +8,490 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A coverage-completeness ratchet closes the gap Phases 7-10 left open**
+  (`REG-10` Phase 11): the existing four `KNOWN_FAMILIES`/`EXCUSED` ratchet
+  tests fail only on an *unclassified* family or an *illegitimate excuse* —
+  never on zero coverage, which is exactly how `vis`/`idem` sat uncovered
+  before Phases 8-10, and how `caps`/`lin`/`lc` (#115) and 15 more families
+  (#130) still do today. Two new consts and two new tests in
+  `crates/acdp-registry-server/tests/conformance.rs` close it:
+  - **`COVERED: &[(&str, &[CoverageMechanism])]`** models the two legitimate
+    coverage mechanisms a family can claim — `Replayed` (produced >= 1
+    exchange in `replays_spec_fixtures_when_present`'s own per-family
+    tally) and `Direct(&[fn_names])` (named in-process test functions).
+    Modelling both, rather than deriving `COVERED` purely from replay
+    results as originally preferred, is load-bearing: `anc`, `can`,
+    `idem`, and `wit` are genuinely covered by direct tests and produce
+    **zero** replayed exchanges, so a replay-only derivation would have
+    branded all four uncovered — including `can` (Phase 7) and `idem`
+    (Phase 10), the two families this very effort added. `vis` claims
+    both mechanisms (it clears `MIN_REPLAYED_EXCHANGES`, currently
+    confirmed still 30, AND carries 10 dedicated per-fixture test
+    functions).
+  - **`DEFERRED: &[(&str, &str, u32)]`** lists the 18 families with no
+    coverage yet, each with a non-empty reason and an open tracking-issue
+    number: `caps`/`lin`/`lc` cite #115; the remaining 15
+    (`body`/`schema`/`sig`/`dk`/`did-ssrf`/`data-ref`/`cur`/`err`/`meta`/
+    `rate`/`status`/`rcpt`/`lhr`/`log`/`rev`) cite #130.
+  - **`known_families_partition_into_covered_excused_or_deferred`** is the
+    new fifth ratchet test, and the one point of this phase: it asserts
+    `KNOWN_FAMILIES == COVERED ∪ EXCUSED ∪ DEFERRED` as a set. Unlike the
+    four existing ratchet tests, it is deliberately **unconditional** — it
+    touches no spec data, so it does not skip when `ACDP_SPEC_DIR` is
+    unset. The required `tests` CI job runs `cargo test --workspace` with
+    no spec configured, so this is what actually blocks a merge; verified
+    directly by temporarily adding an unclassified 30th family and
+    confirming only this test goes red under that exact job configuration.
+  - **`covered_direct_families_have_present_test_functions`** is the
+    mutation-proof half for `Direct`-mechanism families: it scans this
+    file's own compiled-in source (`include_str!`) for each named test
+    function, confirming it still exists with a test attribute directly
+    above it. This is deliberately an EXISTENCE check, not a correctness
+    check — the honest limit of what a spec-independent, self-inspecting
+    const can verify; documented as such rather than overclaimed, including
+    the two evasions it cannot catch (`#[ignore]` written above `#[test]`,
+    and the whole function wrapped in a `/* ... */` block comment).
+    Verified by temporarily stripping a `#[test]` attribute and observing
+    the expected failure, then reverting.
+  - The `Replayed` half of the same mutation proof lives inside
+    `replays_spec_fixtures_when_present` itself: every family claiming
+    `CoverageMechanism::Replayed` must have produced >= 1 exchange in that
+    very run's tally, checked against the spec at the pinned SHA.
+  - **Required-checks decision, recorded but not executed** (a repo-admin
+    action, out of scope for this diff): `conformance (spec fixtures)`
+    should join `rustfmt`/`clippy`/`tests` as a required branch-protection
+    context. Confirmed directly against this repo's branch protection that
+    it is not currently required. Leaving it advisory means only the
+    spec-independent half of this ratchet (the set-equality test and the
+    direct-mechanism scan) can ever block a merge; a regression that
+    silently drops a family's replayed exchanges while its `COVERED` entry
+    and direct tests stay intact would go unnoticed by required checks
+    alone. Flagged as a follow-up for a human with repo-admin access.
+
+- **`idem-001` through `idem-005` (RFC-ACDP-0003 §6 idempotency-key
+  lifecycle) now have DIRECT, fixture-driven coverage** (`REG-10` Phase 10).
+  These five fixtures don't fit Shape D — their top-level key is
+  `preconditions` (an existing idempotency record, never a literal
+  `ctx_id`), not `setup`, and `idem-005`'s `input` is a bare array of
+  publish descriptors, not `scenarios[]` — and none of Shape D's seeding
+  machinery has anything to seed here: the object under test IS the
+  publish response itself. So, same precedent as `anc`/`can`/`vis-003`/
+  `vis-007`: two direct tests, run beside the generic replayer (which
+  still, correctly, shows all five as unreached — "requires pre-seeded
+  state"). `idem001_004_publish_idempotency_key_lifecycle_and_restart_durability`
+  runs the full, mutually-dependent `idem-001`→`idem-002`→`idem-003`→
+  `idem-004` sequence against one shared, file-backed harness: `idem-001`
+  (fresh publish), a genuine registry-restart proof (reconnect to the same
+  on-disk SQLite file as a NEW `SqliteStore`/`RegistryServer`/`Router`,
+  proving the idempotency record — not just the context row — survives),
+  `idem-002` (same key + hash → byte-identical stored response returned,
+  not re-executed), `idem-003` (same key, different hash → 409
+  `duplicate_publish`, with a mutation proof that `idem-001`'s record is
+  unmodified AND that the rejected body was never persisted), and
+  `idem-004` (new key, same content → a fresh `ctx_id` AND `lineage_id`
+  despite byte-identical content). `idem005_no_support_ignores_idempotency_key_header`
+  runs against a SEPARATE, non-playground harness (a did:key producer
+  through the SDK's verified publish path) that genuinely does not
+  advertise `supports_idempotency_key`, proven by reading it back off
+  `GET /.well-known/acdp.json`, and asserts two independent publishes with
+  the same key both succeed with DIFFERENT `ctx_id`s. This repo's
+  `POST /contexts` returns HTTP **200** on success, not the fixtures' own
+  literal `201`, and never sets a `Location` header at all — both
+  deviations are recorded in a doc comment following the `anc-001`
+  precedent, not "fixed". `idem-002`'s `registry_must_not` clause (no
+  re-DID-resolution, no re-signature-verification) is stated honestly as
+  un-observable to a black-box HTTP assertion — the full-response-body
+  equality is the closest indirect evidence available, not a claim of
+  having observed the internals. `idem-006` (a concurrency-race fixture)
+  and `idem-007` (a capabilities-document validation check gated on
+  `acdp_version >= 0.3.0`) are recorded not-owed with their real reasons:
+  `idem-006` sits in the pinned spec's `tolerated_outcomes` — a THIRD
+  obligation category this repo's model didn't previously name, alongside
+  `required_fixtures`/`conditional_fixtures` — not a strict requirement;
+  `idem-007`'s version gate never fires against this harness's advertised
+  `0.1.0`. `MIN_REPLAYED_EXCHANGES` is unchanged at 30 — neither test
+  replays through the generic harness.
+  **Finding recorded, not fixed (out of this phase's scope — test file and
+  CHANGELOG only):** `acdp-registry-core`'s playground publish branch
+  (`crates/acdp-registry-core/src/handlers/context.rs`, the manual
+  idempotency lookup/record dance around `publish_unverified_for_tests`)
+  honors ANY `Idempotency-Key` header whenever one is present, with no
+  check of `supports_idempotency_key` anywhere in that branch — unlike
+  every other publish path (verified did:web, did:key, pinned-verified),
+  which routes through the upstream `acdp-server` SDK's own
+  `RegistryServer::commit_via_store` and gates correctly. It is
+  unreachable in a deployed registry, though not for the reason one might
+  assume: the playground publish branch carries no
+  `#[cfg(feature = "playground")]` (only the admin router does), so it
+  compiles into a stock build and activates on the runtime toggle alone.
+  What actually makes the divergence unrealizable is that
+  `crates/acdp-registry-server/src/main.rs:1026` hardcodes
+  `supports_idempotency_key: true` with no config knob, so the shipped
+  binary can never advertise `false` — the state in which honoring the
+  header would be wrong. It becomes live the moment that field is made
+  config-driven, as every other capability already is. Filed as an issue
+  rather than fixed here; it meant `idem-005` had to be
+  built against a non-playground, did:key harness instead of the shared
+  playground harness `idem-001`..`004` use — see the doc comment on
+  `idem005_no_support_ignores_idempotency_key_header` for the full
+  write-up.
+
+- **`vis-008` (5 scenarios) — the last parked `vis` seed shape,
+  `setup.lineages` — now replays end-to-end through Shape D** (`REG-10`
+  Phase 9c). `MIN_REPLAYED_EXCHANGES` rises from 25 to 30. This is the last
+  fixture needing a THIRD substitution table, `fixture_lineage_id ->
+  minted_lineage_id`, built alongside the existing ctx_id and DID tables
+  (`SeedLineage`/`SeedLineageVersion`, `parse_seed_lineages`) rather than
+  special-cased outside the substitution layer. `vis-008` seeds two
+  two-version lineages (`a1 -> a2`, both `restricted`, same audience/owner;
+  `b1` `public` -> `b2` **`private`**, same owner — the head is private
+  while v1 stays public) through REAL `Producer::supersede_body()`-chained
+  publishes, in ascending `version`-field order (the fixture carries no
+  explicit `supersedes` key), never a direct store write. `status`
+  (`active`/`superseded`) is never a seed input — `PublishRequest` has no
+  such field — it is asserted as the registry COMPUTES it from the
+  supersession, cross-checked against the fixture's own `status` literal
+  per lineage version; at pin `417211f` the registry's computed status
+  matches every one of the fixture's four literals exactly, so no
+  `anc-001`-style deviation note was needed. Two response shapes no earlier
+  phase needed: `GET /lineages/{lineage_id}` returns a bare JSON array
+  (scenario 0's `stranger on a fully-restricted lineage gets 200 + []`, not
+  404 — asserted via an EXPLICIT `body == []` equality check, not inferred
+  from `matches_ctx_ids` being an empty set, because an unsubstituted or
+  unknown `lineage_id` also 200s with an empty array); `GET
+  /lineages/{lineage_id}/current` returns a single `FullContext` object
+  with singular `ctx_id` and a nested `registry_state.status` (scenario 4).
+  A new `assert_substitution_sound` helper generalizes the existing
+  raw-and-percent-encoded substitution-occurred proof (previously inline
+  and ctx_id-specific) so it covers the lineage_id table too — closing the
+  one place a wrong-but-200 answer could otherwise read as correct.
+  Mutation-proven: `vis008_mutated_lineage_version_order_fails_replay`
+  swaps the `version` field between lineage b's two entries (nothing
+  else), which reverses which version publishes first and flips the
+  lineage's real head from private to public — scenario 3 then gets 200
+  instead of its expected 404, failing the replay. `ret-002` (also
+  `setup.lineages`) was checked deliberately and does NOT become
+  replayable as a side effect: its lineage versions carry no `visibility`
+  key and one carries `expires_at`, both outside
+  `parse_seed_lineage_version`'s recognized set, and its first lineage
+  requires an "abnormal state: every version is superseded" that a real
+  publish sequence cannot produce (publishing v2 always makes v2, not v1,
+  the active head) — it remains classified `requires pre-seeded registry
+  state`, unchanged from before this phase.
+
+- **`vis-002` (4 scenarios), `vis-005` (4 scenarios), and `vis-009` (3
+  scenarios) — multi-context, capability-toggling visibility fixtures — now
+  replay end-to-end through Shape D, and `vis-007` gets direct in-process
+  coverage** (`REG-10` Phase 9b). `MIN_REPLAYED_EXCHANGES` rises from 14 to
+  25 (14 + `vis-002`'s 4 + `vis-005`'s 4 + `vis-009`'s 3). Two Shape D
+  capabilities Phase 8 built and proved only synthetically are exercised
+  against real fixtures for the first time: a per-scenario router rebuild
+  driven by `registry_capabilities_subset.anonymous_public_reads`
+  (`vis-002` scenarios 2/3 toggle `true`→`false` back-to-back against the
+  identical anonymous requester; `vis-009` toggles `false`→`true`→`false`
+  across all three scenarios), and ctx_id substitution reaching QUERY
+  STRINGS in both raw and percent-encoded form (`vis-005` scenario 2's
+  `search?derived_from=<percent-encoded private ctx_id>`). The
+  substitution-occurred check inside `replay_shape_d` was strengthened
+  alongside this: previously it only asserted no *raw* literal ctx_id
+  leaked into the built request path, which would have silently missed a
+  failed *query-string* substitution (the percent-encoded literal would
+  sit unnoticed in the path); it now also asserts, positively, that
+  whenever a scenario's original path referenced a fixture ctx_id at all,
+  the built path carries the MINTED replacement — catching exactly the
+  "substitution silently failed, empty result reads as a legitimate
+  negative" failure mode the Phase 8/9b plans both flag. `expected`
+  parsing gains two new assertable (not merely recognized) keys,
+  `total_estimate` and `matches_ctx_ids` — the latter translated through
+  the fixture's ctx_id substitution map at replay time, so a search that
+  returns the right *count* but the wrong *identity* (exactly what
+  `vis-005`'s two same-`did:agent:owner` seeds could produce if the Phase
+  8 `did_map` two-pass fix ever regressed) is caught, not just an
+  off-by-one. `vis-005`'s two seeds sharing one literal `agent_id` is the
+  exact shape Phase 8's GAP 1 (`did_map` overwrite on a shared literal
+  agent) was fixed for but never exercised by a real fixture until now;
+  `vis005_private_audience_search_excluded_via_derived_from` asserts
+  `did_map.len() == 1` on it directly. Across `vis-002` (3), `vis-005` (4),
+  `vis-007` (1, direct coverage), and `vis-009` (2), the pinned spec
+  fixtures carry exactly 10 `expected.total_estimate` occurrences; 9 of the
+  10 are asserted on their exact value, alongside `matches_count`. The
+  tenth — `vis-005` scenario 2, `search?derived_from=<private ctx_id>` — is
+  **not** a conformance divergence: the spec explicitly licenses an
+  approximate `total_estimate` ("May be approximate; not guaranteed to be
+  exact", `schemas/json/acdp-search-response.schema.json`; "SHOULD NOT be
+  relied upon for exact counts", `rfcs/RFC-ACDP-0005-discovery.md:219`; the
+  spec's own `examples/search/empty-page-post-filter-response.json` ships
+  the identical shape — an empty post-filtered page with a non-zero
+  estimate). One genuine, pre-existing registry characteristic surfaced
+  while building this: `total_estimate` (both `acdp-registry-sqlite` and
+  `acdp-registry-pg`, `DESIGN-01`) is computed from the same SQL scan that
+  applies RFC-ACDP-0008 §4.5 visibility, but `derived_from` (like
+  `status`/`tags`) is a documented *post*-SQL refinement applied afterward
+  in Rust — so it is a pre-refinement upper bound for a `derived_from`-
+  filtered search, not the post-filter count `vis-005` scenario 2's fixture
+  happens to pin at `0`; that `0` is one of several conformant values, and
+  this registry emits another. Verified live: `matches` correctly scopes to
+  empty (proving both the `derived_from` filter and the ctx_id substitution
+  work), while `total_estimate` returns the harmless pre-refinement scan
+  count instead. Exact-value assertion is therefore skipped for that one
+  `derived_from`-filtered scenario (see the carve-out in
+  `parse_scenarios_array`, and the corpus-wide tripwire
+  `derived_from_carve_out_matches_exactly_one_corpus_scenario`, which fails
+  loudly if a second such fixture ever appears); every other scenario
+  across all four fixtures keeps the full exact-value assertion. What the
+  carve-out does *not* skip: leak-invariance (RFC-ACDP-0005 §2.5.5 Q2's
+  MUST that a registry "avoid leaking their existence via per-requester
+  variance in the estimate") is asserted directly against a live registry
+  response in `vis005_private_audience_search_excluded_via_derived_from` —
+  the audience member and an outsider get the identical `total_estimate` on
+  the same `derived_from` query, both strictly below the producer's.
+  `anonymous_public_reads: false`
+  is NOT an unconditional "403" rule: `vis-009` scenario 2 sets the flag
+  `false` but expects a *successful* search because its requester is
+  authenticated — the flag gates anonymous reads only, and both the
+  `vis-002`/`vis-009` dedicated tests assert this directly rather than
+  the naive stricter reading. `vis-007` cannot reach Shape D at all: its
+  scenario 2 (`expected: {outcome:
+  "registry_must_not_emit_this_response", rationale}`) carries no `status`
+  whatsoever, so `parse_expected` fails on it and, by Shape D's
+  parse-all-or-nothing rule, the whole fixture stays unparseable there —
+  `vis007_search_match_restricted_visibility_disposition` seeds the one
+  restricted context directly and replays scenarios 0 and 1 for real
+  (`status`/`matches_count`/`total_estimate` all asserted), same
+  direct-coverage precedent as `vis-003`; only the MAY-shaped
+  `match_visibility_field_disposition`/`consumer_invariant` keys and
+  scenario 2 wholesale are recorded not-assertable. Mutation proofs (an
+  in-memory-only fixture clone, never written to the spec checkout) on
+  both `vis-002` (restricted context flipped to `public`) and `vis-005`
+  (the private seed flipped to `public`) fail replay specifically on a
+  `matches_count`/`matches_ctx_ids` mismatch. Shapes A, B, and C remain
+  textually unchanged.
+
+- **`vis-001` (5 scenarios) and `vis-004` (4 scenarios) — single-context
+  restricted/private visibility fixtures — now replay end-to-end through
+  Shape D, and `vis-003` (search response field-naming) gets direct
+  in-process coverage** (`REG-10` Phase 9a). `MIN_REPLAYED_EXCHANGES` rises
+  from 5 to 14 (4 pre-existing + `vis-006`'s 1 + `vis-001`'s 5 + `vis-004`'s
+  4). `vis-001` (RFC-ACDP-0008 §4.5 existence-leak prevention) seeds one
+  `restricted` context and exercises producer / audience-member / outsider
+  / genuinely-nonexistent-ctx_id / non-audience-contributor across five
+  requester identities against the same ctx_id — the first fixture in this
+  file to require the bearer path to actually distinguish requesters (Phase
+  8's proof fixture, `vis-006`, is requester-identity-agnostic by
+  construction: `did:agent:any-authenticated-or-anonymous` against a public
+  context behaves the same with auth on or off). `vis-004` (RFC-ACDP-0008
+  §4.5 / RFC-ACDP-0002 §7 private/audience retrieval asymmetry) seeds one
+  `private` context with an `audience` and covers the same four-way split.
+  Both fixtures carry a scenario with
+  `request.context_subset_for_test.contributors` — a per-scenario mutation
+  of the seeded row's `contributors` list, not a requester swap, and
+  exactly the key Phase 8's allowlist excluded them on. Shape D is widened
+  to fold it onto the (single) seed at seed time rather than left
+  unsupported: the registry's only write path (`POST /contexts`) mints a
+  new `ctx_id` per call, so there is no in-place "update contributors on
+  this existing row" endpoint to genuinely mutate mid-replay, and applying
+  it at seed time is observably identical to that framing here since
+  `contributors` never affects any other scenario's status/error_code —
+  `can_retrieve` and `can_surface_in_search` branch only on visibility,
+  `agent_id`, `audience` and `anonymous_public_reads`, so contributors
+  carries attribution rather than retrieval authorization — and both
+  fixtures are single-seed and retrieval-only. That scoping is deliberate:
+  `contributors` *does* gate authorization on the supersession
+  producer-continuity path, so the same seed-time fold applied to a
+  publish/supersede fixture would change authorization rather than preserve
+  it. `parse_shape_d` fails closed (returns `None`, routing to
+  the existing skip path) rather than guess which seed a *multi*-seed
+  fixture's `context_subset_for_test` would target. `vis-001` scenario 4's
+  genuinely nonexistent ctx_id (`…-000000000000`, distinct from the seeded
+  `…-000000000001`) needed no special-casing — it was never seeded, gains
+  no substitution-table entry, and a dedicated test
+  (`vis001_restricted_denied_as_404_replays_via_shape_d`) asserts the
+  ctx_id map contains exactly the one context that actually was seeded.
+  `vis-003` has no `setup` (only `background`) and its scenarios use
+  `input.endpoint`/`input.received_response`, never
+  `request.method`/`request.path`, so it matches neither Shape D nor Shape
+  B; `vis003_search_response_emits_matches_not_results` drives a real `GET
+  /contexts/search` and asserts the fixture's own
+  `response_body_constraints` (`matches` present, `results` and its listed
+  alternates absent) directly against the real response body — same
+  precedent as the existing `anc`/`wit`/`can` direct-coverage tests. Its
+  other two scenarios (`expected.consumer_behavior` /
+  `expected.minimum_diagnostic_content`) are consumer-side obligations a
+  registry cannot satisfy or violate by construction; recorded
+  not-applicable, with reasoning, in that test's own doc comment rather
+  than silently dropped. `vis-004`'s own mutation proof (seeded visibility
+  flipped `private` → `public` on an in-memory-only fixture clone, never
+  written to the spec checkout) fails replay specifically on the
+  outsider/contributor scenarios' now-wrong 404 expectation, alongside the
+  pre-existing `vis-006` mutation proof — together demonstrating Shape D
+  exercises the registry's real visibility-scoping logic rather than
+  trivially passing. Shapes A, B, and C remain textually unchanged.
+
+- **The conformance replayer gains a fourth shape ("Shape D") that seeds
+  registry state before replaying, and `vis-006` (RFC-ACDP-0005 §2.2
+  public-visibility search disclosure) is now the fifth exchange it
+  proves live** (`REG-10` Phase 8). Previously the replayer's three shapes
+  (`conformance.rs`'s `extract_shapes`) only handled self-contained
+  exchanges; every fixture carrying `setup` — all of `vis-*`, `idem-*` and
+  friends — was a blanket skip ("requires pre-seeded registry state"),
+  because the registry mints its own `ctx_id` and the fixtures' literal
+  ones (`pub-013` proves a producer-supplied `ctx_id` is rejected) can't
+  be replayed against directly. Shape D closes that gap for the shapes it
+  understands: it seeds `setup.context_published` / `.contexts_published`
+  through the real publish API (never a direct store write), building a
+  `fixture_ctx_id -> minted_ctx_id` substitution table and, for any seeded
+  `agent_id` that isn't already `did:web` (this registry only advertises
+  `did:web`, and `pub-008` proves it rejects anything else), a
+  `did:agent:* -> did:web:*` substitution table for a producer identity
+  the harness holds the key for — `audience` entries and requester DIDs
+  route through the same table so an audience check stays consistent with
+  whichever bearer `sub` a scenario presents. It mints a per-scenario
+  bearer from `effective_requester_did` (no `Authorization` header at all
+  when it's `null`). Shape D runs under its own `shape_d_config()` with
+  `auth.enabled = true`: the shared `config()` Shapes A/B/C use leaves auth
+  off, which is right for them since they need no caller identity, but with
+  auth off `caller_from_headers` returns `None` unconditionally, so every
+  bearer Shape D minted was being discarded. Without that one line the
+  per-scenario bearer is inert and any identity-sensitive assertion built on
+  it would pass for the wrong reason. When a scenario's
+  `registry_capabilities_subset` overrides `anonymous_public_reads`, the
+  harness reconstructs the `RegistryServer` with the new capabilities
+  document rather than only rebuilding the router around it: `search` and
+  `retrieve` gate that flag on the server's own baked-in `caps`, not on
+  `RegistryConfig`, so rebuilding the router alone left the override
+  silently inert. Seeded state survives because `SqliteStore` is
+  `SqlitePool`-backed and the pool is an `Arc`, so the clone shares the same
+  in-memory database. Every Shape D fixture gets its own
+  fresh in-memory store, isolated from the shared store Shapes A/B/C
+  replay against. Dispatched deliberately **ahead of** Shape B (not after
+  the fallback, as an earlier draft of this phase's plan had it): a
+  `setup`-carrying fixture's `scenarios[]` also satisfies Shape B's own
+  predicate, and Shape B has no seeding step — letting it capture such a
+  fixture first would silently replay it against an empty store and read
+  the resulting 404s as legitimate negative results. Shapes A, B, and C
+  are textually unchanged. A fixture whose seed shape or scenario
+  assertions Shape D doesn't recognize yet (`setup.lineages`,
+  `matches_ctx_ids`, `total_estimate`, `context_subset_for_test`, …) still
+  falls through to the narrowed — not deleted — `unseeded_precondition_reason`
+  skip path rather than being partially replayed; this is what keeps this
+  phase scoped to exactly one fixture (`vis-006`, the only single-exchange
+  `vis` fixture) even though the rest of `vis-*` structurally satisfies
+  Shape D's dispatch predicate. A dedicated regression test,
+  `four_pre_existing_exchanges_still_use_original_shapes`, asserts the
+  four exchanges replayed before this phase (`pub-004`, `pub-005`,
+  `pub-008`, `ret-001`) still extract via their original shapes with
+  identical fields — the gravest failure mode this phase could introduce
+  is Shape D silently over-matching one of them. A second dedicated test
+  proves Shape D end-to-end on `vis-006` and then, against an in-memory-only
+  mutated copy of the fixture (never written to the spec checkout) whose
+  seeded context's visibility is flipped to `restricted`, proves the
+  replay now fails — demonstrating the harness exercises the registry's
+  real visibility-scoping logic rather than trivially passing. A failed
+  seed publish panics rather than skips, so a broken substitution can't
+  quietly read as "fixture not applicable". Two further tests cover paths no
+  fixture reaches yet, using synthetic in-test fixtures rather than spec
+  reads: `shape_d_seeding_maps_one_shared_literal_agent_to_one_minted_did`
+  pins the multi-seed `contexts_published` path, where two seeds sharing one
+  literal `agent_id` must resolve to a single minted DID — seeding is
+  two-pass for this reason, minting every distinct agent before any publish,
+  so a repeat cannot overwrite an earlier mint and an `audience` naming a
+  later-seeded agent still resolves; and
+  `seeded_harness_rebuild_changes_router_behavior_and_preserves_seeded_state`
+  pins both halves of the rebuild — that the anonymous-read posture actually
+  changes, and that the seeded rows survive it. Note `vis-006` itself does
+  not exercise the bearer path: its requester is
+  `did:agent:any-authenticated-or-anonymous` against a public context, so it
+  behaves identically with auth on or off. The bearer and rebuild mechanisms
+  are proven by the synthetic tests, not by the replayed fixture. `MIN_REPLAYED_EXCHANGES`
+  rises from 4 to 5.
+
+- **`can-*` (RFC-ACDP-0001 canonicalization & hashing) moves from zero
+  coverage to direct, fixture-driven coverage of all 35 vectors across all
+  12 fixtures** (`REG-10` Phase 7). None of `can-*` is HTTP-replayable —
+  the family carries no request/response shape at all — yet all 12 ids sit
+  in the pinned spec's `acdp-registry-core.required_fixtures`, which makes
+  `can` mechanically inexcusable under this file's `EXCUSED` ratchet. Two
+  new tests in `conformance.rs` consume every fixture's own data directly,
+  same precedent as `anc`/`wit`:
+  `can_vectors_reproduce_canonical_form_and_hash` covers 30 of the 35
+  vectors (can-001 through can-006, can-008 through can-012) by driving
+  `acdp::crypto`'s public JCS surface directly —
+  `canonical_preimage` for the Body/`content_hash`-shaped vectors,
+  `canonicalize_value` for can-011's bare numeric-formatting objects (not
+  ACDP bodies, so the Body-specific exclusion-set path is the wrong tool)
+  and can-001's three `canonical_form`-only vectors, and
+  `derive_lineage_id` for can-001's three `lineage_id`-only vectors. `can-001`
+  alone packs three distinct `expected` shapes into its 7 vectors; a naive
+  hash-equality loop would have silently covered only one of them.
+  `can-006`'s two divergent-precision vectors are additionally asserted to
+  produce different `canonical_form`/hash from each other, not just to
+  each independently match their own pinned value. The second new test,
+  `can007_registry_created_at_millisecond_truncation`, covers the
+  remaining 5 — can-007 alone carries no `input`/hash at all, just a
+  `registry_compliance` table keyed off example timestamps — by driving
+  `acdp::time::trunc_ms` directly, the actual function
+  `acdp-registry-sqlite`/`acdp-registry-pg` call when minting
+  `created_at`, proving both that it reproduces the canonical millisecond
+  form and that it floors rather than rounds. An explicit
+  `EXPECTED_CAN_HASH_VECTOR_COUNT`/`EXPECTED_CAN_VECTOR_COUNT` pair (30 and
+  35) guards against the vacuous-pass failure mode where a loop silently
+  iterates zero vectors and passes green; proven by mutation on three
+  fixtures (can-001, can-002, can-011), each of which fails when its
+  `sha256_hex` is corrupted and passes again once restored. Both new tests'
+  doc comments record the tension with this file's own anc-004 precedent
+  (`conformance.rs`'s module doc-comment already argues against re-testing
+  an upstream crate's golden vectors): most of `can`'s vectors do exactly
+  that, but the coverage ratchet makes `can` inexcusable regardless, and
+  the conformance claim is about this binary, not about which crate owns
+  the tested code. No new dependency: `acdp::crypto` already re-exports
+  `acdp_crypto`'s `canonicalize_value`/`canonical_preimage`/
+  `derive_lineage_id`, and `acdp::time::trunc_ms` was already reachable.
+  `KNOWN_FAMILIES`'s doc comment and the module doc-comment both gain a
+  `can` paragraph mirroring the existing `anc` one — classification
+  unchanged (still "non-HTTP fixture"), only coverage changed.
+
+- **The witness aggregator's reject-then-no-write path is now directly
+  tested** (`REG-10` Phase 4, GitHub issue #112). `witness.rs`'s
+  `verify_and_store` was split at the point right after DID resolution:
+  it now resolves the witness DID document and tail-calls a new private
+  `verify_and_store_resolved(store, log, witness_did, doc_value,
+  cosig_value) -> bool`, a verbatim lift of the verify-then-store half
+  (the `verify_cosignature_against_own_log` match through the
+  `upsert_witness_cosignature` call and the three metric-labeled early
+  returns). This is a no-behavior-change refactor — `verify_and_store`'s
+  signature, visibility, and callers are untouched — that makes the
+  store-writing half callable directly against a real `SqliteStore`
+  without a live witness endpoint. Two new tests exercise it:
+  `rejected_cosignature_is_not_persisted_by_the_store_path` (a forged-root
+  cosignature is reported unstored, and leaves no row at either the
+  forged or the honest checkpoint tuple) and
+  `verified_cosignature_is_persisted_by_the_store_path` (the positive
+  control — a genuine cosignature is reported stored and reads back).
+  Previously only the pre-store verification helper had forward-guard
+  assertions; nothing exercised the actual persistence path.
+
+- **`.github/workflows/bump-spec.yml`, a manual and dispatch-driven
+  replacement for hand-written spec-pin bumps** (`REG-10` Phase 3, GitHub
+  issue #110). It delegates to acdp-ci's reusable `bump-spec-ref.yml@v1`
+  workflow, mirroring the existing `bump-acdp.yml` pattern: `with: file:
+  .github/workflows/ci.yml` names the file whose single spec-pin anchor gets
+  rewritten, `sha` picks the target commit (on `workflow_dispatch`, the
+  input — blank meaning spec HEAD; on `repository_dispatch`, the event
+  payload's SHA), and `secrets: inherit` supplies `ACDP_BOT_APP_ID` and
+  `ACDP_BOT_PRIVATE_KEY`, already proven available in this repo via
+  `notify-website.yml`. The reusable workflow hard-fails on zero or more
+  than one spec-pin anchor in the named file, rewrites only the `ref:`
+  following that anchor, asserts the rewrite landed, and opens a PR on
+  branch `deps/spec-<sha:0:12>` for review — it never auto-merges, and it
+  opens no PR when the target SHA already matches the current pin. Two
+  triggers are wired: `workflow_dispatch`, runnable from the Actions tab
+  today with an optional explicit `sha` input; and `repository_dispatch` on
+  `spec-released`, which stays inert until the spec repo's
+  `notify-spec-consumers.yml` adds this repo to its consumer matrix (as of
+  this writing that matrix lists only `acdp-rs` and `acdp-verifier-py`).
+  `CONTRIBUTING.md`'s conformance-pin paragraph now points at this workflow
+  as an alternative to bumping the pin by hand.
+
 - **`anc-001`/`anc-002`/`anc-003` move from "skipped as non-HTTP by the
   generic replayer" to direct, fixture-driven coverage, and require-mode CI
   is confirmed green at spec pin `417211f`** (`REG-3` Phase 7 — the closing
@@ -249,13 +733,84 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `acdp-registry-webhook`: HMAC-SHA256-signed POSTs with retry/backoff.
 - `acdp-registry-core`: axum router + handlers generic over the storage trait.
 - `acdp-registry-server`: binary wiring via Cargo features
-  (`storage-sqlite` default, `storage-pg`, `playground`).
+  (`storage-sqlite` default, `storage-pg`, `storage-memory`, `playground`).
 - Docker image (multi-stage with `cargo-chef`) + docker-compose with Postgres.
 - GitHub Actions: `ci.yml` (fmt + clippy across feature matrix + test +
   cargo-deny), `release-plz.yml`, `docker.yml`.
 
 ### Changed
 
+- **Extracted a shared `tests/common/` harness for `conformance.rs` and
+  `http_integration.rs`** (`REG-10` Phase 6). Rust integration tests
+  compile to separate binaries, so `conformance.rs` couldn't reach
+  `http_integration.rs`'s router-building code and had grown three
+  near-identical ad-hoc routers plus its own copies of
+  `pct_encode_path_segment`, `body_to_json`, and `producer`. All of that
+  now lives in `crates/acdp-registry-server/tests/common/mod.rs`
+  (`mod common;` in both files), parameterized over store backend
+  (`StoreMode::Memory` | `StoreMode::File` — `conformance.rs` used an
+  in-memory `SqliteStore`, `http_integration.rs` a `NamedTempFile`; both
+  are preserved) and capabilities document, so `conformance.rs`'s three
+  routers and `http_integration.rs`'s harness ladder now both build on
+  `common::build_harness_with_webhook`. `body_to_json` is deliberately kept
+  as two functions rather than one: the two files' copies differed, with
+  `http_integration.rs`'s panicking on an empty or non-JSON body and
+  `conformance.rs`'s degrading to `Value::Null`. The strict form is the
+  shared default at all 53 call sites, and `body_to_json_lenient` is used
+  at exactly one — the fixture replayer, which drains arbitrary spec
+  fixtures where an empty response is legitimate. Collapsing them onto the
+  lenient form would have silently removed a guard from ~50 assertions.
+  Pure refactor: the only line changed inside a `#[test]` body is that one
+  replayer call, which is behavior-preserving, and the full suite passes
+  with the exact same test count as before (175, across all seven binaries
+  under `--features storage-sqlite,playground`).
+
+- **Reworded the wit-001/wit-004 quorum assertion's message and its
+  preceding comment** (`REG-10` Phase 5, GitHub issue #113) in
+  `wit004_key_mismatch_cosignature_is_rejected_and_wit001_golden_is_accepted`.
+  The old message claimed the assertion proved `report_both.witnesses`
+  names *wit-001's* witness and not wit-004's — impossible by
+  construction, since the test pins both fixtures to the same witness
+  assertionMethod key and only ever registers one witness DID. The
+  assertion is unchanged; it actually proves the one verifying
+  cosignature is attributed exactly once in `witnesses`, consistent with
+  `witnessed_count`. No executable change.
+
+- **`storage-memory` gets its first required CI coverage** (`REG-10`,
+  issue #109). `.github/workflows/ci.yml`'s `clippy` job gains a fourth
+  step, `clippy (memory)`, running
+  `cargo clippy -p acdp-registry-server --no-default-features --features
+  storage-memory --all-targets -- -D warnings`; the `test` job gains a
+  matching `cargo test (memory)` step running `cargo test -p
+  acdp-registry-server --no-default-features --features storage-memory`.
+  Both are appended as steps to the existing jobs, matching how the
+  pg/sqlite/playground legs are already structured — no new job, no
+  matrix, and `--no-default-features` is load-bearing: `storage-sqlite`
+  is the crate's `default` feature, and a bare `--features storage-memory`
+  would trip the `storage-sqlite`+`storage-memory` mutual-exclusion
+  `compile_error!` in `crates/acdp-registry-server/src/main.rs`. Both legs
+  land in the *required* `clippy`/`test` jobs, not the advisory `msrv`
+  job, so a future break in `memory_ext.rs` now blocks merge instead of
+  going uncaught entirely — before this change no CI job built
+  `storage-memory` at all. Deliberately scoped as compile + lint coverage,
+  not behavioral coverage: `--all-targets` compiles the bin and test
+  targets under this feature set (closing a compile gap `memory_ext.rs`
+  had never been checked against before), and `cargo test`'s memory leg
+  runs the binary's own unit tests plus three tests from the two
+  always-compiled integration binaries, but `tests/conformance.rs`,
+  `tests/http_integration.rs`, and `tests/metrics_integration.rs` are all
+  `#![cfg(feature = "storage-sqlite")]` and compile to zero tests under
+  `storage-memory` — this leg proves the memory cfg gates and the memory
+  `run()` arm typecheck and pass lint, not that the memory-backed store
+  behaves correctly against the HTTP surface. Verified locally: both
+  commands pass as-is (clippy clean; 40 tests pass — 37 unit plus 3 from
+  the two always-compiled integration test binaries, with `conformance.rs`
+  / `http_integration.rs` / `metrics_integration.rs` / `pg_integration.rs`
+  each reporting `0 tests` under this feature set); a deliberate type
+  error introduced into `memory_ext.rs`'s `put` impl made the clippy leg
+  fail with `E0061`, confirming the leg is non-vacuous, then was reverted.
+  `CONTRIBUTING.md`'s feature-flag variant block gains the matching
+  `storage-memory` invocations alongside the existing pg/sqlite ones.
 - **`acdp_version` capability advertisement now reaches `"0.5.0"`** (`REG-3`
   Phase 4 — **one-way-door**). Phase 3's RFC-ACDP-0016 §10/§14 version gate
   shipped with no reachable configuration of the shipped binary that could
@@ -546,6 +1101,31 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   go silently blank until updated to match. A new assertion in
   `tests/metrics_integration.rs` pins the new label form on a
   parameterized request so this doesn't regress unnoticed again.
+- **SHA-pinned `ci.yml`'s third-party actions, and corrected an unreachable pin**
+  (`REG-10`, #111): the fifteen `dtolnay/rust-toolchain`, `Swatinem/rust-cache`,
+  `taiki-e/install-action`, and `EmbarkStudios/cargo-deny-action` refs across `ci.yml`'s
+  eight jobs now resolve at an immutable 40-hex commit SHA with a trailing
+  `# <version-or-branch>` comment, extending `REG-8`'s pinning posture from
+  `docker.yml`/`release-plz.yml` to the last unpinned workflow. First-party `actions/*`
+  refs stay tag-pinned, unchanged.
+  All seven `dtolnay/rust-toolchain` call sites now pin
+  `6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master` and pass an explicit `toolchain:`
+  (`stable` at six sites, `"1.88"` in `msrv`). dtolnay requires a pinned SHA to sit within
+  `master`'s history — anything else is eventually garbage-collected — and the
+  previously-used `4be7066…`, inherited from `release-plz.yml`, is today reachable from no
+  ref at all. That pin is corrected in `release-plz.yml` as part of this change rather than
+  copied into six more jobs.
+  `Swatinem/rust-cache@6323deb… # v2.9.2` (six sites) and
+  `EmbarkStudios/cargo-deny-action@3c63498… # v2.1.1` are ordinary tag-to-SHA pins.
+  `taiki-e/install-action@1ed6d7be… # v2.87.2` pins a release SHA on `main` and passes
+  `tool: cargo-llvm-cov` explicitly. The `@cargo-llvm-cov` tool tag defaults that input, but
+  upstream strongly discourages pinning tool tags by hash: those commits are regenerated per
+  release and are never in `main`'s history, so a hash pin starts referencing a commit that
+  is not present on the repository.
+  Because `# master` is a ref selector rather than a semver tag, Dependabot's
+  `github-actions` ecosystem (`.github/dependabot.yml`, monthly) has nothing to track for the
+  `dtolnay/rust-toolchain` pins; the `# v2.9.2`, `# v2.1.1`, and `# v2.87.2` pins will be
+  kept current.
 
 ### Security
 
@@ -592,3 +1172,41 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `README.md`, `CONTRIBUTING.md`, and `SECURITY.md` corrected to reflect
   that `acdp` is consumed from crates.io (no sibling path dependency) and
   the current auth/hardening surface.
+- **Documentation-accuracy pass (`REG-10` docs follow-up) — two inaccuracies
+  corrected, both in the permissive direction (docs described the code as
+  safer/more restricted than it actually is). Two source comments carrying
+  the same false permissive framing were also corrected
+  (`crates/acdp-registry-core/src/lib.rs`, `crates/acdp-registry-core/src/handlers/admin.rs`)
+  — comments only, no logic or signature changes, no behavior change.**
+  - `CONFIGURATION.md`'s `[playground]` section and `README.md`'s feature
+    list said the DID-signature bypass itself was "compiled in only with
+    the `playground` Cargo feature." It is not: only the two `/admin/*`
+    routes (`admin_router` in `crates/acdp-registry-core/src/lib.rs`) are
+    `#[cfg(feature = "playground")]`-gated. The publish handler's
+    DID-verification skip
+    (`crates/acdp-registry-core/src/handlers/context.rs`, the
+    `playground_snapshot.enabled` branch) is a plain runtime `if` present in
+    every build, including a stock release binary — verified directly: that
+    file's only `cfg` attributes are three `#[cfg(test)]` blocks. Corrected
+    to say so; the existing "never enable
+    in production" warning is retained and strengthened — it now leads the
+    section (previously buried behind a paragraph of compile-gating detail)
+    and reads as the stronger, accurate claim (the risk exists regardless of
+    how the binary was built, and is scoped to non-`did:key` publishes),
+    not weakened. `OPERATIONS.md` and `HTTP-API.md` already scoped
+    the feature-gate claim correctly, to the admin routes only.
+  - `HTTP-API.md`'s endpoint table and Admin section said `GET
+    /admin/contexts` requires the admin bearer (`auth.admin_tokens`), like
+    the other `/admin/*` routes. It does not: `admin_list`
+    (`crates/acdp-registry-core/src/handlers/admin.rs`) calls only
+    `caller_from_headers`/`tenant_for_request` — the same resolution the
+    regular tenant-scoped read routes use — and never
+    `require_admin_bearer`, unlike `reload_pinned_keys`, `admin_status`,
+    `lineage_audit`, and the lifecycle-transition handlers, which do.
+    With `auth.enabled = false` the route is fully anonymous — and even with
+    `auth.enabled = true`, no bearer is required at all when the
+    `Authorization` header is simply absent (`caller_from_headers` returns
+    `Ok(None)`), so an unauthenticated request still enumerates public
+    contexts. This is a pre-existing gap between the route's `/admin/` path
+    and its actual authorization, not a behavior change — `OPERATIONS.md`
+    and `README.md`'s endpoint table corrected to match.

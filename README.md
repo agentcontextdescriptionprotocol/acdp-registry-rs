@@ -24,8 +24,8 @@ see [docs/HTTP-API.md](docs/HTTP-API.md).
 
 - **RFC-ACDP-0003-conformant publish pipeline** — full DID-resolution +
   signature verification + lineage coherence + atomic commit.
-- **Pluggable storage** — Postgres (production) and SQLite (dev / CI), behind a
-  unified `ExtendedRegistryStore` trait.
+- **Pluggable storage** — Postgres (production), SQLite (dev / CI), and an
+  in-memory backend, behind a unified `ExtendedRegistryStore` trait.
 - **DID-bound authentication** — challenge / response over Ed25519, short-lived
   JWTs (HS256 or EdDSA with a published JWKS), token revocation, anonymous
   public reads opt-in.
@@ -42,8 +42,10 @@ see [docs/HTTP-API.md](docs/HTTP-API.md).
   `search.executed`.
 - **Abuse controls & observability** — per-IP and global `/auth/*` rate
   limiting, and an optional Prometheus `/metrics` endpoint.
-- **Playground mode** — compile-time + runtime feature that skips DID
-  verification for hands-on demos.
+- **Playground mode** — a runtime config flag (`[playground] enabled = true`,
+  compiled into every build) that skips DID verification for hands-on demos;
+  never enable in production. Only its admin routes are compile-gated behind
+  the `playground` Cargo feature.
 
 ## Repository layout
 
@@ -108,7 +110,7 @@ Selected fields:
 |-----------------------------------|---------------------------------------------|-------|
 | `registry.authority`              | `ACDP_REGISTRY_REGISTRY__AUTHORITY`         | Bare lowercase DNS name; also the `did:web` identifier. |
 | `registry.port`                   | `ACDP_REGISTRY_REGISTRY__PORT`              | Default `8443`. |
-| `storage.backend`                 | `ACDP_REGISTRY_STORAGE__BACKEND`            | `"postgres"` or `"sqlite"`. |
+| `storage.backend`                 | `ACDP_REGISTRY_STORAGE__BACKEND`            | `"postgres"`, `"sqlite"`, or `"memory"`. |
 | `storage.postgres_url`            | `ACDP_REGISTRY_STORAGE__POSTGRES_URL`       | Required when `backend = "postgres"`. |
 | `auth.jwt_secret`                 | `ACDP_REGISTRY_AUTH__JWT_SECRET`            | Base64-encoded ≥32-byte secret. |
 | `webhook.url`                     | `ACDP_REGISTRY_WEBHOOK__URL`                | HMAC-signed POST target. |
@@ -144,7 +146,7 @@ Selected routes (the full surface, including request/response shapes, is in
 | GET    | `/admin/lineages/{id}/audit`      | On-demand lineage integrity audit (admin bearer). |
 | POST   | `/admin/contexts/{id}/retract`    | Admin retraction (admin bearer). |
 | POST   | `/admin/contexts/{id}/republish`  | Admin republish (admin bearer). |
-| GET    | `/admin/contexts`                 | Compile-gated by `playground` (admin bearer). |
+| GET    | `/admin/contexts`                 | Compile-gated by `playground`; **not** admin-bearer gated — see [docs/HTTP-API.md#admin](docs/HTTP-API.md#admin). |
 | POST   | `/admin/pinned-keys/reload`       | Compile-gated by `playground` (admin bearer). |
 
 Visibility (`public` / `restricted` / `private`) is enforced server-side per
@@ -205,6 +207,8 @@ tables between cases.
 cargo build --release                                          # default = SQLite
 cargo build --release -p acdp-registry-server                   \
     --no-default-features --features storage-pg                # Postgres only
+cargo build --release -p acdp-registry-server                   \
+    --no-default-features --features storage-memory            # In-memory
 cargo build --release -p acdp-registry-server                   \
     --features storage-sqlite,playground                       # Playground
 ```

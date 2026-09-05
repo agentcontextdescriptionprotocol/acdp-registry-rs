@@ -126,10 +126,10 @@ pub async fn verify_cosignature_against_own_log<S: ExtendedRegistryStore>(
     verify_witness_cosignature_value(cosig_value, witness_did_doc, &checkpoint, None, None)
 }
 
-/// Resolve the witness DID, verify one cosignature against our own log,
-/// and (on success) store it. Returns `true` iff a verified cosignature
-/// was stored. Never propagates a verification failure as an error — a
-/// bogus cosignature from one witness must not stall the poll.
+/// Resolve the witness DID, then verify and store the cosignature via
+/// [`verify_and_store_resolved`]. Returns `true` iff a verified
+/// cosignature was stored. Never propagates a DID-resolution failure as
+/// an error — a bogus or unreachable witness must not stall the poll.
 async fn verify_and_store<S: ExtendedRegistryStore>(
     store: &S,
     log: &LogState,
@@ -152,8 +152,23 @@ async fn verify_and_store<S: ExtendedRegistryStore>(
             return false;
         }
     };
+    verify_and_store_resolved(store, log, witness_did, &doc_value, cosig_value).await
+}
+
+/// Verify one cosignature against our own log, given the witness's
+/// already-resolved DID document, and (on success) store it. Returns
+/// `true` iff a verified cosignature was stored. Never propagates a
+/// verification failure as an error — a bogus cosignature from one
+/// witness must not stall the poll.
+async fn verify_and_store_resolved<S: ExtendedRegistryStore>(
+    store: &S,
+    log: &LogState,
+    witness_did: &str,
+    doc_value: &serde_json::Value,
+    cosig_value: &serde_json::Value,
+) -> bool {
     let verified =
-        match verify_cosignature_against_own_log(store, log, &doc_value, cosig_value).await {
+        match verify_cosignature_against_own_log(store, log, doc_value, cosig_value).await {
             Ok(c) => c,
             Err(e) => {
                 // The wrong-root / bad-signature / skew rejection lands here.
@@ -473,11 +488,14 @@ mod tests {
         );
 
         // And nothing was persisted: the store holds zero cosignatures for
-        // this exact checkpoint tuple after the rejection — a guard against
-        // this verification path ever gaining a persist-before-verify write
-        // (the actual store call lives in verify_and_store, untested here),
-        // so a forged cosignature can never later be served as though it
-        // had been aggregated (§6.1).
+        // this exact checkpoint tuple after the rejection. This is a
+        // forward guard on the verification helper only — it does not
+        // exercise the store path (`verify_and_store`/
+        // `verify_and_store_resolved`) at all. The actual proof that a
+        // rejected cosignature cannot reach storage is
+        // `rejected_cosignature_is_not_persisted_by_the_store_path` below,
+        // paired with `verified_cosignature_is_persisted_by_the_store_path`
+        // as the positive control.
         let stored = store
             .witness_cosignatures_for(&log.log_id, 5, WIT_002_FORGED_ROOT)
             .await
@@ -514,7 +532,10 @@ mod tests {
             "beyond-head rejection must name the beyond-head reason, got: {msg}"
         );
 
-        // And nothing was persisted for this tuple either.
+        // And nothing was persisted for this tuple either. As above, this
+        // is a forward guard on the verification helper, not the store
+        // path — see `rejected_cosignature_is_not_persisted_by_the_store_path`
+        // for the actual store-path proof.
         let stored = store
             .witness_cosignatures_for(&log.log_id, 5, &root5)
             .await
@@ -522,6 +543,92 @@ mod tests {
         assert!(
             stored.is_empty(),
             "a rejected beyond-head cosignature must not be persisted, got {stored:?}"
+        );
+    }
+
+    // ── Store-path tests (REG-10 phase 4) ───────────────────────────────
+    //
+    // The two tests above only prove that `verify_cosignature_against_own_log`
+    // rejects a bad cosignature — they never call the store-writing half of
+    // the aggregator, so they cannot show that a rejection actually blocks a
+    // write. These two exercise `verify_and_store_resolved` (the
+    // post-resolution half of `verify_and_store`, split out in REG-10 phase
+    // 4 specifically so this is testable without a live witness endpoint)
+    // against a real `SqliteStore`, per the module's own admonition that
+    // `MemoryStore` would exit via the `NotImplemented` default and prove
+    // nothing.
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejected_cosignature_is_not_persisted_by_the_store_path() {
+        let (store, _tmp) = store_with_size(5).await;
+        let log = log_state();
+        // Same forged-root vector as `cosignature_over_wrong_root_is_rejected`.
+        let forged_cp = log
+            .signer
+            .mint_log_checkpoint(&log.log_id, 5, WIT_002_FORGED_ROOT, Utc::now())
+            .unwrap();
+        let cosig = witness_signer().mint(&forged_cp, Utc::now()).unwrap();
+        let wire = serde_json::to_value(&cosig).unwrap();
+        let doc_value = witness_doc();
+
+        let ok = verify_and_store_resolved(&store, &log, WITNESS_DID, &doc_value, &wire).await;
+        assert!(
+            !ok,
+            "a forged-root cosignature must not be reported as stored"
+        );
+
+        // No row at the forged tuple.
+        let at_forged = store
+            .witness_cosignatures_for(&log.log_id, 5, WIT_002_FORGED_ROOT)
+            .await
+            .unwrap();
+        assert!(
+            at_forged.is_empty(),
+            "a rejected cosignature must not be persisted at the forged root, got {at_forged:?}"
+        );
+
+        // No row at the honest tuple either — guards a write landing under
+        // a different key than the one that was actually verified against.
+        let honest_cp = reconstruct_checkpoint(&store, &log, 5)
+            .await
+            .unwrap()
+            .unwrap();
+        let at_honest = store
+            .witness_cosignatures_for(&log.log_id, 5, &honest_cp.root_hash)
+            .await
+            .unwrap();
+        assert!(
+            at_honest.is_empty(),
+            "a rejected cosignature must not appear under the honest root either, got {at_honest:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn verified_cosignature_is_persisted_by_the_store_path() {
+        let (store, _tmp) = store_with_size(5).await;
+        let log = log_state();
+        let cp = reconstruct_checkpoint(&store, &log, 5)
+            .await
+            .unwrap()
+            .unwrap();
+        let cosig = witness_signer().mint(&cp, Utc::now()).unwrap();
+        let wire = serde_json::to_value(&cosig).unwrap();
+        let doc_value = witness_doc();
+
+        let ok = verify_and_store_resolved(&store, &log, WITNESS_DID, &doc_value, &wire).await;
+        assert!(
+            ok,
+            "a cosignature over our own root must be reported as stored"
+        );
+
+        let stored = store
+            .witness_cosignatures_for(&log.log_id, 5, &cp.root_hash)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored.len(),
+            1,
+            "a verified cosignature must be readable back from the store, got {stored:?}"
         );
     }
 }

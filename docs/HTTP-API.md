@@ -31,12 +31,16 @@ The complete inbound surface of `acdp-registry`. Routes are assembled in
 | GET  | `/admin/lineages/{lineage_id}/audit` | admin bearer | always |
 | POST | `/admin/contexts/{ctx_id}/retract`   | admin bearer | always (501 unless `lifecycle.enabled`) |
 | POST | `/admin/contexts/{ctx_id}/republish` | admin bearer | always (501 unless `lifecycle.enabled`) |
-| GET  | `/admin/contexts`                | admin bearer | `playground` feature |
+| GET  | `/admin/contexts`                | optional bearer\* | `playground` feature |
 | POST | `/admin/pinned-keys/reload`      | admin bearer | `playground` feature |
 
 The `/auth/*` routes are mounted at runtime only when `auth.enabled = true`. The
 two `/admin/{contexts,pinned-keys}` routes are compiled in only with the
 `playground` Cargo feature; `/admin/status` always ships.
+
+\* Despite living under `/admin/`, `GET /admin/contexts` is **not** gated by
+the admin bearer (`auth.admin_tokens`) — see [Admin](#admin) below for what it
+actually checks.
 
 ## Media types and middleware
 
@@ -504,9 +508,32 @@ is configured. See [AUTHENTICATION.md](AUTHENTICATION.md#token-revocation).
 
 ## Admin
 
-Bearer-gated against `auth.admin_tokens` (constant-time compare; empty list
-disables every admin route). See
+Most `/admin/*` routes are bearer-gated against `auth.admin_tokens`
+(constant-time compare; empty list disables every route that checks it):
+`GET /admin/status`, `GET /admin/lineages/{lineage_id}/audit`,
+`POST /admin/contexts/{ctx_id}/retract`, `POST /admin/contexts/{ctx_id}/republish`,
+and `POST /admin/pinned-keys/reload`. See
 [OPERATIONS.md](OPERATIONS.md#admin-endpoints).
+
+**`GET /admin/contexts` is the one exception** — it does not call the admin-bearer
+check at all (`crates/acdp-registry-core/src/handlers/admin.rs`'s `admin_list`
+calls only `caller_from_headers` and `tenant_for_request`, the same helpers the
+regular tenant-scoped read routes use). With `auth.enabled = false` it is fully
+anonymous; with `auth.enabled = true` it accepts an ordinary (non-admin) auth
+bearer, not an `auth.admin_tokens` value. Critically, a bearer is never
+*required*: `caller_from_headers`
+(`crates/acdp-registry-core/src/handlers/context.rs:1337-1339`) returns `Ok(None)`
+whenever the `Authorization` header is simply absent, `auth.enabled` value
+notwithstanding, and `admin_list` passes that `None` straight into
+`list_contexts`, whose SQL grants every `visibility = 'public'` row to a NULL
+requester (`crates/acdp-registry-pg/src/store.rs:166-169`). So a completely
+unauthenticated `GET /admin/contexts` request enumerates all public contexts
+regardless of `auth.enabled`. Only a well-formed `Bearer <token>` whose token
+fails validation is rejected; any other header shape — including a non-`Bearer`
+scheme — is treated as anonymous rather than refused
+(`crates/acdp-registry-auth/src/service.rs:400-405`).
+This is a pre-existing gap between the route's location under `/admin/` and
+its actual authorization — not a recent change.
 
 ### `GET /admin/status`
 
@@ -609,6 +636,19 @@ allowing it is the natural reading of an actor-agnostic §7.1 and the intended
 Paginated dump of stored contexts for the requested tenant. Query: `limit`
 (default 50), `cursor`. Returns `{ items: [...], next_cursor }`. Tenant filter
 applies at the SQL level.
+
+**Not admin-bearer gated** — see the note at the top of [Admin](#admin). Access
+control here is the same tenant/caller resolution as the regular read routes,
+not `auth.admin_tokens`. It is not identical, though: `list_contexts` takes no
+`anonymous_public_reads` flag and unconditionally exposes `visibility = 'public'`
+rows to an anonymous (`None`) requester, whereas `search`
+(`crates/acdp-registry-pg/src/store.rs:1051,1110`,
+`crates/acdp-registry-sqlite/src/store.rs:1152,1251`, wired at
+`crates/acdp-registry-server/src/main.rs:1025`) only does that when
+`auth.anonymous_public_reads = true` — `false` by default
+(`crates/acdp-registry-types/src/config.rs:486`). So with the default config,
+`GET /admin/contexts` hands an anonymous caller public contexts that
+`GET /contexts/search` withholds from the same caller.
 
 ### `POST /admin/pinned-keys/reload` *(playground feature)*
 

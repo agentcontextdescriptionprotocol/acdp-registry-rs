@@ -1,0 +1,22 @@
+name: bump spec
+
+# Delegates to acdp-ci's reusable bump-spec-ref workflow, mirroring bump-acdp.yml.
+# Note: `repository_dispatch` is inert until the spec repo adds this repo to
+# notify-spec-consumers.yml's matrix (today: acdp-rs, acdp-verifier-py only).
+# `workflow_dispatch` works immediately.
+on:
+  repository_dispatch:
+    types: [spec-released]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'Spec SHA to adopt (blank = spec HEAD)'
+        required: false
+        default: ''
+jobs:
+  bump:
+    uses: agentcontextdistributionprotocol/acdp-ci/.github/workflows/bump-spec-ref.yml@v1
+    with:
+      file: .github/workflows/ci.yml
+      sha: ${{ github.event.inputs.sha }}
+    secrets: inherit

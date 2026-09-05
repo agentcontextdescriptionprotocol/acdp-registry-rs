@@ -139,7 +139,7 @@ values for illustration. Env var = `ACDP_REGISTRY_` + the bracketed path.
 | `token_leeway_seconds` | u64 | `30` | Clock-skew tolerance for `exp`. |
 | `anonymous_public_reads` | bool | `false` | Allow unauthenticated reads of `public` contexts. Opt in for discovery hubs. |
 | `require_tenant` | bool | `false` | Strict multi-tenancy: requests resolving to no tenant are denied. See [MULTI-TENANCY.md](MULTI-TENANCY.md). |
-| `admin_tokens` | string[] | `[]` | Bearer tokens for `/admin/*`. Empty disables all admin routes. |
+| `admin_tokens` | string[] | `[]` | Bearer tokens for `/admin/*`. Empty disables the admin-bearer-gated routes (`/admin/status`, `/admin/lineages/{id}/audit`, `/admin/contexts/{id}/retract`, `/admin/contexts/{id}/republish`, `/admin/pinned-keys/reload`) — it does **not** disable `GET /admin/contexts`, which never checks `admin_tokens`. See [HTTP-API.md#admin](HTTP-API.md#admin). |
 
 #### `[[auth.tenant_agents]]`
 
@@ -239,8 +239,29 @@ exposed metric names.
 
 ### `[playground]`
 
-Compiled in only with the `playground` Cargo feature. **Never enable in
-production** — the publish handler skips DID-signature verification.
+**Never enable in production** — setting `enabled = true` skips DID-signature
+verification on publishes from non-`did:key` agents, regardless of which Cargo
+features the binary was built with. (`did:key` publishes are verified before
+the playground branch runs and are unaffected — see below — and a pinned
+agent under `[[playground.pinned_keys]]` is still cryptographically verified
+even with `enabled = true`; the bypass applies to unpinned, non-`did:key`
+publishes.)
+
+Only the two admin routes this feature unlocks (`GET /admin/contexts`,
+`POST /admin/pinned-keys/reload`) are compiled in with the `playground` Cargo
+feature — see [OPERATIONS.md](OPERATIONS.md#admin-endpoints) and
+[HTTP-API.md](HTTP-API.md#endpoint-summary). `[playground] enabled = true`
+itself is **not** feature-gated: the publish handler's DID-signature bypass
+(`crates/acdp-registry-core/src/handlers/context.rs`, the
+`playground_snapshot.enabled` branch) is a plain runtime `if`, compiled into
+every build including a stock release binary with default features.
+`did:key` producers are checked before this branch, unconditionally, through
+acdp's offline verifier (`context.rs:414`, comment at `:423-432`) — a
+`did:key` identity is self-verifying by construction, so `[playground]` never
+affects how a `did:key` publish is authorized. Pinned agents
+(`[[playground.pinned_keys]]`) are cryptographically verified inside the
+playground branch itself (`context.rs:457-464`); the skip applies only to
+publishes from non-`did:key` agents that aren't pinned.
 
 | Key | Type | Default | Notes |
 |-----|------|---------|-------|

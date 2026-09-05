@@ -132,9 +132,11 @@ pub fn build_router<S: ExtendedRegistryStore + 'static>(state: AppState<S>) -> R
         // Registry-attested lifecycle (RFC-ACDP-0013 §6 registry-initiated
         // events): admin-gated retract/republish attributed to the
         // registry's own DID — the policy/legal takedown lever for when a
-        // producer is unavailable. Auth-gated by `auth.admin_tokens` like
-        // every other `/admin/*` route; requires `[lifecycle] enabled`
-        // (501 otherwise). Ships in every build.
+        // producer is unavailable. Auth-gated by `auth.admin_tokens`, same as
+        // `/admin/status` and `/admin/lineages/{id}/audit` above — but NOT
+        // every `/admin/*` route: `GET /admin/contexts` (in `admin_router`
+        // below) never checks `auth.admin_tokens` at all. Requires
+        // `[lifecycle] enabled` (501 otherwise). Ships in every build.
         .route(
             "/admin/contexts/{ctx_id}/retract",
             post(handlers::admin_retract::<S>),
