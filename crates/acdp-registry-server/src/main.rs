@@ -683,9 +683,9 @@ async fn serve_with_store<S: ExtendedRegistryStore + 'static>(
                     "auth.jwt_secret not set and allow_ephemeral_secret=true — \
                      generating an ephemeral key; tokens will not survive a restart"
                 );
-                use rand::RngCore;
+                use rand::Rng;
                 let mut bytes = [0u8; 32];
-                rand::thread_rng().fill_bytes(&mut bytes);
+                rand::rng().fill_bytes(&mut bytes);
                 JwtSecret::from_bytes(&bytes)
             } else {
                 JwtSecret::from_base64(&cfg.auth.jwt_secret)

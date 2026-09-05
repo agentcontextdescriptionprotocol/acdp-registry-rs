@@ -359,8 +359,9 @@ async fn jwks_publishes_eddsa_public_key_in_eddsa_mode() {
     let pem = {
         use base64::Engine as _;
         use ed25519_dalek::SigningKey;
-        use rand::rngs::OsRng;
-        let sk = SigningKey::generate(&mut OsRng);
+        use rand::rand_core::UnwrapErr;
+        use rand::rngs::SysRng;
+        let sk = SigningKey::generate(&mut UnwrapErr(SysRng));
         let prefix: [u8; 16] = [
             0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22,
             0x04, 0x20,
