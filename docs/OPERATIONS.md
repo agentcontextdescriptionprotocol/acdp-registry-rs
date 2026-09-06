@@ -81,10 +81,20 @@ an empty list disables every route that checks it). See
 out of band and distribute them to operators / monitoring.
 
 - `GET /admin/status` — always shipped, admin-bearer gated. An operational
-  snapshot: storage health, idempotency record count, webhook queue depth,
-  configured revocation feeds, and migration state. Good for a readiness
-  probe richer than `/healthz`. Shape in
+  snapshot: build identity, storage health, idempotency record count, webhook
+  queue depth, configured revocation feeds, and migration state. Good for a
+  readiness probe richer than `/healthz`. Shape in
   [HTTP-API.md](HTTP-API.md#get-adminstatus).
+
+  The `build` group answers "exactly which binary is running": `version` (the
+  same string `/healthz` serves unauthenticated), `commit`, and
+  `storage_impl`. **`commit` is omitted when the binary was not built by
+  `docker.yml`** — that absence is the signal that the build is not uniquely
+  identified, because `version` then degrades to the bare package version that
+  every locally built binary shares. When diagnosing "which build is in this
+  pod", an absent `commit` means you cannot answer that from the service and
+  must fall back to the image digest. `storage_impl` is an opaque diagnostic
+  string (a Rust type path) — display it, do not parse it.
 - `GET /admin/contexts`, `POST /admin/pinned-keys/reload` — only in builds with
   the `playground` Cargo feature. Both are admin-bearer gated. `GET
   /admin/contexts` authenticates the caller but names no agent DID, and

@@ -20,6 +20,17 @@ COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json \
         --no-default-features --features "${STORAGE_FEATURE}" \
         -p acdp-registry-server
+# The build SHA is declared AFTER `cargo chef cook` on purpose: its value
+# changes every commit, so declaring it earlier would bust the dependency
+# cache the two-stage build exists for. The final layer below rebuilds on
+# every commit anyway, so it costs nothing here.
+#
+# It arrives as a build ARG rather than from `git describe` in a build.rs:
+# `.dockerignore` excludes `.git/`, so no git metadata exists in the build
+# context. Unset (a plain `docker build`) leaves `option_env!` as `None` and
+# the served version falls back to the bare package version.
+ARG ACDP_BUILD_SHA
+ENV ACDP_BUILD_SHA=${ACDP_BUILD_SHA}
 # Bring in the real sources and build the actual binary.
 COPY . .
 RUN cargo build --release \
