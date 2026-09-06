@@ -903,6 +903,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   No family moved bucket in this phase — this is a record correction plus
   the new ratchet, not new coverage.
 
+- **`did-ssrf`'s deferral reason corrected (same review pass).** It claimed the family
+  "needs a controlled resolver seam this harness doesn't have yet". That named the wrong
+  cause and was falsifiable from this suite's own output: all five `did-ssrf-*` fixtures
+  are reported under `non-HTTP fixture (vectors / schema / informative)` in the skip
+  tally, so they never reach a resolver. The seam also already exists —
+  `acdp_did::WebResolver` applies `SsrfPolicy::default()` unconditionally, and exposes
+  `with_ssrf_policy` and `with_test_endpoint` under the `test-transport` feature already
+  enabled on `acdp` in this crate's dev-dependencies. The real gap is a direct-vector
+  pass like `can`'s.
+
 <!-- end REG-11 Phase 6 -->
 
 - **BREAKING** (`REG-11` Phase 3, `#133`): `GET /admin/contexts` is now

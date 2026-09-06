@@ -7215,8 +7215,15 @@ const DEFERRED: &[(&str, &str, u32)] = &[
     ),
     (
         "did-ssrf",
-        "producer-DID-resolution SSRF refusal; needs a controlled resolver seam this \
-         harness doesn't have yet.",
+        "producer-DID-resolution SSRF refusal. NOT a missing resolver seam: all 5 \
+         did-ssrf-* fixtures fall out at fixture-shape extraction and are reported \
+         as \"non-HTTP fixture (vectors / schema / informative)\" in this suite's own \
+         skip tally -- so they never reach a resolver at all. The seam also already \
+         exists: acdp_did::WebResolver applies SsrfPolicy::default() unconditionally \
+         (covering the 001-003 IP-literal cases), and exposes with_ssrf_policy plus \
+         with_test_endpoint under the test-transport feature, which is already enabled \
+         on acdp in this crate's dev-dependencies. What is missing is a direct-vector \
+         pass like can's, not a capability.",
         130,
     ),
     (
