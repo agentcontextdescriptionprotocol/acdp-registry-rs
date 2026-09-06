@@ -344,7 +344,8 @@ mod tests {
     use super::*;
     use acdp_registry_types::auth::{AcdpClaims, BearerClaims};
     use ed25519_dalek::SigningKey;
-    use rand::rngs::OsRng;
+    use rand::rand_core::UnwrapErr;
+    use rand::rngs::SysRng;
 
     fn sample_claims() -> BearerClaims {
         let now = chrono::Utc::now().timestamp();
@@ -364,7 +365,7 @@ mod tests {
     }
 
     fn fresh_ed25519_pkcs8_pem() -> String {
-        let sk = SigningKey::generate(&mut OsRng);
+        let sk = SigningKey::generate(&mut UnwrapErr(SysRng));
         // PKCS#8 v1 layout we documented in decode_ed25519_pem_to_public.
         let prefix: [u8; 16] = [
             0x30, 0x2e, // SEQUENCE (46)
