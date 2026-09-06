@@ -62,4 +62,4 @@ uuid           = { workspace = true }
 # Serialize PG integration tests so they don't fight over the shared
 # truncate-and-test database. SQLite tests use disposable tempfiles so
 # they don't need this.
-serial_test    = "4"
+serial_test    = "3"
