@@ -1582,6 +1582,43 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Documentation
 
+<!-- REG-11 #152 (Lane B) -->
+
+- **Bearer-parsing behaviour is now documented** (`#152`), in a new
+  "Presenting a bearer" section of `docs/AUTHENTICATION.md`, with
+  cross-references from `README.md` and `SECURITY.md`.
+
+  Two facts were true but written down nowhere. First, an `Authorization`
+  header the registry does not recognise as a bearer — a non-`Bearer` scheme, a
+  misspelled header, a non-UTF-8 value — is treated as **anonymous** on the
+  ordinary read/publish routes rather than refused: a typo'd scheme never reaches
+  token validation at all. Only a well-formed bearer that then fails validation
+  is rejected, and that rejection is `403 not_authorized` — this registry emits
+  no `401` on the auth path. What the caller sees after the anonymous
+  classification depends on the route and on `auth.anonymous_public_reads`
+  (default `false`), so it may be a refusal or a filtered result set.
+  `/admin/*` refuses all the same inputs with `403`.
+
+  Second, the two parsers disagree. `extract_bearer` accepts `Bearer ` or
+  `bearer ` and trims the token; `require_admin_bearer` accepts `Bearer ` only
+  and does not trim. So `bearer <jwt>` authenticates on `/contexts/*` and 403s
+  on `/admin/*`. Both admin behaviours are pinned by tests
+  (`bearer_scheme_is_case_sensitive`, `rejects_token_with_extra_whitespace`), so
+  the strictness is deliberate rather than accidental.
+
+  The section corrects a claim in the issue that prompted it: `#152` argued the
+  lax parser is the RFC 7235-conformant one. It is not — both parsers hard-code
+  their prefixes, so `BEARER` and `BeArEr` are rejected by **both**. Neither is
+  case-insensitive; one simply accepts an extra spelling.
+
+  Trailing whitespace is documented as protocol-dependent, which is the one
+  behaviour here that cannot be stated flatly: `httparse` strips trailing
+  whitespace from HTTP/1.1 header values before any handler sees them, while
+  HTTP/2 preserves it. `Bearer <jwt> ` is therefore accepted everywhere over
+  HTTP/1.1 and refused by `/admin/*` over HTTP/2.
+
+<!-- end REG-11 #152 -->
+
 - Reference guides under `docs/`: an index (`README.md`) plus
   `HTTP-API.md` (every endpoint, media types, and the RFC-ACDP-0007
   error envelope), `AUTHENTICATION.md` (DID challenge-response, JWT

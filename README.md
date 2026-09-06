@@ -157,8 +157,12 @@ Selected routes (the full surface, including request/response shapes, is in
 
 Visibility (`public` / `restricted` / `private`) is enforced server-side per
 RFC-ACDP-0008 §4.5; authenticated callers identify themselves via
-`Authorization: Bearer <jwt>`. Full request/response shapes, error envelope,
-auth flow, config, and ops are documented under [`docs/`](docs/README.md).
+`Authorization: Bearer <jwt>`. A header the registry does not recognise as a
+bearer is treated as **anonymous** rather than refused on these routes — it
+never reaches token validation — while `/admin/*` refuses it. See
+[Presenting a bearer](docs/AUTHENTICATION.md#presenting-a-bearer).
+Full request/response shapes, error envelope, auth flow, config, and ops are
+documented under [`docs/`](docs/README.md).
 
 When `auth.enabled = false`, the `/auth/challenge`, `/auth/token`, and
 `/auth/token/revoke` routes are not mounted, and any `Authorization` header is ignored — every caller
