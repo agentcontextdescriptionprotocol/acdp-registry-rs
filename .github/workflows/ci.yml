@@ -158,7 +158,7 @@ jobs:
           # Pinned so a spec-repo push cannot change this repo's CI result
           # without a commit here. Bump deliberately when adopting new
           # fixtures.
-          ref: b8601e29d63d18af716b2999f146884557e382c7
+          ref: d1f06d0d49b73d411a3983d3877321ccaccd38e7
           path: acdp-spec
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
