@@ -5534,7 +5534,7 @@ async fn idem001_004_publish_idempotency_key_lifecycle_and_restart_durability() 
 /// did:key producer (offline-verifiable, no network resolver needed)
 /// against a NON-playground harness, routed through
 /// `RegistryServer::publish_verified_did_key_in_tenant` ->
-/// `commit_via_store` (`registry/server.rs:587`,
+/// `commit_via_store` (`registry/server.rs:666`,
 /// `let idempotency = if self.caps.supports_idempotency_key { ... } else
 /// { None }`), which every SDK-routed publish path (verified did:web,
 /// did:key, pinned-verified) shares and which gates correctly.
@@ -5543,9 +5543,12 @@ async fn idem001_004_publish_idempotency_key_lifecycle_and_restart_durability() 
 /// `acdp-registry-core`'s OWN playground publish branch
 /// (`crates/acdp-registry-core/src/handlers/context.rs`, the manual
 /// idempotency lookup/record dance around `publish_unverified_for_tests`)
-/// never goes through `commit_via_store` at all --
-/// `publish_unverified_for_tests` takes no idempotency key -- so it cannot
-/// inherit this gate and must consult
+/// DOES reach `commit_via_store` -- `publish_unverified_for_tests` ends
+/// with an unconditional `self.commit_via_store(req, None, None, None)`
+/// (`server.rs:557`) -- but that call hardcodes `None` for the idempotency
+/// key, so `commit_via_store`'s `supports_idempotency_key` gate
+/// (`server.rs:666`) is a no-op for this path. The playground branch must
+/// therefore consult
 /// `state.server.capabilities().supports_idempotency_key` itself. Before
 /// REG-11 Phase 5 (#128) it did not: a first attempt at this test, built
 /// on the shared playground harness like `idem-001`..`004`, demonstrated
@@ -5655,21 +5658,23 @@ async fn idem005_no_support_ignores_idempotency_key_header() {
 /// REG-11 Phase 5 (#128): the playground publish branch's own
 /// `supports_idempotency_key` gate, exercised directly.
 ///
-/// `idem-005` above proves the SDK-routed paths (verified did:web,
-/// did:key, pinned-verified) respect `supports_idempotency_key` because
-/// they all go through `RegistryServer::commit_via_store`. It
-/// deliberately does NOT exercise the playground's own manual idempotency
-/// lookup/record dance around `publish_unverified_for_tests`
-/// (`context.rs`'s `publish_inner`, the unpinned arm of the
-/// `playground_snapshot.enabled` branch) -- that code path never calls
-/// `commit_via_store` at all, so it cannot inherit the gate, and had none
-/// of its own until this phase added the `idem_key` binding (computed
-/// once, reused at both the lookup and the record call sites).
+/// `idem-005` proves the did:key path directly, and -- via the shared
+/// `commit_via_store` call -- the verified-did:web and pinned-verified
+/// paths by construction. It deliberately does NOT exercise the
+/// playground's own manual idempotency lookup/record dance around
+/// `publish_unverified_for_tests` (`context.rs`'s `publish_inner`, the
+/// unpinned arm of the `playground_snapshot.enabled` branch) -- that code
+/// path DOES end in an unconditional `commit_via_store(req, None, None,
+/// None)` call, but the hardcoded `None` idempotency key makes
+/// `commit_via_store`'s `supports_idempotency_key` gate a no-op for it, so
+/// it cannot inherit the gate that way, and had none of its own until this
+/// phase added the `idem_key` binding (computed once, reused at both the
+/// lookup and the record call sites).
 ///
 /// The producer here **must be did:web, not did:key**. `publish_inner`
 /// siphons off every did:key agent BEFORE the playground branch is ever
-/// reached (`context.rs:414`, `req.agent_id.as_str().starts_with(
-/// "did:key:")`), routing it through
+/// reached (`context.rs`'s `req.agent_id.as_str().starts_with(
+/// "did:key:")` check), routing it through
 /// `publish_verified_did_key_in_tenant` -> `commit_via_store` instead --
 /// exactly the already-gated path `idem-005` covers. A did:key producer
 /// here would silently re-run `idem-005` under a different name and would
@@ -7100,6 +7105,8 @@ const COVERED: &[(&str, &[CoverageMechanism])] = &[
         &[CoverageMechanism::Direct(&[
             "idem001_004_publish_idempotency_key_lifecycle_and_restart_durability",
             "idem005_no_support_ignores_idempotency_key_header",
+            "idem_playground_branch_honors_supports_idempotency_key_gate",
+            "idem_playground_branch_writes_no_idempotency_record_when_gated_off",
         ])],
     ),
     (

@@ -1203,11 +1203,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **The playground publish branch now honors `supports_idempotency_key`**
   (`REG-11` Phase 5, `#128`): `crates/acdp-registry-core/src/handlers/
   context.rs`'s playground unpinned publish branch — the manual
-  idempotency lookup/record dance it runs around `publish_unverified_for_tests`,
-  which takes no idempotency key and so cannot delegate to the SDK's
-  `RegistryServer::commit_via_store` the other three publish paths (verified
-  did:web, did:key, pinned-verified) all inherit the gate from — previously
-  honored ANY `Idempotency-Key` header unconditionally, with no check of
+  idempotency lookup/record dance it runs around `publish_unverified_for_tests`
+  — reaches the SDK's `RegistryServer::commit_via_store` just like the other
+  three publish paths (verified did:web, did:key, pinned-verified), but only
+  via an unconditional `commit_via_store(req, None, None, None)` tail call
+  (`server.rs:557`) that hardcodes the idempotency key to `None`, so
+  `commit_via_store`'s own `supports_idempotency_key` gate (`server.rs:666`)
+  is a no-op for this path and the branch cannot delegate this decision to
+  it — previously honored ANY `Idempotency-Key` header unconditionally, with
+  no check of
   `state.server.capabilities().supports_idempotency_key` anywhere in that
   branch. Fixed with one shared `idem_key` binding, computed once before the
   lookup and reused at both the lookup and record call sites, rather than two
@@ -1219,7 +1223,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   handler's doc comment, which claimed `Idempotency-Key` "is honored when
   the registry advertises support" — true of the other three branches, false
   of this one before the fix — to instead name the actual mechanism and why
-  this branch cannot delegate.
+  this branch cannot delegate this decision.
   Two new direct tests in `crates/acdp-registry-server/tests/conformance.rs`,
   placed immediately after `idem005_no_support_ignores_idempotency_key_header`:
   `idem_playground_branch_honors_supports_idempotency_key_gate` (two

@@ -290,8 +290,10 @@ pub(crate) fn reconcile_tenant_sources(
 /// `Idempotency-Key` handling differs by branch: the did:key, pinned-verified,
 /// and production branches delegate to the SDK's `commit_via_store`, which
 /// consults `supports_idempotency_key` itself. The playground unpinned branch
-/// cannot delegate — it calls `publish_unverified_for_tests`, which takes no
-/// idempotency key at all — so it gates its own manual lookup/record dance on
+/// cannot delegate this decision — it too ends up inside `commit_via_store`
+/// (via `publish_unverified_for_tests`), but only after hardcoding `None` for
+/// the idempotency key, so `commit_via_store`'s own gate is a no-op for this
+/// path — so it gates its own manual lookup/record dance on
 /// `supports_idempotency_key` directly (see the `idem_key` binding below).
 pub async fn publish<S: ExtendedRegistryStore + 'static>(
     state: State<Arc<AppState<S>>>,
