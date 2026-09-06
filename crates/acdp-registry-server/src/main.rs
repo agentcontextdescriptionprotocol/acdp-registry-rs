@@ -147,16 +147,30 @@ fn validate_config(cfg: &RegistryConfig) -> anyhow::Result<()> {
     // token claim — so no caller can ever assert the one tenant every row
     // reports, and every tenant-scoped read matches nothing. Publishes still
     // succeed — they just record no tenant — so a warning would have nothing
-    // working to preserve on the read path. Note this keys on `tenant_agents`
-    // only; `require_tenant` alone on this backend is the same failure and is
-    // not yet refused (#156).
-    if !cfg.auth.tenant_agents.is_empty() && matches!(cfg.storage.backend, StorageBackend::Memory) {
+    // working to preserve on the read path.
+    //
+    // #156 widened this from `tenant_agents` alone to EITHER tenancy signal.
+    // `require_tenant = true` with an empty `tenant_agents` is a real
+    // configuration: with no agent bindings no registry-issued token ever
+    // carries a `tenant` claim (`tenant_for_agent` over an empty binding list
+    // returns `None`), so on the READ path a caller asserts its tenant with
+    // the `X-Tenant-Id` header via `tenant_for_request`'s no-bearer arm —
+    // exactly what this registry's own default-deny message instructs.
+    // (Publishes are a separate story: `tenant_for_publish`'s
+    // `binding_fallback` deliberately ignores the spoofable header in strict
+    // mode (#2), so with no bindings a publish is denied outright.)
+    // On this backend the reads then fail identically to the `tenant_agents`
+    // arm: any tenant a caller does assert cannot match the `"default"` every
+    // row reports. Keying on `tenant_agents` alone left that arm starting
+    // cleanly and serving nothing.
+    let tenancy_configured = !cfg.auth.tenant_agents.is_empty() || cfg.auth.require_tenant;
+    if tenancy_configured && matches!(cfg.storage.backend, StorageBackend::Memory) {
         anyhow::bail!(
-            "auth.tenant_agents is configured (multi-tenant) but storage.backend=memory, \
-             which is not tenancy-aware: it records no tenant for a published context and \
-             reports the reserved 'default' tenant for every row, which no caller is \
-             permitted to assert. Every tenant-scoped read would return zero rows. Use \
-             the sqlite or postgres backend for a multi-tenant deployment."
+            "tenancy is configured (auth.tenant_agents and/or auth.require_tenant=true) but \
+             storage.backend=memory, which is not tenancy-aware: it records no tenant for a \
+             published context and reports the reserved 'default' tenant for every row, \
+             which no caller is permitted to assert. Every tenant-scoped read would return \
+             zero rows. Use the sqlite or postgres backend for a multi-tenant deployment."
         );
     }
 
@@ -1476,6 +1490,38 @@ mod tests {
         // The same tenancy config on a durable backend still starts.
         cfg.storage.backend = StorageBackend::Sqlite;
         assert!(validate_config(&cfg).is_ok());
+    }
+
+    // #156 — the other arm of the same failure: strict tenancy with no
+    // `[[auth.tenant_agents]]` at all, where reads carry `X-Tenant-Id`.
+    // Before #156 this started cleanly on the memory backend and then served
+    // zero rows for every tenant-scoped read.
+    #[test]
+    fn require_tenant_on_memory_backend_is_rejected_without_tenant_agents() {
+        let mut cfg = RegistryConfig::defaults();
+        // Deliberately EMPTY: this is the case the #137 guard missed.
+        assert!(
+            cfg.auth.tenant_agents.is_empty(),
+            "this test only covers the empty-tenant_agents arm"
+        );
+        cfg.auth.require_tenant = true;
+        cfg.storage.backend = StorageBackend::Memory;
+        let err = validate_config(&cfg)
+            .expect_err("strict tenancy on the memory backend must be refused");
+        assert!(err.to_string().contains("tenancy-aware"), "{err}");
+
+        // Strict tenancy on a durable backend still starts...
+        cfg.storage.backend = StorageBackend::Sqlite;
+        assert!(validate_config(&cfg).is_ok());
+
+        // ...and the memory backend is still fine with no tenancy at all,
+        // which is the demo/ephemeral case it exists for.
+        cfg.auth.require_tenant = false;
+        cfg.storage.backend = StorageBackend::Memory;
+        assert!(
+            validate_config(&cfg).is_ok(),
+            "an untenanted memory registry must still start"
+        );
     }
 
     // The capabilities `supported_signature_algorithms` gate is enforced by

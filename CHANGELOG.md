@@ -805,6 +805,45 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+<!-- REG-11 #156 (Lane B) -->
+
+- **BREAKING** (`#156`): the memory-backend tenancy refusal now covers
+  `auth.require_tenant = true` as well as a non-empty
+  `[[auth.tenant_agents]]`. Either signal alone, combined with
+  `storage.backend = "memory"`, is refused at startup.
+
+  This **narrows** the acceptance criterion the original refusal shipped
+  under, which said every other backend/tenancy combination still starts.
+  That is deliberate: `require_tenant = true` with an empty `tenant_agents`
+  is a real configuration. With no agent bindings, no registry-issued token
+  ever carries a `tenant` claim, so on the read path a caller asserts its
+  tenant with the `X-Tenant-Id` header — which is what the registry's own
+  default-deny message instructs. (Publishes differ: strict mode
+  deliberately ignores that spoofable header when the producer has no
+  binding, so a publish is denied outright.) On the memory backend those
+  reads then fail identically to the case already refused.
+  Strict mode denies every request resolving to no tenant, and any tenant a
+  caller does assert cannot match the reserved `default` that every row
+  reports, so each tenant-scoped read returns zero rows while the registry
+  starts cleanly. Keying the refusal on `[[auth.tenant_agents]]` alone left
+  that arm silently under-serving.
+
+  An untenanted memory registry — neither signal set — still starts, which
+  is the ephemeral demo case the backend exists for.
+
+  Nothing in the repo relied on the newly-refused combination. A sweep for
+  the memory backend combined with either tenancy signal found no test,
+  fixture, example config, compose file, CI job, or doc snippet that hits
+  it: `config/registry.example.toml` ships `sqlite` with
+  `require_tenant = false`, `docker/config.docker.toml` ships `postgres`,
+  and every `StorageBackend::Memory` site in the tree is in
+  `validate_config` or its own tests. (The three integration tests that set
+  `require_tenant = true` also set `tenant_agents`, so they were already
+  inside the Phase 8 guard; they run on SQLite and never call
+  `validate_config` regardless.)
+
+<!-- end REG-11 #156 -->
+
 <!-- REG-11 Phase 8 (Lane B) -->
 
 - **BREAKING** (`REG-11` Phase 8, `#137`): `storage.backend = "memory"`
@@ -830,12 +869,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   refuses `tenant_agents` with `require_tenant = false`, keeping the two
   tenancy refusals together; because that guard forces strict mode whenever
   `tenant_agents` is set, the rejected configuration is always the strict
-  one. Every other backend/tenancy combination is unaffected — including
-  `require_tenant = true` with an empty `tenant_agents` on the memory
-  backend, which fails the same way and is **not** refused by this change;
-  that gap is tracked in `#156` and documented in `docs/MULTI-TENANCY.md`.
+  one. No other backend/tenancy combination was affected by Phase 8
+  itself (see the `#156` entry above, which later narrowed this).
   Documented in `docs/MULTI-TENANCY.md` (new "Backend support" section)
   and `docs/CONFIGURATION.md`.
+
+  *(This entry originally noted that `require_tenant = true` with an empty
+  `tenant_agents` on the memory backend fails the same way and was not
+  refused, tracking it as `#156`. That gap is closed by the `#156` entry
+  above, in the same release, so the caveat has been removed rather than
+  left to read as a standing limitation.)*
 
 <!-- end REG-11 Phase 8 -->
 
