@@ -7050,11 +7050,11 @@ const EXCUSED: &[(&str, &str)] = &[
     ),
     (
         "fed",
-        "applies_to_profiles = [acdp-registry-federated, acdp-consumer] on all 10 \
+        "applies_to_profiles = [acdp-registry-federated, acdp-consumer] on all 11 \
          fixtures. This repo does not implement or advertise the \
          acdp-registry-federated profile itself -- no crate under crates/ implements \
          federated resolution (the profile name appears only in fixture data and in \
-         this excuse) -- and none of the 10 is in acdp-registry-core's \
+         this excuse) -- and none of the 11 is in acdp-registry-core's \
          required_fixtures or conditional_fixtures.",
     ),
     (
@@ -7221,11 +7221,13 @@ const DEFERRED: &[(&str, &str, u32)] = &[
     ),
     (
         "data-ref",
-        "DataRef publish-path rejections (RFC-ACDP-0002 \u{a7}6): all 8 data-ref-* fixtures \
-         are registry-side publish validation -- neither/both location+embedded, a \
+        "DataRef publish-path rejections (RFC-ACDP-0002 \u{a7}6): the 7 data-ref-* \
+         fixtures in acdp-registry-core's required_fixtures (data-ref-001..007) are \
+         registry-side publish validation -- neither/both location+embedded, a \
          credentialed URI, a missing structured scheme, an oversized/non-UTF-8/hash- \
-         mismatched embedded payload -- not a consumer-leaning obligation. Needs a \
-         direct-vector or replayed pass against the publish validation path.",
+         mismatched embedded payload; the 8th, data-ref-008-external-data-ref-hash- \
+         mismatch, is a consumer fetch-time check and is not required of this profile. \
+         Needs a direct-vector or replayed pass against the publish validation path.",
         130,
     ),
     (
@@ -7248,7 +7250,7 @@ const DEFERRED: &[(&str, &str, u32)] = &[
         "rate-limiting obligations (RFC-ACDP-0008 \u{a7}4.3); not a missing seam -- \
          `limits.publish_rate_per_minute` (config.rs:560-561) is a live config knob \
          enforced by the in-process fixed-window `AgentRateLimiter` \
-         (rate_limit.rs, wired at state.rs:87-88) emitting 429 `rate_limited` with \
+         (rate_limit.rs, wired at state.rs:86-89) emitting 429 `rate_limited` with \
          `Retry-After` (error.rs:42,61,75) -- already proven end-to-end for the sibling \
          challenge limiter (http_integration.rs:843-873). Needs a direct/replayed pass \
          exercising the publish-path limiter the same way, not a new mechanism.",
@@ -7263,24 +7265,34 @@ const DEFERRED: &[(&str, &str, u32)] = &[
     ),
     (
         "rcpt",
-        "receipt verification (RFC-ACDP-0010); the harness advertises only the \
-         acdp-registry-core profile (HARNESS_PROFILES, conformance.rs:425), not that a \
-         seam is missing.",
+        "receipt verification (RFC-ACDP-0010); two causes, not one: rcpt-001 carries no \
+         applies_to_profiles and is skipped as a non-HTTP golden vector (needs a \
+         direct-vector pass); rcpt-002/003/004 are restricted to \
+         acdp-registry-receipts/acdp-consumer and the harness advertises only \
+         acdp-registry-core (HARNESS_PROFILES, conformance.rs:425). Neither is a \
+         missing seam.",
         130,
     ),
     (
         "lhr",
-        "lineage-head receipts (RFC-ACDP-0011); the harness advertises only the \
-         acdp-registry-core profile (HARNESS_PROFILES, conformance.rs:425), not that a \
-         seam is missing.",
+        "lineage-head receipts (RFC-ACDP-0011); two causes, not one: lhr-001 carries no \
+         applies_to_profiles and is skipped as a non-HTTP golden vector (needs a \
+         direct-vector pass); lhr-002/003/004 are restricted to \
+         acdp-registry-head-receipts/acdp-consumer and the harness advertises only \
+         acdp-registry-core (HARNESS_PROFILES, conformance.rs:425). Neither is a \
+         missing seam.",
         130,
     ),
     (
         "log",
         "transparency-log verification (RFC-ACDP-0012); the emission side is implemented \
-         and always mounted (/log/checkpoint, /log/proof, /log/entries, lib.rs:86-88) -- \
-         the harness advertises only the acdp-registry-core profile (HARNESS_PROFILES, \
-         conformance.rs:425), not that a seam is missing.",
+         and always mounted (/log/checkpoint, /log/proof, /log/entries, \
+         crates/acdp-registry-core/src/lib.rs:86-88). Two causes, not one: log-001/003 \
+         carry no applies_to_profiles and are skipped as non-HTTP golden vectors (need \
+         a direct-vector pass); log-002/004 are restricted to \
+         acdp-registry-transparency-log/acdp-consumer and the harness advertises only \
+         acdp-registry-core (HARNESS_PROFILES, conformance.rs:425). Neither is a \
+         missing seam.",
         130,
     ),
     (

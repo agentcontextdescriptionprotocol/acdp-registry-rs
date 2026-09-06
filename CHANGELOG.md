@@ -870,8 +870,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   context is ever dropped from branch protection. Measured, not derived:
   `ACDP_SPEC_DIR=<pinned-spec-checkout> ACDP_REQUIRE_CONFORMANCE=1 cargo
   test -p acdp-registry-server --features storage-sqlite,playground --test
-  conformance --test conformance_gate -- --nocapture` → 45 passed, 0
-  failed, `replayed 30 exchange(s); failures=0` (`pub: 3`, `ret: 1`,
+  conformance --test conformance_gate -- --nocapture` → 44 passed + 1
+  passed, 0 failed, `replayed 30 exchange(s); failures=0` (`pub: 3`, `ret: 1`,
   `vis: 26` — `MIN_REPLAYED_EXCHANGES` unchanged); `cargo test --workspace`
   and `cargo clippy --workspace --all-targets -- -D warnings` both clean.
 - **Corrected seven `DEFERRED` reasons that misdescribed this repo's own
@@ -879,22 +879,32 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `rate` claimed a missing "clock/limiter seam", but
   `limits.publish_rate_per_minute` (`config.rs:560-561`) is already enforced
   by the in-process `AgentRateLimiter` (`rate_limit.rs`, wired at
-  `state.rs:87-88`), proven end-to-end by the sibling challenge-limiter test
+  `state.rs:86-89`), proven end-to-end by the sibling challenge-limiter test
   (`http_integration.rs:843-873`); `data-ref` called the family
-  "consumer-leaning", but all 8 `data-ref-*` fixtures are registry-side
-  publish-path rejections (RFC-ACDP-0002 §6); `status` called it "lifecycle
+  "consumer-leaning", but the 7 `data-ref-*` fixtures in
+  `acdp-registry-core`'s `required_fixtures` (`data-ref-001..007`) are
+  registry-side publish-path rejections (RFC-ACDP-0002 §6) — the 8th,
+  `data-ref-008-external-data-ref-hash-mismatch`, is a consumer fetch-time
+  check and is not required of this profile; `status` called it "lifecycle
   status transitions", but the fixtures test the `status` *string's*
   grammar (RFC-ACDP-0004 §4.1), not lifecycle state; `rev` called it a
   "verification-side family", but RFC-ACDP-0014 §4/§5 assigns this to the
   registry, which already implements `ContextType::KeyRevocation`. Three
   more overstated the gap as "needing a new seam" when the seam already
   exists: `log`'s `/log/checkpoint`, `/log/proof`, and `/log/entries`
-  routes are always mounted (`lib.rs:86-88`); the accurate reason for `log`,
-  `rcpt`, and `lhr` alike is that this test harness advertises only the
-  `acdp-registry-core` profile (`HARNESS_PROFILES`, `conformance.rs:425`).
+  routes are always mounted (`crates/acdp-registry-core/src/lib.rs:86-88`).
+  `log`, `rcpt`, and `lhr` each have two real causes, not one: one fixture
+  per family (`log-001`/`log-003`, `rcpt-001`, `lhr-001`) carries no
+  `applies_to_profiles` and is a non-HTTP golden vector needing a
+  direct-vector pass; the rest (`log-002`/`log-004`, `rcpt-002..004`,
+  `lhr-002..004`) are restricted to a profile this harness doesn't
+  advertise (`HARNESS_PROFILES`, `conformance.rs:425`) — advertising it
+  would not make the non-HTTP vectors run.
   No family moved bucket in this phase — this is a record correction plus
   the new ratchet, not new coverage.
+
 <!-- end REG-11 Phase 6 -->
+
 - **BREAKING** (`REG-11` Phase 3, `#133`): `GET /admin/contexts` is now
   gated behind `require_admin_bearer`, like every other `/admin/*` route.
   A registry with an empty `auth.admin_tokens` (the shipped default in both
