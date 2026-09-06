@@ -740,6 +740,51 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`ci.yml`'s conformance job checks the spec out through
+  `acdp-ci/actions/checkout-spec` rather than a hand-rolled `actions/checkout`**
+  (`REG-11`, #143). The pinned spec ref is unchanged —
+  `d1f06d0d49b73d411a3983d3877321ccaccd38e7`, exactly as merged in #147; only
+  the mechanism that checks it out changed. This was an adoption ask, not a
+  compliance defect: #143 states outright that the previous form already
+  satisfied the substance of the spec-pinning rule.
+  The action resolves at `015910153b61c32abbe018afe85d44868897bf3b # v1` — the
+  commit `acdp-ci`'s **annotated** `v1` tag dereferences to (`refs/tags/v1` →
+  tag object `82b2a25…` → commit `0159101…`, confirmed against the remote via
+  `gh api`; the `action.yml` blob at that commit is `8c5dacd…` on GitHub and in
+  the local clone alike). That is `acdp-verifier-py`'s call-site pin verbatim,
+  and it follows `REG-8`/`REG-10`'s rule that a non-`actions/*` action resolves
+  at an immutable 40-hex SHA with a `# <version>` comment. The
+  `acdp-ci/.github/workflows/*@v1` reusable-workflow refs are untouched and stay
+  tag-tracked — a composite action is a `uses:` step inside this job, not the
+  family propagation that exemption protects.
+  Three guarantees the hand-rolled form did not have: the action rejects a `ref`
+  that is not 40-hex lowercase before any network call; it re-reads the
+  checked-out `HEAD` and fails when it differs from the pin; and it refuses the
+  `set-env: false` + `require-conformance: true` combination, which would export
+  `ACDP_REQUIRE_CONFORMANCE` without `ACDP_SPEC_DIR`.
+  The `Conformance (spec fixtures required)` step still sets both variables
+  itself rather than relying only on the action's `$GITHUB_ENV` exports, so
+  require-mode stays a property of *this* file and cannot be switched off by an
+  action input. `ACDP_SPEC_DIR` now reads the action's `path` output instead of
+  restating `${{ github.workspace }}/acdp-spec`, so the checkout location and
+  the variable cannot drift apart.
+  No `repository:` or `path:` override is passed, even though both would merely
+  restate the action's own defaults: `bump-spec-ref.yml` counts a
+  `repository: <spec>` line as a **second** pin anchor and then fails the bump
+  outright rather than rewrite only the first, so adding one would silently
+  disable `bump-spec.yml`. Checked by running that workflow's own anchor-count
+  `awk`, its `perl` rewriter and its post-rewrite assertion — copied verbatim
+  from `acdp-ci` at `v1` — against the new file: one anchor, `d1f06d0…`
+  resolved as the current pin, and a simulated bump rewrote exactly one line,
+  the spec `ref:`, leaving the action's own `@0159101…` pin alone.
+  Not verified locally: the job itself. `cargo` cannot run in this environment,
+  so CI on this PR is the gate — and for this job green alone is not the check.
+  Under `ACDP_REQUIRE_CONFORMANCE` a broken spec checkout panics rather than
+  skips (`spec_root`/`spec_fixtures` in `tests/conformance.rs`) and
+  `MIN_REPLAYED_EXCHANGES` (derived from source as 30) floors the replay count,
+  so acceptance is reading the job log for `conformance: fixtures dir = …`, the
+  `ran by family` tally, and `conformance: replayed N exchange(s)`.
+
 - **BREAKING** (`REG-11` Phase 3, `#133`): `GET /admin/contexts` is now
   gated behind `require_admin_bearer`, like every other `/admin/*` route.
   A registry with an empty `auth.admin_tokens` (the shipped default in both
