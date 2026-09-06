@@ -38,10 +38,6 @@ The `/auth/*` routes are mounted at runtime only when `auth.enabled = true`. The
 two `/admin/{contexts,pinned-keys}` routes are compiled in only with the
 `playground` Cargo feature; `/admin/status` always ships.
 
-\* Despite living under `/admin/`, `GET /admin/contexts` is **not** gated by
-the admin bearer (`auth.admin_tokens`) — see [Admin](#admin) below for what it
-actually checks.
-
 ## Media types and middleware
 
 Every ACDP data and auth endpoint returns `application/acdp+json` — on both

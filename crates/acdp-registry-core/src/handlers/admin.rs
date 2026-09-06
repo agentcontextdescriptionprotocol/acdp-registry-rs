@@ -41,7 +41,8 @@ pub struct AdminListResponse {
     pub next_cursor: Option<String>,
 }
 
-/// Paginated tenant-scoped context listing (playground feature).
+/// Paginated context listing, tenant-filtered when a tenant is asserted
+/// (playground feature).
 ///
 /// Admin-bearer gated, like every other `/admin/*` handler: the caller must
 /// present `Authorization: Bearer <token>` matching `auth.admin_tokens`
@@ -60,6 +61,13 @@ pub struct AdminListResponse {
 /// disclosed to the admin listing — their SQL arms both require a non-NULL
 /// requester DID (`LIST_VISIBILITY_SQLITE` in `acdp-registry-sqlite`, and
 /// its Postgres twin), which a `None` requester can never supply.
+///
+/// The tenant filter itself is conditional, not unconditional: when
+/// `tenant_for_request` resolves to `None` (no `X-Tenant-Id` header, no JWT
+/// `tenant` claim, and `auth.require_tenant = false`), both backends skip
+/// the `tenant_id` predicate entirely (`if tenant.is_some()` in
+/// `list_contexts`, `acdp-registry-sqlite` and `acdp-registry-pg`), so the
+/// listing spans every tenant rather than defaulting to one.
 #[cfg(feature = "playground")]
 pub async fn admin_list<S: ExtendedRegistryStore + 'static>(
     State(state): State<Arc<AppState<S>>>,
