@@ -36,7 +36,10 @@ The binary validates config before serving and refuses to boot on a misconfig
 - **Webhook** — when `enabled`, `url` must be non-empty and pass the SSRF policy
   (HTTPS, no private/internal authorities), and `secret` must be non-empty.
 - **Multi-tenancy** — a non-empty `[[auth.tenant_agents]]` requires
-  `require_tenant = true` (you can't half-enable tenancy).
+  `require_tenant = true` (you can't half-enable tenancy), and a
+  tenancy-aware storage backend (SQLite/Postgres — the memory backend
+  records no tenant and reports the reserved `default` for every row, so
+  every tenant-scoped read would return zero rows).
 - **Bind safety** — a non-loopback `bind` with neither TLS nor auth requires an
   explicit `allow_public_bind = true`.
 - **TLS** — when `tls.enabled`, `cert_path` and `key_path` must exist on disk.
