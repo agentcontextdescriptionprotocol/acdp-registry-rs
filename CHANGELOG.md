@@ -882,6 +882,82 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 <!-- end REG-11 Phase 8 -->
 
+<!-- REG-11 Phase 6 (Lane A) -->
+
+- **The `EXCUSED`/`DEFERRED` ratchet now actually ratchets, in every CI job**
+  (`REG-11` Phase 6, `#115`, `#130`): previously nothing in
+  `crates/acdp-registry-server/tests/conformance.rs` forced a spec-required
+  family *out* of `DEFERRED` and away from `EXCUSED` — zero coverage plus a
+  written reason plus an open issue number was permanently green. A new
+  `CORE_INEXCUSABLE_FAMILIES: &[&str]` const mirrors, by family, the pinned
+  spec's `acdp-registry-core` `required_fixtures` ∪ `conditional_fixtures`
+  (18 families: the 5 already `COVERED` — `can`, `idem`, `pub`, `ret`,
+  `vis` — plus the 13 still `DEFERRED` — `body`, `caps`, `data-ref`,
+  `did-ssrf`, `dk`, `err`, `lin`, `meta`, `rate`, `rev`, `schema`, `sig`,
+  `status`). Two assertions give it teeth: **`core_inexcusable_families_
+  are_never_excused_or_unclassified`** is unconditional (no `ACDP_SPEC_DIR`
+  needed, so it runs in the required `tests` job) and fails if any mirror
+  family is ever moved into `EXCUSED` or drops out of `COVERED ∪ DEFERRED`;
+  the existing spec-gated `no_excused_family_is_required_by_our_profile`
+  (required `conformance (spec fixtures)` job) now also `assert_eq!`s the
+  mirror against the same set recomputed live from the pinned spec, so the
+  literal cannot silently rot against a future spec-pin bump. Moving a
+  family `DEFERRED` → `COVERED` requires **zero** edits to either assertion
+  or the const, by design — the mirror is keyed to the spec's family-level
+  obligations, not to which bucket currently covers them. The unconditional
+  half is deliberate belt-and-suspenders: `conformance (spec fixtures)` sets
+  `ACDP_REQUIRE_CONFORMANCE=1` and is a required status check today, but
+  that required-check set is maintained by a sibling repo's hand-written
+  mirror (independently confirmed stale as of 2026-09-05), so the
+  unconditional `tests`-job half is what keeps the guarantee even if that
+  context is ever dropped from branch protection. Measured, not derived:
+  `ACDP_SPEC_DIR=<pinned-spec-checkout> ACDP_REQUIRE_CONFORMANCE=1 cargo
+  test -p acdp-registry-server --features storage-sqlite,playground --test
+  conformance --test conformance_gate -- --nocapture` → 44 passed + 1
+  passed, 0 failed, `replayed 30 exchange(s); failures=0` (`pub: 3`, `ret: 1`,
+  `vis: 26` — `MIN_REPLAYED_EXCHANGES` unchanged); `cargo test --workspace`
+  and `cargo clippy --workspace --all-targets -- -D warnings` both clean.
+- **Corrected seven `DEFERRED` reasons that misdescribed this repo's own
+  implementation** (`REG-11` Phase 6, `#130`): four were factually false —
+  `rate` claimed a missing "clock/limiter seam", but
+  `limits.publish_rate_per_minute` (`config.rs:560-561`) is already enforced
+  by the in-process `AgentRateLimiter` (`rate_limit.rs`, wired at
+  `state.rs:86-89`), proven end-to-end by the sibling challenge-limiter test
+  (`http_integration.rs:843-873`); `data-ref` called the family
+  "consumer-leaning", but the 7 `data-ref-*` fixtures in
+  `acdp-registry-core`'s `required_fixtures` (`data-ref-001..007`) are
+  registry-side publish-path rejections (RFC-ACDP-0002 §6) — the 8th,
+  `data-ref-008-external-data-ref-hash-mismatch`, is a consumer fetch-time
+  check and is not required of this profile; `status` called it "lifecycle
+  status transitions", but the fixtures test the `status` *string's*
+  grammar (RFC-ACDP-0004 §4.1), not lifecycle state; `rev` called it a
+  "verification-side family", but RFC-ACDP-0014 §4/§5 assigns this to the
+  registry, which already implements `ContextType::KeyRevocation`. Three
+  more overstated the gap as "needing a new seam" when the seam already
+  exists: `log`'s `/log/checkpoint`, `/log/proof`, and `/log/entries`
+  routes are always mounted (`crates/acdp-registry-core/src/lib.rs:86-88`).
+  `log`, `rcpt`, and `lhr` each have two real causes, not one: one fixture
+  per family (`log-001`/`log-003`, `rcpt-001`, `lhr-001`) carries no
+  `applies_to_profiles` and is a non-HTTP golden vector needing a
+  direct-vector pass; the rest (`log-002`/`log-004`, `rcpt-002..004`,
+  `lhr-002..004`) are restricted to a profile this harness doesn't
+  advertise (`HARNESS_PROFILES`, `conformance.rs:425`) — advertising it
+  would not make the non-HTTP vectors run.
+  No family moved bucket in this phase — this is a record correction plus
+  the new ratchet, not new coverage.
+
+- **`did-ssrf`'s deferral reason corrected (same review pass).** It claimed the family
+  "needs a controlled resolver seam this harness doesn't have yet". That named the wrong
+  cause and was falsifiable from this suite's own output: all five `did-ssrf-*` fixtures
+  are reported under `non-HTTP fixture (vectors / schema / informative)` in the skip
+  tally, so they never reach a resolver. The seam also already exists —
+  `acdp_did::WebResolver` applies `SsrfPolicy::default()` unconditionally, and exposes
+  `with_ssrf_policy` and `with_test_endpoint` under the `test-transport` feature already
+  enabled on `acdp` in this crate's dev-dependencies. The real gap is a direct-vector
+  pass like `can`'s.
+
+<!-- end REG-11 Phase 6 -->
+
 - **BREAKING** (`REG-11` Phase 3, `#133`): `GET /admin/contexts` is now
   gated behind `require_admin_bearer`, like every other `/admin/*` route.
   A registry with an empty `auth.admin_tokens` (the shipped default in both
