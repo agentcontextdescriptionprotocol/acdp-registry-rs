@@ -155,11 +155,51 @@ pub async fn reload_pinned_keys<S: ExtendedRegistryStore + 'static>(
 /// Operational snapshot returned by `GET /admin/status`.
 #[derive(Debug, Serialize)]
 pub struct AdminStatusResponse {
+    pub build: BuildStatus,
     pub storage: StorageStatus,
     pub idempotency: IdempotencyStatus,
     pub webhook: WebhookStatus,
     pub revocation: RevocationStatus,
     pub migrations: MigrationStatus,
+}
+
+/// Identity of the running build (#117). The coarse `version` string is
+/// also served unauthenticated on `GET /healthz`; the commit and the
+/// compiled-in storage feature are disclosed only here, behind the admin
+/// bearer.
+#[derive(Debug, Serialize)]
+pub struct BuildStatus {
+    /// Same value `GET /healthz` returns. Opaque — display or equality
+    /// only, never parsed.
+    pub version: String,
+    /// The injected commit SHA, or `None` for a build made outside CI
+    /// (`ACDP_BUILD_SHA` unset), in which case the field is omitted from
+    /// the response entirely.
+    ///
+    /// Its **absence is meaningful, not an error**: it means the build was
+    /// not produced by `docker.yml` and is therefore NOT uniquely
+    /// identified — `version` is then the bare package version, which every
+    /// such build shares.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit: Option<&'static str>,
+    /// The concrete store implementation compiled into this binary — an
+    /// **opaque diagnostic identifier for operators**. Its exact shape is
+    /// NOT part of the API contract: it comes from `std::any::type_name`,
+    /// whose output is explicitly not stability-guaranteed and can change
+    /// across compiler versions. Display it; never parse it or branch on it.
+    ///
+    /// Reported as the store *type* rather than as a `storage-*` Cargo
+    /// feature name because those features are declared on
+    /// `acdp-registry-server`, not on this crate — `cfg!(feature =
+    /// "storage-sqlite")` here is not merely always-false, it fails to
+    /// compile under the `-D unexpected-cfgs` implied by CI's `-D warnings`.
+    /// This crate is generic over `S: ExtendedRegistryStore` precisely so it
+    /// need not know about storage backends; declaring those features here
+    /// to satisfy a diagnostic string would invert that layering. The type
+    /// is the accurate compile-time answer available at this layer, and it
+    /// distinguishes the compiled-in backend from the runtime
+    /// `storage.backend` that `migrations.backend` already reports.
+    pub storage_impl: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -233,6 +273,11 @@ pub async fn admin_status<S: ExtendedRegistryStore + 'static>(
         },
     };
     Ok(Json(AdminStatusResponse {
+        build: BuildStatus {
+            version: crate::handlers::meta::build_version(),
+            commit: option_env!("ACDP_BUILD_SHA"),
+            storage_impl: std::any::type_name::<S>(),
+        },
         storage: StorageStatus { healthy },
         idempotency: IdempotencyStatus { records },
         webhook,

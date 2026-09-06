@@ -227,6 +227,52 @@ async fn health_returns_ok() {
     assert_eq!(v["status"], "ok");
 }
 
+/// #117: `/healthz` carries a `version` identifying the running build.
+///
+/// Asserts the SHAPE only, never a literal. A CI-built Docker image injects
+/// `ACDP_BUILD_SHA` and serves `<pkg>+g<sha>`; a plain `cargo test` leaves it
+/// unset and serves the bare `<pkg>`. Pinning a literal would pass here and
+/// break in the image — the case `docker.yml`'s smoke step covers instead, by
+/// asserting the served version carries the commit it was built from.
+#[tokio::test]
+async fn health_reports_a_build_version() {
+    let h = harness(true).await;
+    let app = &h.router;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_to_json(resp).await;
+
+    let version = v["version"]
+        .as_str()
+        .unwrap_or_else(|| panic!("/healthz must carry a string `version`, body = {v}"));
+    assert!(!version.is_empty(), "`version` must be non-empty");
+
+    // The leading component is the package SemVer, with or without a
+    // `+g<sha>` build-metadata suffix.
+    let core = version.split('+').next().unwrap();
+    let parts: Vec<&str> = core.split('.').collect();
+    assert_eq!(
+        parts.len(),
+        3,
+        "`version` must start with a major.minor.patch SemVer core, got {version:?}"
+    );
+    assert!(
+        parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())),
+        "`version` SemVer core must be numeric, got {version:?}"
+    );
+}
+
 #[tokio::test]
 async fn acdp_endpoints_use_acdp_json_content_type() {
     // RFC-ACDP-0007 §4: every response from an ACDP endpoint — success body

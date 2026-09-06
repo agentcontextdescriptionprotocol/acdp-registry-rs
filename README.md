@@ -88,7 +88,13 @@ Then:
 ```bash
 curl http://localhost:8443/.well-known/acdp.json
 curl http://localhost:8443/healthz
+# {"status":"ok","storage":true,"version":"0.1.0"}
 ```
+
+`version` identifies the running build. A locally built binary reports the bare
+package version (`0.1.0`); an image built by CI reports `0.1.0+g<shortsha>`,
+which is what actually pins it to a commit. Treat the string as opaque — see
+[HTTP-API.md](docs/HTTP-API.md#the-version-field-117).
 
 ### Production (Postgres + Docker)
 
@@ -126,7 +132,7 @@ Selected routes (the full surface, including request/response shapes, is in
 | GET    | `/.well-known/acdp.json`          | Capabilities document. |
 | GET    | `/.well-known/jwks.json`          | JWKS (EdDSA public key; empty for HS256). |
 | GET    | `/.well-known/did.json`           | Registry DID document (when a receipt key is configured). |
-| GET    | `/healthz`                        | Storage liveness. |
+| GET    | `/healthz`                        | Storage liveness + the running build's `version`. |
 | GET    | `/metrics`                        | Prometheus metrics (when `metrics.enabled`). |
 | POST   | `/contexts`                       | Publish (full RFC-ACDP-0003 §2.1 pipeline). |
 | GET    | `/contexts/{ctx_id}`              | Retrieve full context. |

@@ -121,8 +121,41 @@ receipt key is configured. See [RECEIPTS.md](RECEIPTS.md).
 
 ### `GET /healthz`
 
-Storage liveness. `200` with `{"status":"ok","storage":true}` when the backend
-responds, `503` with `{"status":"degraded","storage":false}` otherwise.
+Storage liveness, plus the identity of the running build.
+
+`200` with `{"status":"ok","storage":true,"version":"..."}` when the backend
+responds, `503` with `{"status":"degraded","storage":false,"version":"..."}`
+otherwise. `version` is present on **both** responses — build identity matters
+most when the service is unhealthy.
+
+#### The `version` field (#117)
+
+> `GET /healthz` MUST include a top-level `"version"`: a non-empty,
+> human-readable identifier of the running build. It SHOULD begin with the
+> package's SemVer and MAY carry SemVer build metadata (`+g<shortsha>`).
+> **Consumers MUST treat it as opaque** — display or equality at most, never
+> parsing.
+
+What it contains depends on how the binary was built:
+
+| Build | `version` | Uniquely identifies the build? |
+|---|---|---|
+| Image built by `.github/workflows/docker.yml` | `0.1.0+g<shortsha>` | Yes |
+| `cargo build` / `cargo run` / any other image build | `0.1.0` | **No** |
+
+The commit is injected at compile time through the `ACDP_BUILD_SHA` build ARG.
+Outside `docker.yml` it is unset and the field degrades to the bare package
+version, which every such build shares. The package version is currently a
+placeholder `0.1.0` for all workspace crates, so the `+g<shortsha>` suffix is
+what carries build identity today.
+
+`acdp-control-plane` serves the same flat `version` string shape on its own
+`/healthz`. The two are two precision levels of one contract, not two
+different fields.
+
+For the commit on its own — and for which storage implementation was compiled
+in — see the `build` group on
+[`GET /admin/status`](#get-adminstatus), which is bearer-gated.
 
 ### `GET /metrics` *(FEAT-10)*
 
@@ -517,6 +550,8 @@ Operational snapshot. Always shipped.
 
 ```json
 {
+  "build":       { "version": "0.1.0+g83de685c2f26", "commit": "83de685c2f26",
+                   "storage_impl": "acdp_registry_sqlite::store::SqliteStore" },
   "storage":     { "healthy": true },
   "idempotency": { "records": 128 },
   "webhook":     { "enabled": true, "queue_in_flight": 0, "queue_capacity": 1024 },
@@ -527,6 +562,26 @@ Operational snapshot. Always shipped.
 
 `idempotency.records` and the webhook queue fields are `null` when the backend
 doesn't track them.
+
+#### The `build` group (#117)
+
+The coarse `version` string is also served unauthenticated on
+[`GET /healthz`](#get-healthz); the commit and the compiled-in storage
+implementation are disclosed only here, behind the admin bearer.
+
+- **`version`** — identical to the `/healthz` value. Opaque; see
+  [the `version` field](#the-version-field-117).
+- **`commit`** — the injected build SHA. **Omitted entirely when the binary
+  was not built by `docker.yml`** (`ACDP_BUILD_SHA` unset). Its absence is
+  meaningful rather than an error: it means this build is not uniquely
+  identified, and `version` is the bare package version that every such build
+  shares.
+- **`storage_impl`** — which store implementation was compiled in, as opposed
+  to the runtime `storage.backend` that `migrations.backend` reports. An
+  **opaque diagnostic identifier for human consumption**: it is a Rust type
+  path from `std::any::type_name`, whose output carries no stability
+  guarantee and may change across compiler versions. Display it; do not parse
+  it or branch on it.
 
 ### `GET /admin/lineages/{lineage_id}/audit` *(ACDP 0.2.0)*
 

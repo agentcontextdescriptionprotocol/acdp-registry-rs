@@ -44,6 +44,15 @@ jobs:
       # Build the image first and load it into the local daemon so it can be
       # smoke-tested before anything is published. The push below reuses this
       # build via the buildx cache.
+      # `option_env!("ACDP_BUILD_SHA")` is compiled into the binary, so the
+      # commit has to arrive as a build ARG (`.dockerignore` excludes `.git/`).
+      # Truncated here rather than in Rust so the served version reads
+      # `0.1.0+g<shortsha>`; GitHub expressions have no substring function, so
+      # this needs its own step.
+      - name: short sha
+        id: sha
+        run: echo "short=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
       - name: build (amd64, local)
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
@@ -52,7 +61,9 @@ jobs:
           load: true
           platforms: linux/amd64
           tags: acdp-registry:smoke
-          build-args: STORAGE_FEATURE=storage-pg
+          build-args: |
+            STORAGE_FEATURE=storage-pg
+            ACDP_BUILD_SHA=${{ steps.sha.outputs.short }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -74,7 +85,19 @@ jobs:
             -e ACDP_REGISTRY_STORAGE__POSTGRES_URL=postgres://acdp:acdp@pg:5432/acdp_registry \
             acdp-registry:smoke
           curl --fail --silent --show-error --retry 15 --retry-delay 2 --retry-all-errors \
-            http://localhost:8443/healthz
+            http://localhost:8443/healthz -o healthz.json
+          cat healthz.json
+          # #117: prove the running image reports the commit it was built from.
+          # Asserting the shape, not a literal version, so a package-version
+          # bump does not break this.
+          VERSION="$(jq -r .version healthz.json)"
+          case "$VERSION" in
+            *"+g${{ steps.sha.outputs.short }}")
+              echo "healthz version '$VERSION' carries the build commit" ;;
+            *)
+              echo "ERROR: healthz version '$VERSION' does not carry +g${{ steps.sha.outputs.short }}"
+              exit 1 ;;
+          esac
           docker logs registry
           docker rm -f registry pg
           docker network rm acdp-smoke
@@ -90,6 +113,8 @@ jobs:
           platforms: linux/amd64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-args: STORAGE_FEATURE=storage-pg
+          build-args: |
+            STORAGE_FEATURE=storage-pg
+            ACDP_BUILD_SHA=${{ steps.sha.outputs.short }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

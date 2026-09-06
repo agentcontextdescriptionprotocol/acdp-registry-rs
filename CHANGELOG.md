@@ -8,6 +8,71 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+<!-- REG-11 Phase 9 (Lane B) -->
+
+- **`GET /healthz` now reports the running build** (`REG-11` Phase 9,
+  `#117`): the body carries a top-level `version` alongside `status` and
+  `storage`, on both the `200` and the `503`/degraded response — build
+  identity matters most when the service is unhealthy, which is also the
+  precedent `acdp-control-plane` sets in its own health tests.
+
+  The frozen contract is one field, not a body shape:
+
+  > `GET /healthz` MUST include a top-level `"version"`: a non-empty,
+  > human-readable identifier of the running build. It SHOULD begin with
+  > the package's SemVer and MAY carry SemVer build metadata
+  > (`+g<shortsha>`). **Consumers MUST treat it as opaque** — display or
+  > equality at most, never parsing.
+
+  The value is composed as `CARGO_PKG_VERSION` plus an optional
+  `+g<shortsha>`, because every workspace crate still carries a
+  placeholder `0.1.0` and the package version alone would not distinguish
+  two builds. CI injects the commit through a new `ACDP_BUILD_SHA` build
+  ARG in `docker/Dockerfile`, fed from `.github/workflows/docker.yml`.
+  **Outside `docker.yml` — a local `cargo run`, or any other image build —
+  `ACDP_BUILD_SHA` is unset and `version` degrades to the bare `0.1.0`,
+  which does not uniquely identify a build.** The unique-identification
+  property holds for images built by `docker.yml`, not universally. No new
+  dependency and no `build.rs`: `.dockerignore` excludes `.git/`, so a
+  `git describe` at build time could not work.
+
+  The ARG is declared *after* the `cargo chef cook` layer. Its value
+  changes every commit, so declaring it earlier would invalidate the
+  dependency cache the two-stage build exists for; the final layer
+  rebuilds each commit regardless, so it costs nothing there.
+  `docker.yml`'s smoke step now asserts the running image's `version`
+  carries the commit it was built from, so the injection path is covered
+  by CI rather than assumed.
+
+- **`GET /admin/status` gains a `build` group** (`REG-11` Phase 9,
+  `#117`): `version` (the same string `/healthz` serves), `commit`, and
+  `storage_impl`. Coarse identity stays public; the finer detail is
+  disclosed only behind the existing admin bearer. The endpoint's other
+  groups are unchanged and it remains bearer-gated.
+
+  `commit` is **omitted entirely** when `ACDP_BUILD_SHA` was unset. That
+  absence is meaningful rather than an error: it is how an operator tells
+  a `docker.yml`-built image from any other build without reading docs.
+
+  `storage_impl` reports the compiled-in store *type* (from
+  `std::any::type_name`), not a `storage-*` Cargo feature name. It is an
+  **opaque diagnostic identifier**: `type_name` output carries no
+  stability guarantee and may change across compiler versions, so it must
+  be displayed rather than parsed or branched on. This deviates from the
+  REG-11 plan, which specified a `storage_feature` string — those
+  features are declared on `acdp-registry-server`, not on
+  `acdp-registry-core` where the handler lives, so `cfg!(feature =
+  "storage-sqlite")` there does not merely evaluate false, it fails to
+  compile under the `-D unexpected-cfgs` implied by CI's `-D warnings`.
+  `acdp-registry-core` is generic over `S: ExtendedRegistryStore`
+  precisely so it need not know about storage backends.
+
+  Closing `#117` unblocks `acdp-ui-console#64`; it does not by itself
+  make that console display a live registry version, which needs its own
+  change there.
+
+<!-- end REG-11 Phase 9 -->
+
 - **A coverage-completeness ratchet closes the gap Phases 7-10 left open**
   (`REG-10` Phase 11): the existing four `KNOWN_FAMILIES`/`EXCUSED` ratchet
   tests fail only on an *unclassified* family or an *illegitimate excuse* —
