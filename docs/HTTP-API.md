@@ -141,7 +141,7 @@ What it contains depends on how the binary was built:
 | Build | `version` | Uniquely identifies the build? |
 |---|---|---|
 | Image built by `.github/workflows/docker.yml` | `0.1.0+g<shortsha>` | Yes |
-| `cargo build` / `cargo run` / any other image build | `0.1.0` | **No** |
+| `cargo build`, `cargo run`, `docker compose up --build`, or any other build that injects no commit | `0.1.0` | **No** |
 
 The commit is injected at compile time through the `ACDP_BUILD_SHA` build ARG.
 Outside `docker.yml` it is unset and the field degrades to the bare package

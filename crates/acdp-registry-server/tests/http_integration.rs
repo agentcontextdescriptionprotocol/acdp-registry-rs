@@ -2136,6 +2136,80 @@ async fn admin_status_requires_token_and_reports_health() {
     assert_eq!(v["revocation"]["configured_feeds"], 0, "body = {v}");
 }
 
+/// #117: `GET /admin/status` carries a `build` group, still bearer-gated.
+///
+/// Guards the property the field exists for: an un-injected build must OMIT
+/// `commit` entirely rather than reporting an empty string. `docker/Dockerfile`
+/// declares `ARG ACDP_BUILD_SHA` then `ENV ACDP_BUILD_SHA=${ACDP_BUILD_SHA}`,
+/// so a `docker build` with no `--build-arg` sets it to `""` and `option_env!`
+/// yields `Some("")` — which would serialize as `"commit": ""` and quietly
+/// destroy the "absence means this build is not uniquely identified" signal
+/// the docs tell operators to rely on.
+#[tokio::test]
+async fn admin_status_reports_the_build_group() {
+    let mut cfg = config(true);
+    cfg.auth.admin_tokens = vec!["secret-admin".into()];
+    let h = harness_from_config(cfg).await;
+    let app = &h.router;
+
+    // The group is behind the same admin gate as the rest of the snapshot.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/admin/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/admin/status")
+                .header("authorization", "Bearer secret-admin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_to_json(resp).await;
+
+    let version = v["build"]["version"]
+        .as_str()
+        .unwrap_or_else(|| panic!("build.version must be a string, body = {v}"));
+    assert!(!version.is_empty(), "build.version must be non-empty");
+
+    // `cargo test` never injects ACDP_BUILD_SHA, so `commit` must be absent —
+    // absent, not null and not "".
+    assert!(
+        v["build"].get("commit").is_none(),
+        "an un-injected build must omit `commit` entirely, got {v}"
+    );
+    assert!(
+        !version.contains("+g"),
+        "an un-injected build must not advertise a commit suffix, got {version:?}"
+    );
+
+    // Opaque diagnostic string: assert presence and a substring, never the
+    // whole `type_name` path, which carries no stability guarantee.
+    let storage_impl = v["build"]["storage_impl"]
+        .as_str()
+        .unwrap_or_else(|| panic!("build.storage_impl must be a string, body = {v}"));
+    assert!(
+        storage_impl.contains("Store"),
+        "build.storage_impl should name a store type, got {storage_impl:?}"
+    );
+
+    // The pre-existing groups still ride alongside it.
+    assert_eq!(v["storage"]["healthy"], true, "body = {v}");
+    assert_eq!(v["migrations"]["applied"], true, "body = {v}");
+}
+
 #[tokio::test]
 async fn search_filters_by_schema_uri() {
     let h = harness(true).await;
@@ -2324,6 +2398,65 @@ async fn health_503_when_storage_pool_closed() {
     let v = body_to_json(resp).await;
     assert_eq!(v["status"], "degraded");
     assert_eq!(v["storage"], false);
+}
+
+/// #117: `version` rides the degraded/503 body too, not just the 200.
+///
+/// Build identity matters most when the service is unhealthy — that is the
+/// stated reason for the choice in `docs/HTTP-API.md`, and it is the
+/// precedent `acdp-control-plane` sets (its health tests pin `version` on the
+/// DB-failure path). `meta::health` builds one body for both status codes, so
+/// this holds by construction today; the test exists so a later refactor that
+/// splits the two bodies cannot drop the field from the response an operator
+/// reads exactly when they need it most.
+///
+/// Deliberately a separate test rather than an added assertion on
+/// `health_503_when_storage_pool_closed`, which the REG-11 plan requires to
+/// stay green *unmodified*.
+#[tokio::test]
+async fn health_503_still_reports_the_build_version() {
+    let db = tempfile::Builder::new()
+        .prefix("acdp-degraded-version-")
+        .suffix(".sqlite")
+        .tempfile()
+        .unwrap();
+    let store = SqliteStore::connect(db.path(), 1).await.unwrap();
+    store.migrate().await.unwrap();
+    store.pool().close().await;
+
+    let server = Arc::new(RegistryServer::try_new(store, caps(), AUTHORITY).unwrap());
+    let challenges: Arc<dyn ChallengeStore> = Arc::new(InMemoryChallengeStore::new());
+    let secret = JwtSecret::from_bytes(&[42u8; 32]);
+    let signer = JwtSigner::new(secret, format!("did:web:{AUTHORITY}"), AUTHORITY.into(), 30);
+    let resolver = Arc::new(WebResolver::new());
+    let auth = Arc::new(AuthService::new(
+        AuthConfig::default(),
+        challenges,
+        signer,
+        resolver,
+        AUTHORITY.into(),
+    ));
+    let state = AppStateInner::new(server, auth, None, config(true), None);
+    let app = build_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let v = body_to_json(resp).await;
+    assert_eq!(v["status"], "degraded", "body = {v}");
+    let version = v["version"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the 503 body must carry `version` too, body = {v}"));
+    assert!(
+        !version.is_empty(),
+        "`version` must be non-empty on the 503"
+    );
 }
 
 #[tokio::test]

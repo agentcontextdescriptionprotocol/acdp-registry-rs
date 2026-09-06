@@ -25,7 +25,7 @@ use crate::state::AppState;
 ///
 /// This composes with — rather than being replaced by — a future fix to the
 /// release pipeline: once the package version bumps, the same expression
-/// emits `0.4.0+g<sha>` with no code change.
+/// emits `<new-version>+g<sha>` with no code change.
 ///
 /// `option_env!` is resolved at compile time, so a cached build layer keeps
 /// whatever SHA it was built with; the Dockerfile places the ARG after the
@@ -33,11 +33,31 @@ use crate::state::AppState;
 ///
 /// Consumers MUST treat this as opaque — display or equality at most, never
 /// parsing. See `docs/HTTP-API.md`.
-pub fn build_version() -> String {
-    match option_env!("ACDP_BUILD_SHA") {
+pub(crate) fn build_version() -> String {
+    match build_commit() {
         Some(sha) => format!("{}+g{sha}", env!("CARGO_PKG_VERSION")),
         None => env!("CARGO_PKG_VERSION").to_string(),
     }
+}
+
+/// The injected commit, or `None` when this build was not given one.
+///
+/// **The emptiness check is load-bearing — do not simplify it to a bare
+/// `option_env!`.** `docker/Dockerfile` declares `ARG ACDP_BUILD_SHA` and
+/// then `ENV ACDP_BUILD_SHA=${ACDP_BUILD_SHA}`. A `docker build` that passes
+/// no `--build-arg` sets that variable to the **empty string** rather than
+/// leaving it unset, and `option_env!` on a set-but-empty variable returns
+/// `Some("")`, not `None`. Without this filter such a build would serve
+/// `0.1.0+g` — a version falsely advertising an injected commit while
+/// carrying none — and `/admin/status` would report `"commit": ""` instead
+/// of omitting the field, destroying the "absence means this build is not
+/// uniquely identified" signal the docs tell operators to rely on.
+///
+/// Not a hypothetical path: `docker/docker-compose.yml` passes only
+/// `STORAGE_FEATURE`, and `README.md` documents `docker compose up --build`
+/// as the local production path.
+pub(crate) fn build_commit() -> Option<&'static str> {
+    option_env!("ACDP_BUILD_SHA").filter(|sha| !sha.is_empty())
 }
 
 /// `GET /.well-known/acdp.json` — the registry capabilities document.

@@ -275,7 +275,7 @@ pub async fn admin_status<S: ExtendedRegistryStore + 'static>(
     Ok(Json(AdminStatusResponse {
         build: BuildStatus {
             version: crate::handlers::meta::build_version(),
-            commit: option_env!("ACDP_BUILD_SHA"),
+            commit: crate::handlers::meta::build_commit(),
             storage_impl: std::any::type_name::<S>(),
         },
         storage: StorageStatus { healthy },
