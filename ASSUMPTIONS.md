@@ -405,3 +405,112 @@ public-API-contract changes, mirroring how the prior wave routed OQ2 (the witnes
   further downgrades to read-only for fork PRs. Different risk shape, not strictly worse;
   reviewed and deliberately left as-is.
 - **Status:** CONFIRMED (2026-09-01) — see `DECISIONS.md`.
+
+## REG-11 Phase 1 — extending #136's fix-forward past the planned two-file scope
+- **Plan:** `plans/backlog-reg11.md` (Phase 1)
+- **Assumed:** the plan's guard — *"If the two fixes surface a third breakage, split #136
+  rather than growing this phase"* — was aimed at an **unrelated** crate breaking, not at
+  the same two API migrations appearing at more call sites.
+- **Chose:** extend the fix-forward to the three remaining sites rather than splitting the
+  PR. The CI log this plan was written from under-reported the blast radius: it showed
+  `rand` 0.8→0.10 and `hmac` 0.12→0.13 breaking two files, but the same two migrations also
+  hit `crates/acdp-registry-server/src/main.rs:686,688` (identical `RngCore`/`thread_rng`
+  pattern), `crates/acdp-registry-auth/src/jwt.rs:347` and
+  `crates/acdp-registry-server/tests/http_integration.rs:362` (both `rand::rngs::OsRng`,
+  renamed to `SysRng` in rand 0.10).
+  Applied the three-part bar for extending a prior ruling:
+  1. **Reason applies unchanged?** Partly. The stated reason was "the breakage is narrow and
+     the compiler names the exact fix" — still true (same two migrations, mechanical, each
+     confirmed against vendored upstream sources). The literal "2 files" premise is falsified.
+  2. **Same unit of work?** Yes — one dependabot PR, one dependency bump.
+  3. **Bounded and fails loudly?** Yes — a wrong edit fails the build in CI, visibly.
+- **Alternatives:** split `rand` out of the grouped PR. Rejected because the `rand` bump
+  cannot land at all until every `rand` call site is migrated, so splitting does not reduce
+  the work — it only fights `.github/dependabot.yml`'s deliberate `major-updates` grouping
+  and would require hand-editing `Cargo.toml`/`Cargo.lock` to exclude one member of a group.
+- **Blast radius if wrong:** bounded and cheap. Worst case CI stays red on a dependabot
+  branch that was already red; nothing reaches `main`. Reversal is `git revert` on an
+  unmerged branch.
+- **Status:** UNCONFIRMED
+
+## REG-11 Phase 1 — #136's two non-mechanical bumps (serial_test MSRV, jsonwebtoken crypto provider)
+- **Plan:** `plans/backlog-reg11.md` (Phase 1)
+- **Assumed:** the plan's premise that only 2 of #136's 12 bumps were implicated. **False.**
+  Four are: `rand` and `hmac` (mechanical, fixed in `5d0eda1`/`2d263ab`), plus two that
+  needed decisions rather than fixes. The plan recorded the "other ten compile clean" claim
+  as *inferred from CI log absence, not measured* — that caveat was correct and this is
+  exactly what it was hedging against. The first CI run only surfaced the errors that
+  aborted the build earliest.
+- **Chose:** both decided by the user on 2026-09-05, not assumed:
+  1. **`serial_test`: hold at 3.x.** It bumps to 4.0.1 which requires rustc 1.93.1, against a
+     declared `rust-version = "1.88"` (`Cargo.toml:17`) with a dedicated `msrv (1.88)` CI job.
+     It is a **dev-dependency only** (`crates/acdp-registry-server/Cargo.toml:65`) and never
+     ships in the binary, so letting it raise the MSRV floor for every downstream consumer of
+     these 8 published crates would be backwards.
+  2. **`jsonwebtoken` 11: enable the `rust_crypto` feature.** v11 compiles but panics at
+     runtime ("Could not automatically determine the process-level CryptoProvider"),
+     requiring exactly one of `rust_crypto` / `aws_lc_rs`. Chose `rust_crypto` for
+     consistency with the existing pure-Rust stack (`ed25519-dalek`, `sha2`, `hmac` are all
+     RustCrypto) and to avoid adding a C/assembly build dependency that would complicate the
+     multi-stage Docker build and cross-compilation.
+- **Alternatives:** raise MSRV to 1.93.1 (rejected — a test-only crate should not dictate the
+  consumer compatibility contract); `aws_lc_rs` (rejected — faster and FIPS-adjacent, but
+  diverges from the pure-Rust stack and adds a toolchain dependency); close #136 and split
+  per-crate (rejected — discards the completed rand/hmac migration and fights the deliberate
+  `major-updates` grouping in `.github/dependabot.yml`).
+- **Blast radius if wrong:** `serial_test` — none at runtime; worst case a future test-only
+  API is unavailable until MSRV rises for an independent reason. `jsonwebtoken` — this is the
+  JWT signing/verification backend for the auth path, so a wrong provider choice is a
+  correctness-and-performance issue, though not a disclosure one; reversible by flipping one
+  Cargo feature.
+- **Status:** CONFIRMED (2026-09-05) — both options presented to the user with tradeoffs; the
+  recommended option was chosen in each case.
+
+## REG-11 Phase 1 — RUSTSEC-2023-0071 (`rsa` Marvin attack) suppressed in `deny.toml`
+- **Plan:** `plans/backlog-reg11.md` (Phase 1)
+- **Assumed:** nothing — this was escalated to a Fable subagent at the user's explicit
+  request and decided on verified evidence.
+- **Chose:** keep `jsonwebtoken`'s `rust_crypto` feature and add an advisory ignore.
+  **CORRECTION (2026-09-06):** this was first written, and committed in `fde8d94`'s message,
+  as "the repository's first advisories.ignore entry". **That is false.** `RUSTSEC-2025-0134`
+  (rustls-pemfile) was an `ignore` entry until PR #97 (`1cc4f27`) deleted it when
+  `axum-server` 0.8 dropped the dependency — see `git show 1cc4f27^:deny.toml` and the
+  repo's own narration at `CHANGELOG.md:1148-1152`. This is the **second** such entry, and
+  the precedent it sets is a good one: the prior entry was *removed when it became
+  unnecessary* rather than left to rot. The claim in `fde8d94`'s commit body cannot be
+  edited (it is squash-merged history); this entry is the correction of record. Justified on two independent grounds, each sufficient alone:
+  1. **Unreachable, enforced by library dispatch order.** Every verification pins exactly
+     one algorithm — `Validation::new(self.material.algorithm())`
+     (`crates/acdp-registry-auth/src/jwt.rs:224`), which is only `HS256` or `EdDSA`
+     (`:88-93`). jsonwebtoken 11 rejects a header `alg` outside `validation.algorithms`
+     with `InvalidAlgorithm` at `decoding.rs:278-280` — **before** constructing any crypto
+     verifier at `:282`. An attacker sending `alg: RS256` executes zero `rsa` instructions.
+     Independently re-verified: no permissive algorithms list exists anywhere in the
+     workspace, `jsonwebtoken` is imported in exactly one file, and there is no
+     `jsonwebtoken::jwk` / RSA-key-import path. The DID challenge path whitelists
+     `ed25519`/`ecdsa-p256` by name before key resolution (`service.rs:150`).
+  2. **Inapplicable even if reached.** Marvin recovers an RSA **private** key via timing of
+     private-key operations. This registry holds no RSA private key material at all.
+     There is nothing to recover.
+  Also established: the registry only ever verifies JWTs it minted itself (`iss` pinned to
+  `self.issuer`, verified with its own key), and `jsonwebtoken` **9** uses `ring`, not the
+  `rsa` crate — so holding at 9 would not have been "equally exposed"; the bump does add the
+  edge, but the edge is inert.
+- **Alternatives:** `aws_lc_rs` (rejected — legitimate, and adds no new toolchain since
+  `aws-lc-sys` is already present via rustls, but it would put a second Ed25519
+  **implementation** on the trust boundary alongside `ed25519-dalek`.
+  **Qualification (2026-09-06):** `rust_crypto` does not avoid a dual-*version* graph —
+  `cargo tree` on `fde8d94` shows `ed25519-dalek` **2.2.0** (via `jsonwebtoken 11`, the
+  EdDSA JWT verify path) coexisting with **3.0.0** (via `acdp-crypto 0.8.5` and this repo's
+  `decode_ed25519_pem_to_public`). The argument holds for distinct *implementations* — same
+  crate lineage rather than two unrelated codebases — but it is weaker than first stated
+  and should not be read as "one Ed25519 everywhere"); hold `jsonwebtoken` at 9 (rejected —
+  merely defers a bump on a moving crate line).
+- **Blast radius if wrong:** the suppression hides a real, unpatched timing side channel in
+  a crate that ships in the binary. It is safe **only while** the reachability argument
+  holds, so the `deny.toml` entry carries an explicit re-review trigger list. The most
+  fragile item: the argument depends on jsonwebtoken's internal dispatch order, so any
+  future major bump of that crate must re-read `decode()`.
+- **Status:** CONFIRMED (2026-09-06) — user asked for Fable to take the call and stated a
+  preference for `rust_crypto`; Fable tested that preference rather than deferring to it and
+  independently reached the same answer. Crux claims re-verified against source.

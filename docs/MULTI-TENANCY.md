@@ -63,6 +63,13 @@ The store carries the tenant binding alongside each context:
   binding.
 - `list_contexts(tenant)` and `/admin/contexts` filter at the **SQL level**, so
   pagination pages don't short.
+- `list_contexts` also carries `anonymous_public_reads`, the same
+  RFC-ACDP-0008 §4.5 term `search` uses: for an anonymous caller
+  (`requester = None`), `public` rows are listed only when it is `true`.
+  This is orthogonal to tenant filtering — the two are ANDed together, so
+  an anonymous caller with `anonymous_public_reads = false` sees zero rows
+  regardless of tenant, and a non-`None` requester's results are unaffected
+  by this flag.
 - Search and lineage **post-filter the tenant binding** in the handler with a
   bounded refill loop (up to 6 inner pages) — so a search page may come back
   shorter than `limit`; keep paging until `next_cursor` is absent. (Visibility

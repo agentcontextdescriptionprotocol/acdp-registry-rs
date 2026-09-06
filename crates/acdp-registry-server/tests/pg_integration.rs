@@ -524,7 +524,10 @@ async fn pg_concurrent_duplicate_publishes_yield_one_context() {
     assert_eq!(inserted, 1, "exactly one racer inserts");
     assert_eq!(ctx_ids.len(), 1, "all racers resolve to the same ctx_id");
 
-    let page = store.list_contexts(100, None, None, None).await.unwrap();
+    let page = store
+        .list_contexts(100, None, None, None, true)
+        .await
+        .unwrap();
     assert_eq!(page.items.len(), 1, "one context row persisted");
 }
 
@@ -580,7 +583,10 @@ async fn pg_receipt_atomicity_and_round_trip() {
     .await
     .unwrap();
     assert!(outcome.is_err(), "minting failure fails the publish");
-    let page = store.list_contexts(100, None, None, None).await.unwrap();
+    let page = store
+        .list_contexts(100, None, None, None, true)
+        .await
+        .unwrap();
     assert!(page.items.is_empty(), "no row survives a failed mint");
     assert_eq!(store.count_idempotency_records().await.unwrap(), Some(0));
 
