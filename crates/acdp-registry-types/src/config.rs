@@ -352,10 +352,12 @@ pub struct AuthConfig {
     #[serde(default)]
     pub revocation_feeds: Vec<RevocationFeedConfig>,
 
-    /// API tokens accepted on admin endpoints (currently
-    /// `POST /admin/pinned-keys/reload`). Bearer the value verbatim in
+    /// API tokens accepted on admin endpoints: `GET /admin/status`,
+    /// `GET /admin/lineages/{id}/audit`, `POST /admin/contexts/{id}/retract`,
+    /// `POST /admin/contexts/{id}/republish`, `GET /admin/contexts`, and
+    /// `POST /admin/pinned-keys/reload`. Bearer the value verbatim in
     /// the `Authorization` header. Empty (the default) means the admin
-    /// endpoints reject every caller — admin reload is opt-in per
+    /// endpoints reject every caller — admin access is opt-in per
     /// deployment.
     #[serde(default)]
     pub admin_tokens: Vec<String>,

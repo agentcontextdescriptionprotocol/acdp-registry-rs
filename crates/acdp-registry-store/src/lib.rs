@@ -40,6 +40,12 @@ pub trait ExtendedRegistryStore: RegistryStore + Send + Sync {
     /// public bodies are returned exactly as before. A non-`None` requester's
     /// results are unaffected by this flag either way.
     ///
+    /// `GET /admin/contexts` requires an `auth.admin_tokens` bearer; the
+    /// admin caller is authenticated but unnamed (`requester = None`), so it
+    /// reaches the §4.5 **public arm only** — restricted and private bodies
+    /// are never disclosed to it. The tenant filter below applies when a
+    /// tenant is asserted; otherwise the listing spans tenants.
+    ///
     /// `tenant` (plan §7): when `Some`, the backend MUST filter rows
     /// at the storage layer so the returned page contains only that
     /// tenant's contexts. This eliminates the "short pages" wart of
