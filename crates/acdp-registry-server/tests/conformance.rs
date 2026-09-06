@@ -6613,6 +6613,198 @@ fn can007_registry_created_at_millisecond_truncation() {
     }
 }
 
+/// The exact vector count `lin-001-lineage-derivation-golden` carries at
+/// spec pin d1f06d0. A silently-shrinking count here is exactly the
+/// vacuous-pass failure mode this ratchet exists to prevent.
+const EXPECTED_LIN_VECTOR_COUNT: usize = 3;
+
+/// lin-001 (RFC-ACDP-0001 §5.6): `lineage_id` golden derivation vectors,
+/// reusing `assert_lineage_vector` -- the exact same helper can-001's
+/// `{lineage_id}`-only vectors already use above, since lin-001's three
+/// vectors are the identical `{input: {ctx_id}, expected: {lineage_id}}`
+/// shape (and per lin-001's own fixture notes, its vectors are
+/// cross-checks of can-001's lineage vectors 1-3).
+///
+/// lin-001 DOES carry `applies_to_profiles: ["acdp-registry-core",
+/// "acdp-consumer"]` -- unlike every caps-* fixture, which carries none.
+/// This direct-vector test deliberately bypasses the runtime
+/// `HARNESS_PROFILES` gate `extract` applies to HTTP-replayed fixtures
+/// entirely: `derive_lineage_id` is a pure function with no profile-
+/// conditional behavior, so there is nothing for a profile gate to guard
+/// here. Do NOT "fix" this by adding one.
+#[test]
+fn lin_vectors_reproduce_lineage_derivation() {
+    let Some(fixtures) = spec_fixtures() else {
+        eprintln!(
+            "conformance: ACDP_SPEC_DIR unset or no fixtures resolvable; skipping lin-* \
+             lineage-derivation vectors (set ACDP_REQUIRE_CONFORMANCE to make this a hard \
+             failure)"
+        );
+        return;
+    };
+
+    let mut asserted = 0usize;
+
+    if let Some(fx) = find_fixture_by_id(&fixtures, "lin-001") {
+        let vectors = fx["vectors"]
+            .as_array()
+            .unwrap_or_else(|| panic!("lin-001: vectors missing or not an array: {fx}"));
+        assert_eq!(
+            vectors.len(),
+            EXPECTED_LIN_VECTOR_COUNT,
+            "lin-001 must carry exactly {EXPECTED_LIN_VECTOR_COUNT} vectors at spec pin \
+             d1f06d0: {fx}"
+        );
+        for (i, v) in vectors.iter().enumerate() {
+            let ctx = format!("lin-001 vector {i} ({})", v["name"].as_str().unwrap_or("?"));
+            assert_lineage_vector(&v["input"], &v["expected"], &ctx);
+            asserted += 1;
+        }
+    }
+
+    assert_eq!(
+        asserted, EXPECTED_LIN_VECTOR_COUNT,
+        "expected exactly {EXPECTED_LIN_VECTOR_COUNT} lin-* lineage-derivation vectors at spec \
+         pin d1f06d0 -- a silently-shrinking count here is exactly the vacuous-pass failure \
+         mode this ratchet exists to prevent"
+    );
+}
+
+/// The exact number of caps-* fixture ids at spec pin d1f06d0, and the
+/// exact number of outcome assertions this test makes (7 base-case
+/// fixtures + caps-007's 3 `reject_variants`). Two separate constants
+/// because they answer two separate "did this silently shrink" questions:
+/// fixtures found on disk, and outcomes actually checked.
+const EXPECTED_CAPS_FIXTURE_COUNT: usize = 7;
+const EXPECTED_CAPS_ASSERTION_COUNT: usize = 10;
+
+/// Deserializes `body` as a [`CapabilitiesDocument`] and, if that
+/// succeeds, runs `acdp::validation::validate_capabilities` on it --
+/// returning `"accept"` only if both stages succeed, `"reject"` otherwise.
+/// caps-* rejection legitimately happens at EITHER stage: caps-007's
+/// `-5` and `60.5` overrides for `limits.max_publish_per_minute` (an
+/// `Option<u64>`) fail serde deserialization outright, while its `0`
+/// override deserializes fine and is only caught by
+/// `validate_capabilities`'s explicit `>= 1` check. Both are
+/// `schema_violation` per RFC-ACDP-0007 §3 and indistinguishable from a
+/// real consumer's point of view, so this helper treats a failure at
+/// either stage as the fixture's single `"reject"` outcome rather than
+/// assuming ahead of time which stage a given negative vector will trip.
+fn assert_capabilities_outcome(body: &Value, want_outcome: &str, ctx: &str) {
+    let outcome = match serde_json::from_value::<CapabilitiesDocument>(body.clone()) {
+        Err(_) => "reject",
+        Ok(doc) => match acdp::validation::validate_capabilities(&doc) {
+            Ok(()) => "accept",
+            Err(_) => "reject",
+        },
+    };
+    assert_eq!(
+        outcome, want_outcome,
+        "{ctx}: capabilities outcome mismatch (got {outcome:?}, want {want_outcome:?}) for \
+         body {body}"
+    );
+}
+
+/// caps-001..007 (RFC-ACDP-0007 §3): validates each fixture's own
+/// `input.response_body` directly against `acdp::validation::
+/// validate_capabilities` over the wire type `CapabilitiesDocument`. No
+/// HTTP leg: `acdp-registry-server` is bin-only (no `[lib]` target), so a
+/// test in this crate cannot import its own `build_capabilities` to
+/// compare against -- an HTTP assertion here would only prove this test's
+/// own hand-written capabilities document round-trips, not exercise the
+/// spec's validator. The vector pass against the published validator is
+/// the substance of this family's coverage.
+///
+/// Per-fixture outcome is read from each fixture's own `expected.outcome`,
+/// never assumed: measured against spec pin d1f06d0, caps-001/006/007
+/// (base case) expect `"accept"` and caps-002/003/004/005 plus caps-007's
+/// three `reject_variants` expect `"reject"` -- i.e. 4 rejecting fixtures,
+/// not 6. caps-006 in particular is a POSITIVE case: the CapabilitiesDocument
+/// schema is open at the top level (unknown top-level fields, e.g.
+/// `future_capability_x`, are tolerated and land in `extensions` via
+/// `#[serde(flatten)]`), while only its `limits` sub-object is closed
+/// (`#[serde(deny_unknown_fields)]`). Treating caps-006 as a rejection
+/// would invert this family's most important forward-compatibility
+/// invariant.
+#[test]
+fn caps_vectors_validate_capabilities_document() {
+    let Some(fixtures) = spec_fixtures() else {
+        eprintln!(
+            "conformance: ACDP_SPEC_DIR unset or no fixtures resolvable; skipping caps-* \
+             capabilities-document vectors (set ACDP_REQUIRE_CONFORMANCE to make this a hard \
+             failure)"
+        );
+        return;
+    };
+
+    let mut asserted = 0usize;
+    let mut found_ids: Vec<&str> = Vec::new();
+
+    for id in [
+        "caps-001", "caps-002", "caps-003", "caps-004", "caps-005", "caps-006", "caps-007",
+    ] {
+        let Some(fx) = find_fixture_by_id(&fixtures, id) else {
+            continue;
+        };
+        found_ids.push(id);
+
+        let body = fx["input"]["response_body"].clone();
+        let want = fx["expected"]["outcome"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{id}: expected.outcome missing or not a string: {fx}"));
+        assert_capabilities_outcome(&body, want, &format!("{id} base case"));
+        asserted += 1;
+
+        if id == "caps-007" {
+            let variants = fx["reject_variants"].as_array().unwrap_or_else(|| {
+                panic!("caps-007: reject_variants missing or not an array: {fx}")
+            });
+            assert_eq!(
+                variants.len(),
+                3,
+                "caps-007 must carry exactly 3 reject_variants at spec pin d1f06d0: {fx}"
+            );
+            for v in variants {
+                let name = v["name"].as_str().unwrap_or("?");
+                // Hand-applied: every caps-007 reject_variant overrides the
+                // same single dotted path, `limits.max_publish_per_minute`
+                // -- not a generic JSON-path engine, just the one field
+                // this fixture's own reject_variants ever touch.
+                let override_value = &v["response_body_override"]["limits.max_publish_per_minute"];
+                assert!(
+                    !override_value.is_null(),
+                    "caps-007 variant {name:?}: response_body_override.\"limits.\
+                     max_publish_per_minute\" missing or null: {v}"
+                );
+                let mut overridden = body.clone();
+                overridden["limits"]["max_publish_per_minute"] = override_value.clone();
+                let want_variant = v["expected"]["outcome"].as_str().unwrap_or_else(|| {
+                    panic!("caps-007 variant {name:?}: expected.outcome missing: {v}")
+                });
+                assert_capabilities_outcome(
+                    &overridden,
+                    want_variant,
+                    &format!("caps-007 reject_variant {name:?}"),
+                );
+                asserted += 1;
+            }
+        }
+    }
+
+    assert_eq!(
+        found_ids.len(),
+        EXPECTED_CAPS_FIXTURE_COUNT,
+        "expected exactly {EXPECTED_CAPS_FIXTURE_COUNT} caps-* fixtures at spec pin d1f06d0: \
+         found {found_ids:?}"
+    );
+    assert_eq!(
+        asserted, EXPECTED_CAPS_ASSERTION_COUNT,
+        "expected exactly {EXPECTED_CAPS_ASSERTION_COUNT} caps-* outcome assertions (7 base \
+         cases + caps-007's 3 reject_variants) at spec pin d1f06d0 -- a silently-shrinking \
+         count here is exactly the vacuous-pass failure mode this ratchet exists to prevent"
+    );
+}
+
 // ─── Phase 1: harness fidelity gates ───
 
 /// A fixture whose `applies_to_profiles` is disjoint from `HARNESS_PROFILES`
@@ -7139,6 +7331,18 @@ const COVERED: &[(&str, &[CoverageMechanism])] = &[
         ])],
     ),
     (
+        "lin",
+        &[CoverageMechanism::Direct(&[
+            "lin_vectors_reproduce_lineage_derivation",
+        ])],
+    ),
+    (
+        "caps",
+        &[CoverageMechanism::Direct(&[
+            "caps_vectors_validate_capabilities_document",
+        ])],
+    ),
+    (
         "idem",
         &[CoverageMechanism::Direct(&[
             "idem001_004_publish_idempotency_key_lifecycle_and_restart_durability",
@@ -7156,30 +7360,18 @@ const COVERED: &[(&str, &[CoverageMechanism])] = &[
 ];
 
 /// Families with no coverage yet, each with a non-empty written reason and
-/// an open tracking-issue number. `caps`, `lin`, and `lc` cite **#115**
-/// (filed exactly for those three, per Q1 of
-/// `plans/reg10-conformance-and-ci-hygiene.md`); the remaining 15 cite
+/// an open tracking-issue number. `caps` and `lin` were also originally
+/// filed under **#115** (Q1 of `plans/reg10-conformance-and-ci-hygiene.md`)
+/// alongside `lc`, but REG-11 Phase 7 gave them direct-vector coverage
+/// (`caps_vectors_validate_capabilities_document`,
+/// `lin_vectors_reproduce_lineage_derivation` in `COVERED` above) --
+/// `lc` alone remains DEFERRED under #115, since it is profile-gated
+/// rather than closeable by a direct vector pass. The remaining 15 cite
 /// **#130** (filed for this phase, enumerating each with its own reason).
 /// `known_families_partition_into_covered_excused_or_deferred` checks: the
 /// reason is non-empty, the issue is one of the two known-open numbers, and
-/// the `caps`/`lin`/`lc` trio specifically cites #115.
+/// `lc` specifically cites #115.
 const DEFERRED: &[(&str, &str, u32)] = &[
-    (
-        "caps",
-        "required-but-uncovered: all 7 caps-* ids sit in acdp-registry-core's \
-         required_fixtures, so this is mechanically inexcusable (same rule that makes \
-         `can` inexcusable) -- but the generic replayer skips them as non-HTTP and no \
-         direct test exists yet.",
-        115,
-    ),
-    (
-        "lin",
-        "required-but-uncovered: lin-001-lineage-derivation-golden sits in \
-         acdp-registry-core's required_fixtures. derive_lineage_id is already exported \
-         from acdp_crypto, so this may close as cheaply as the can-* vectors did in \
-         Phase 7 -- just not yet done.",
-        115,
-    ),
     (
         "lc",
         "profile-gated-uncovered: lc-*'s 3 fixtures target a profile this harness does \
