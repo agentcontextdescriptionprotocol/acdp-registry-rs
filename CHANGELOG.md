@@ -1200,6 +1200,48 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The playground publish branch now honors `supports_idempotency_key`**
+  (`REG-11` Phase 5, `#128`): `crates/acdp-registry-core/src/handlers/
+  context.rs`'s playground unpinned publish branch — the manual
+  idempotency lookup/record dance it runs around `publish_unverified_for_tests`,
+  which takes no idempotency key and so cannot delegate to the SDK's
+  `RegistryServer::commit_via_store` the other three publish paths (verified
+  did:web, did:key, pinned-verified) all inherit the gate from — previously
+  honored ANY `Idempotency-Key` header unconditionally, with no check of
+  `state.server.capabilities().supports_idempotency_key` anywhere in that
+  branch. Fixed with one shared `idem_key` binding, computed once before the
+  lookup and reused at both the lookup and record call sites, rather than two
+  independent `&&` conditions: gating only the lookup would still write a
+  record that a later `supports_idempotency_key = true` flip would start
+  replaying — resurrecting replays from records that should never have
+  existed — and gating only the record would still replay today. A single
+  binding makes that divergence unrepresentable. Also corrected the
+  handler's doc comment, which claimed `Idempotency-Key` "is honored when
+  the registry advertises support" — true of the other three branches, false
+  of this one before the fix — to instead name the actual mechanism and why
+  this branch cannot delegate.
+  Two new direct tests in `crates/acdp-registry-server/tests/conformance.rs`,
+  placed immediately after `idem005_no_support_ignores_idempotency_key_header`:
+  `idem_playground_branch_honors_supports_idempotency_key_gate` (two
+  publishes of the same body with the same key now get different `ctx_id`s
+  when the capability is `false`) and
+  `idem_playground_branch_writes_no_idempotency_record_when_gated_off`
+  (asserts `GET /admin/status`'s `idempotency.records == 0`, which a
+  lookup-only fix would not catch). Both use a **did:web** producer, not
+  did:key — `context.rs`'s did:key branch is checked, and returns, before
+  the playground branch is ever reached, so a did:key producer would
+  silently re-exercise the already-gated SDK path and prove nothing about
+  the branch under test. `idem005_no_support_ignores_idempotency_key_header`'s
+  own doc comment is amended (not its assertions) to reflect that the gap it
+  recorded is now fixed and covered from both sides.
+  `#128`'s second bullet (`docs/CONFIGURATION.md:242`) was already
+  discharged by PR #132 (`REG-11` context finding 5); no further doc change
+  was needed for it here.
+  No test result is asserted as measured in this entry: `cargo test` cannot
+  run in this environment (EACCES writing `.d` files even with
+  `CARGO_TARGET_DIR` on a fresh scratch dir), so verification is via CI on
+  the PR.
+
 - **Documentation sweep for the `#133` fix** (`REG-11` Phase 4): removed every
   doc statement and source comment describing `GET /admin/contexts` as
   ungated or as "the one exception" among `/admin/*` routes — `docs/HTTP-API.md`
