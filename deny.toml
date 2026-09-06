@@ -19,11 +19,12 @@ ignore = [
     #      (crates/acdp-registry-auth/src/jwt.rs:224). jsonwebtoken 11 rejects
     #      a token whose header `alg` is not in `validation.algorithms`
     #      (InvalidAlgorithm) BEFORE constructing any crypto verifier
-    #      (jsonwebtoken-11.0.0 src/decoding.rs:278-282), so an
-    #      attacker-supplied `alg: RS256` executes zero `rsa` code. We use no
-    #      `jsonwebtoken::jwk` and no RSA DecodingKey constructors; the DID
-    #      challenge path whitelists ed25519/ecdsa-p256 by name before key
-    #      resolution (crates/acdp-registry-auth/src/service.rs:150).
+    #      (jsonwebtoken-11.0.0 src/decoding.rs:278-280; :282 is the verifier
+    #      construction it precedes), so an attacker-supplied `alg: RS256`
+    #      executes zero `rsa` code. We use no `jsonwebtoken::jwk` and no RSA
+    #      DecodingKey constructors; the DID challenge path whitelists
+    #      ed25519/ecdsa-p256 by name before key resolution
+    #      (crates/acdp-registry-auth/src/service.rs:149).
     #   2. Marvin recovers an RSA PRIVATE key via timing of private-key
     #      operations. This registry holds no RSA private key material at all
     #      (signing is HS256/EdDSA only) — there is no key to recover.

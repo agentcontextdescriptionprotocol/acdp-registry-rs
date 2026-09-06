@@ -187,6 +187,7 @@ impl ExtendedRegistryStore for SqliteStore {
         cursor: Option<&str>,
         requester: Option<&AgentDid>,
         tenant: Option<&str>,
+        anonymous_public_reads: bool,
     ) -> Result<Page<FullContext>, AcdpError> {
         let limit = limit.clamp(1, 200) as i64;
         let anchor = cursor.map(decode_cursor).transpose()?.flatten();
@@ -198,7 +199,8 @@ impl ExtendedRegistryStore for SqliteStore {
         // predicate (`visible_to`) into SQL so restricted/private bodies the
         // requester may not see are never read or decoded, and the page fills
         // to `limit` instead of being trimmed by a post-query retain.
-        // Placeholders (in order): `?req` ×3.
+        // Placeholders (in order): `?req` (public), `?anon`, `?req` ×3
+        // (restricted/private).
         sql.push_str(LIST_VISIBILITY_SQLITE);
         // Plan §7: push the tenant filter into SQL so a busy
         // mixed-tenant registry doesn't return short pages caused by a
@@ -219,7 +221,12 @@ impl ExtendedRegistryStore for SqliteStore {
         let mut q = sqlx::query(&sql);
         // Disclosure binds first — same textual order as LIST_VISIBILITY_SQLITE.
         let req = requester_s.as_deref();
-        q = q.bind(req).bind(req).bind(req);
+        q = q
+            .bind(req)
+            .bind(anonymous_public_reads)
+            .bind(req)
+            .bind(req)
+            .bind(req);
         if let Some(t) = tenant {
             q = q.bind(t);
         }
@@ -414,13 +421,17 @@ fn log_row_to_record(r: &sqlx::sqlite::SqliteRow) -> Result<LogEntryRecord, Acdp
 }
 
 /// RFC-ACDP-0008 §4.5 retrieval-style disclosure used by the admin/debug
-/// listing (the former in-Rust `visible_to`): `public` is always listed;
-/// `restricted`/`private` require the requester to be the producer
-/// (`agent_id`) or a named `audience` member. Placeholders (in textual
-/// order): `?req` ×3, where `?req` is the requester DID or SQL NULL for an
-/// anonymous caller. `json_each(body_json,'$.audience')` yields zero rows
-/// when `audience` is absent, so the audience arm short-circuits.
-const LIST_VISIBILITY_SQLITE: &str = " AND (visibility = 'public' \
+/// listing (the former in-Rust `visible_to`): `public` surfaces for any
+/// authenticated caller or — when `anonymous_public_reads` — anonymously,
+/// mirroring `search`'s public arm; `restricted`/`private` require the
+/// requester to be the producer (`agent_id`) or a named `audience` member.
+/// Placeholders (in textual order): `?req` (public), `?anon`, then
+/// `?req`,`?req`,`?req` (restricted/private), where `?req` is the requester
+/// DID or SQL NULL for an anonymous caller and `?anon` is
+/// `anonymous_public_reads`. `json_each(body_json,'$.audience')` yields zero
+/// rows when `audience` is absent, so the audience arm short-circuits.
+const LIST_VISIBILITY_SQLITE: &str = " AND (\
+    (visibility = 'public' AND (? IS NOT NULL OR ?)) \
     OR (? IS NOT NULL AND (agent_id = ? \
         OR EXISTS (SELECT 1 FROM json_each(body_json, '$.audience') WHERE value = ?))))";
 
@@ -1894,7 +1905,10 @@ mod tests {
             "exactly one publish inserts; the other replays"
         );
 
-        let page = store.list_contexts(100, None, None, None).await.unwrap();
+        let page = store
+            .list_contexts(100, None, None, None, true)
+            .await
+            .unwrap();
         assert_eq!(
             page.items.len(),
             1,
@@ -2121,7 +2135,10 @@ mod tests {
         .unwrap();
         assert!(outcome.is_err(), "minting failure must fail the publish");
 
-        let page = store.list_contexts(100, None, None, None).await.unwrap();
+        let page = store
+            .list_contexts(100, None, None, None, true)
+            .await
+            .unwrap();
         assert!(
             page.items.is_empty(),
             "no context row may survive a failed receipt mint"

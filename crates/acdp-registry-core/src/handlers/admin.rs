@@ -61,6 +61,16 @@ pub async fn admin_list<S: ExtendedRegistryStore + 'static>(
     // their tenant, not "≤50 across all tenants, then in-Rust retain
     // trims to ~3". The prior post-query `tenants_of_ctxs` filter is
     // gone — its job is now done by the WHERE clause in the store.
+    // REG-11 Phase 2: pass literal `true`, NOT
+    // `state.config.auth.anonymous_public_reads`. This restores the
+    // dropped §4.5 disclosure term to `list_contexts` at the SQL level
+    // without changing this route's observable behavior in this phase —
+    // `true` reproduces today's "public rows always listed" outcome
+    // byte-for-byte. Wiring the real config value here belongs to a later
+    // phase that flips the gate (`require_admin_bearer`) and the exposure
+    // together, atomically; doing it now would ship an anonymous-behavior
+    // break (403/empty listings for admins) inside a phase whose
+    // CHANGELOG entry is not the BREAKING one.
     let page = state
         .server
         .store()
@@ -69,6 +79,7 @@ pub async fn admin_list<S: ExtendedRegistryStore + 'static>(
             q.cursor.as_deref(),
             requester.as_ref(),
             requested_tenant.as_deref(),
+            true,
         )
         .await?;
     Ok(Json(AdminListResponse {

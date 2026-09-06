@@ -740,6 +740,54 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Restored the RFC-ACDP-0008 §4.5 `anonymous_public_reads` disjunct to
+  `list_contexts`** (`REG-11` Phase 2, `#133`): the pg/sqlite list-visibility
+  predicate was a bit-for-bit copy of `search`'s disclosure predicate MINUS
+  the `anonymous_public_reads ||` term on the `public` arm — `retrieve` and
+  `search` both already honor the flag; `list_contexts` was the sole
+  outlier. `ExtendedRegistryStore::list_contexts` gains a fifth parameter,
+  `anonymous_public_reads: bool` (`crates/acdp-registry-store/src/lib.rs`),
+  mirroring `RegistryStore::search`'s parameter of the same name; both SQL
+  backends' visibility predicate now reads
+  `Public => anonymous_public_reads || requester.is_some()`, arm-for-arm
+  with `search` (`acdp-registry-pg/src/store.rs:167-171`,
+  `acdp-registry-sqlite/src/store.rs:419-427`; the SQLite `LIST_VISIBILITY_SQLITE`
+  const grows from three `?` placeholders, all bound to the requester, to
+  five: `?req`, `?anon`, `?req`×3).
+  **Observable behavior is unchanged in this release**: the sole production
+  call site, `admin_list` behind `GET /admin/contexts`
+  (`acdp-registry-core/src/handlers/admin.rs`), passes a literal `true`
+  rather than `auth.anonymous_public_reads`, so today's "public rows always
+  listed" outcome is reproduced byte-for-byte. Wiring the real config value
+  there, together with gating the route behind the admin bearer, is a
+  later, deliberately atomic change — not this one. Both backends'
+  `sql_disclosure_matches_rfc_4_5_across_the_matrix` oracle test now
+  exercises `list_contexts` under both `anonymous_public_reads` values
+  inside the same `for anon_reads in [true, false]` loop that already
+  covered `search`, closing the one place this repo's own §4.5 restatement
+  didn't reach.
+- **Twelve dependency majors** (`REG-11` Phase 1, `#136`): `rand` 0.8→0.10
+  (`rand::thread_rng()` → `rand::rng()`, `RngCore` no longer at the crate
+  root — `crates/acdp-registry-auth/src/service.rs`,
+  `crates/acdp-registry-server/src/main.rs`), `hmac` 0.12→0.13 (`KeyInit`
+  now imported separately from `Mac` —
+  `crates/acdp-registry-webhook/src/lib.rs:250`), `jsonwebtoken` 9→11
+  (switches the JWT crypto provider to the `rust_crypto` feature — no
+  other provider was enabled by default before), `thiserror` 1→2,
+  `ed25519-dalek` 2→3, `toml` 0.8→1.1, plus `tower-http`, `sha2`, `base64`,
+  `config`, `metrics-exporter-prometheus`, and `serial_test`. `serial_test`
+  is held at `3.x` rather than the dependabot-proposed `4.x`, which
+  requires rustc 1.93.1 and would break the `msrv (1.88)` CI job. Added a
+  `deny.toml` `advisories.ignore` entry for `RUSTSEC-2023-0071` ("Marvin",
+  an RSA private-key timing side channel): `rsa` enters the dependency
+  graph only because jsonwebtoken 11's `rust_crypto` feature enables it
+  unconditionally, every JWT verification pins a single non-RSA algorithm
+  before any crypto verifier is constructed, and this registry holds no
+  RSA private key material to time. **This is the repository's second
+  advisories-ignore entry, not its first** — `RUSTSEC-2025-0134` was
+  ignored and then removed by PR #97 once `axum-server` 0.8 dropped
+  `rustls-pemfile` from the graph entirely; this one is expected to
+  outlive that pattern, since no upstream `rsa` patch exists for Marvin.
 - **Extracted a shared `tests/common/` harness for `conformance.rs` and
   `http_integration.rs`** (`REG-10` Phase 6). Rust integration tests
   compile to separate binaries, so `conformance.rs` couldn't reach
@@ -1129,6 +1177,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- **`chacha20` bumped 0.10.1 → 0.10.2** (`REG-11` Phase 2 ride-along;
+  lockfile-only version bump, not a `deny.toml` ignore): `0.10.1` is
+  yanked from crates.io. It sits behind `rand::rng()` on the
+  auth-challenge-nonce path (`crates/acdp-registry-auth/src/service.rs`),
+  so this closes the CSPRNG core to a yanked dependency without any code
+  change; `cargo update -p chacha20` only re-resolves the lockfile.
 - `SEC-01` through `SEC-07` — full sweep landed; see Added/Changed
   above for individual items. Notable: empty-string webhook secrets
   no longer silently produce valid HMACs (`SEC-04`), and the

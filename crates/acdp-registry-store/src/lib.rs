@@ -30,8 +30,15 @@ pub struct Page<T> {
 /// implementations.
 #[async_trait]
 pub trait ExtendedRegistryStore: RegistryStore + Send + Sync {
-    /// Paginated listing for admin / debug. Visibility rules apply: if
-    /// `requester` is `None`, only public bodies are returned.
+    /// Paginated listing for admin / debug. Visibility follows the same
+    /// RFC-ACDP-0008 §4.5 retrieval-style predicate `retrieve` and `search`
+    /// already enforce: `restricted`/`private` bodies require `requester` to
+    /// be the producer or a named audience member. The `public` arm is
+    /// gated by `anonymous_public_reads`, mirroring `RegistryStore::search`'s
+    /// third parameter of the same name — when `requester` is `None` and
+    /// `anonymous_public_reads` is `false`, the page is empty; when `true`,
+    /// public bodies are returned exactly as before. A non-`None` requester's
+    /// results are unaffected by this flag either way.
     ///
     /// `tenant` (plan §7): when `Some`, the backend MUST filter rows
     /// at the storage layer so the returned page contains only that
@@ -52,6 +59,7 @@ pub trait ExtendedRegistryStore: RegistryStore + Send + Sync {
         cursor: Option<&str>,
         requester: Option<&AgentDid>,
         tenant: Option<&str>,
+        anonymous_public_reads: bool,
     ) -> Result<Page<FullContext>, AcdpError>;
 
     /// Storage backend health check. `Ok(())` on success.

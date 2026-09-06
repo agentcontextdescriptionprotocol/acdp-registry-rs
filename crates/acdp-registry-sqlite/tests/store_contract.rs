@@ -976,11 +976,19 @@ mod visibility_sql {
     }
 
     /// Retrieval-style disclosure (§4.5) used by the admin/debug listing:
-    /// public is always listed; restricted/private require producer or
+    /// public surfaces for any authenticated caller, or anonymously iff
+    /// `anon_reads` (REG-11 Phase 2 restores this term — it mirrors
+    /// `oracle_search`'s public arm); restricted/private require producer or
     /// audience membership.
-    fn oracle_list(vis: Visibility, is_owner: bool, is_audience: bool, authed: bool) -> bool {
+    fn oracle_list(
+        vis: Visibility,
+        is_owner: bool,
+        is_audience: bool,
+        authed: bool,
+        anon_reads: bool,
+    ) -> bool {
         match vis {
-            Visibility::Public => true,
+            Visibility::Public => authed || anon_reads,
             Visibility::Restricted | Visibility::Private => authed && (is_owner || is_audience),
         }
     }
@@ -1070,22 +1078,26 @@ mod visibility_sql {
                     Some(want.len() as u64),
                     "total_estimate must equal the §4.5-visible count: role={role} anon_reads={anon_reads}"
                 );
-            }
 
-            // ── list_contexts (retrieval-style; no anon_reads knob) ──
-            let page = store
-                .list_contexts(50, None, requester.as_ref(), Some(tenant))
-                .await
-                .expect("list ok");
-            let got: HashSet<&str> = page.items.iter().map(|c| c.body.ctx_id.as_str()).collect();
-            let mut want: HashSet<&str> = HashSet::new();
-            for (vis, id) in &contexts {
-                let is_aud = is_reader && !matches!(vis, Visibility::Public);
-                if oracle_list(vis.clone(), is_owner, is_aud, authed) {
-                    want.insert(id.as_str());
+                // ── list_contexts × anonymous_public_reads (REG-11 Phase 2) ──
+                let page = store
+                    .list_contexts(50, None, requester.as_ref(), Some(tenant), anon_reads)
+                    .await
+                    .expect("list ok");
+                let got: HashSet<&str> =
+                    page.items.iter().map(|c| c.body.ctx_id.as_str()).collect();
+                let mut want: HashSet<&str> = HashSet::new();
+                for (vis, id) in &contexts {
+                    let is_aud = is_reader && !matches!(vis, Visibility::Public);
+                    if oracle_list(vis.clone(), is_owner, is_aud, authed, anon_reads) {
+                        want.insert(id.as_str());
+                    }
                 }
+                assert_eq!(
+                    got, want,
+                    "LIST disclosure diverges from §4.5: role={role} anon_reads={anon_reads}"
+                );
             }
-            assert_eq!(got, want, "LIST disclosure diverges from §4.5: role={role}");
         }
     }
 

@@ -145,6 +145,7 @@ impl ExtendedRegistryStore for PgStore {
         cursor: Option<&str>,
         requester: Option<&AgentDid>,
         tenant: Option<&str>,
+        anonymous_public_reads: bool,
     ) -> Result<Page<FullContext>, AcdpError> {
         let limit = limit.clamp(1, 200) as i64;
         let anchor = cursor.map(decode_cursor).transpose()?.flatten();
@@ -161,13 +162,18 @@ impl ExtendedRegistryStore for PgStore {
         // predicate (`visible_to`) into SQL so restricted/private bodies the
         // requester may not see are never read or decoded, and the page fills
         // to `limit` instead of being trimmed by a post-query retain. $1 is
-        // the requester DID (SQL NULL for an anonymous caller); Postgres
-        // resolves the repeated $1 to one bound value.
+        // the requester DID (SQL NULL for an anonymous caller); $2 is
+        // `anonymous_public_reads`. Postgres resolves the repeated $1 to one
+        // bound value. The public arm mirrors `search`'s
+        // `Public => anonymous_public_reads || requester.is_some()` — this
+        // restores a term that was dropped when this predicate was written;
+        // `retrieve` and `search` both honor it already.
         q.push_str(
-            " AND (visibility = 'public' OR ($1::text IS NOT NULL AND (agent_id = $1::text \
+            " AND ((visibility = 'public' AND ($1::text IS NOT NULL OR $2::bool)) \
+             OR ($1::text IS NOT NULL AND (agent_id = $1::text \
              OR (body_json -> 'audience') @> to_jsonb($1::text))))",
         );
-        let mut next_pos = 2usize;
+        let mut next_pos = 3usize;
         // Plan §7: SQL-level tenant filter — see sqlite/list_contexts
         // and store/lib.rs for rationale. The composite
         // `idx_ctx_tenant_created` index from migration 006_tenant_id
@@ -190,7 +196,8 @@ impl ExtendedRegistryStore for PgStore {
         ));
 
         let mut query = sqlx::query(&q);
-        query = query.bind(requester_s); // $1 (disclosure)
+        query = query.bind(requester_s); // $1 (disclosure: requester)
+        query = query.bind(anonymous_public_reads); // $2 (disclosure: anonymous_public_reads)
         if let Some(t) = tenant {
             query = query.bind(t);
         }

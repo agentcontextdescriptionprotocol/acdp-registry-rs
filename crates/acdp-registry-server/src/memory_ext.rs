@@ -109,6 +109,7 @@ impl ExtendedRegistryStore for MemoryStore {
         _cursor: Option<&str>,
         _requester: Option<&AgentDid>,
         _tenant: Option<&str>,
+        _anonymous_public_reads: bool,
     ) -> Result<Page<FullContext>, AcdpError> {
         // The protocol-library InMemoryStore deliberately doesn't expose
         // its internal map; admin listing isn't supported on this backend.
