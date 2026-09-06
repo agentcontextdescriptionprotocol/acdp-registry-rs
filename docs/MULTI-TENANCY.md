@@ -43,9 +43,10 @@ On an enforced multi-tenant deployment:
   An unbound token (no claim) may **not** assert a tenant via `X-Tenant-Id`.
 - Configuring any `[[auth.tenant_agents]]` requires `require_tenant = true`;
   startup validation enforces this so tenancy can't be half-enabled.
-- Configuring any `[[auth.tenant_agents]]` also requires a tenancy-aware
-  storage backend (`sqlite` or `postgres`); startup validation refuses
-  `storage.backend = "memory"`. See [Backend support](#backend-support).
+- Strict mode itself requires a tenancy-aware storage backend (`sqlite` or
+  `postgres`): startup validation refuses `storage.backend = "memory"` when
+  **either** `require_tenant = true` or a non-empty `[[auth.tenant_agents]]`
+  is configured. See [Backend support](#backend-support).
 
 In lax mode (`require_tenant = false`) an unbound caller's `X-Tenant-Id` is
 still honored, preserving V0 behavior.
@@ -61,8 +62,10 @@ cross-boundary read/write. Untenanted rows remain reachable only through the
 ## Backend support
 
 Tenancy requires the `sqlite` or `postgres` backend. The `memory` backend is
-**not** tenancy-aware: configuring any `[[auth.tenant_agents]]` alongside
-`storage.backend = "memory"` is refused at startup.
+**not** tenancy-aware, and startup is refused when `storage.backend = "memory"`
+is combined with **either** tenancy signal: a non-empty `[[auth.tenant_agents]]`,
+or `require_tenant = true`. An untenanted memory registry — neither of those set
+— still starts, which is the ephemeral demo case the backend exists for.
 
 `MemoryStore` overrides none of the three tenancy methods below, so it inherits
 their untenanted defaults: `set_tenant_of_ctx` is a no-op, and `tenant_of_ctx` /
@@ -73,10 +76,16 @@ rows. (Publishes still succeed; they simply record no tenant, which is what make
 the reads empty.) A warning would therefore have nothing working to preserve on
 the read path: the registry would start cleanly and then serve nothing.
 
-> **Known gap (#156).** The refusal keys on `[[auth.tenant_agents]]` being
-> non-empty. `require_tenant = true` with an *empty* `tenant_agents` — tenancy
-> driven entirely by an external issuer's `tenant` claim — is **not** currently
-> refused on the memory backend, and is broken in the same way.
+Both signals are covered because either one alone is enough to break reads.
+`require_tenant = true` with an *empty* `tenant_agents` is a real configuration:
+with no agent bindings no registry-issued token ever carries a `tenant` claim, so
+on the read path a caller asserts its tenant with the `X-Tenant-Id` header, which
+is what this registry's own default-deny message instructs. (Publishes differ:
+strict mode deliberately ignores that spoofable header when the producer has no
+binding, so a publish is denied outright.) On this backend those reads then fail
+the same way as the `tenant_agents` arm — no asserted tenant can match the
+`default` each row reports. (The original refusal keyed on `[[auth.tenant_agents]]` alone and
+left that arm starting cleanly and serving nothing; closed in #156.)
 
 ## How the binding is stored and filtered
 
