@@ -76,6 +76,10 @@ require_tenant = false
 # Empty (the default) disables all /admin/* routes, including
 # GET /admin/contexts (playground feature) — there is no working admin
 # surface without at least one token configured here.
+# Entries must be non-blank and unpadded; startup refuses otherwise. One
+# blank entry opens /admin/* even alongside real tokens, because the
+# allowlist compare folds over every entry. Leaving the list empty (the
+# default) disables the admin routes entirely.
 # admin_tokens = ["<generate out of band>"]
 
 [webhook]

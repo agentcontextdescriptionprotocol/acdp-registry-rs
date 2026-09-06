@@ -33,6 +33,14 @@ The binary validates config before serving and refuses to boot on a misconfig
   `jwt_private_key_pem`. HS256 with an empty `jwt_secret` requires
   `allow_ephemeral_secret = true`, otherwise it fails. A non-empty secret is
   rejected if it is the literal `changeme`, and must decode to ≥32 bytes.
+- **Admin tokens** — every entry in `auth.admin_tokens` must be non-blank and
+  carry no leading or trailing whitespace. An empty *list* remains valid and
+  still means "admin routes disabled"; it is a bad *entry* that is refused.
+  One bad entry is enough: the allowlist compare folds over every entry, so a
+  blank one is admitted alongside real tokens while the list still looks
+  populated. A bare `Authorization: Bearer ` matches a blank entry over
+  HTTP/2, which preserves trailing header whitespace (HTTP/1.1 strips it
+  before the handler sees it, so the same request is refused there).
 - **Webhook** — when `enabled`, `url` must be non-empty and pass the SSRF policy
   (HTTPS, no private/internal authorities), and `secret` must be non-empty.
 - **Multi-tenancy** — a non-empty `[[auth.tenant_agents]]` requires
@@ -144,7 +152,7 @@ values for illustration. Env var = `ACDP_REGISTRY_` + the bracketed path.
 | `token_leeway_seconds` | u64 | `30` | Clock-skew tolerance for `exp`. |
 | `anonymous_public_reads` | bool | `false` | Allow unauthenticated reads of `public` contexts. Opt in for discovery hubs. |
 | `require_tenant` | bool | `false` | Strict multi-tenancy: requests resolving to no tenant are denied. See [MULTI-TENANCY.md](MULTI-TENANCY.md). |
-| `admin_tokens` | string[] | `[]` | Bearer tokens for `/admin/*`. Empty disables every admin-bearer-gated route: `/admin/status`, `/admin/lineages/{id}/audit`, `/admin/contexts/{id}/retract`, `/admin/contexts/{id}/republish`, `GET /admin/contexts`, `/admin/pinned-keys/reload`. See [HTTP-API.md#admin](HTTP-API.md#admin). |
+| `admin_tokens` | string[] | `[]` | Bearer tokens for `/admin/*`. Entries must be non-empty and not whitespace-only (startup validation). An empty *list* disables every admin-bearer-gated route: `/admin/status`, `/admin/lineages/{id}/audit`, `/admin/contexts/{id}/retract`, `/admin/contexts/{id}/republish`, `GET /admin/contexts`, `/admin/pinned-keys/reload`. See [HTTP-API.md#admin](HTTP-API.md#admin). |
 
 #### `[[auth.tenant_agents]]`
 

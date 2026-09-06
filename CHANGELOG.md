@@ -1498,6 +1498,55 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+<!-- REG-11 #161 (Lane B) -->
+
+- **Startup now refuses a blank or whitespace-padded entry in
+  `auth.admin_tokens`** (`#161`).
+
+  The failure this closes is not an operator blanking their admin allowlist —
+  it is a deployment with **several working admin tokens where one templated
+  from an unset variable**. The allowlist compare folds over every entry
+  without early return (deliberately, for constant time), so
+  `["tok-a", "tok-b", ""]` admits the empty token *alongside* the real ones.
+  Every genuine token keeps working, the list is non-empty, and nothing looks
+  anomalous — the deployment reads as correctly configured while
+  `/admin/*` is open, including the live pinned-keys reload and the
+  registry-attested retract/republish routes.
+
+  The mechanism: `require_admin_bearer` strips `"Bearer "` and does not trim,
+  so `Authorization: Bearer ` yields `""`, which matches an empty entry.
+  **This is reachable over HTTP/2**, which preserves trailing whitespace in
+  header values. Over HTTP/1.1 `httparse` strips trailing SP/HTAB/CR/LF before
+  the value reaches the handler, so the same request arrives as `"Bearer"` and
+  is refused. The registry serves both protocols.
+
+  Padded entries such as `"tok "` are refused for the same reason from the
+  other direction: HTTP/1.1 trims the request header but not the configured
+  value, so such a token authenticates over HTTP/2 and 403s over HTTP/1.1.
+  That fails closed rather than open, but it is the same templating accident
+  and it is indistinguishable from a typo.
+
+  **This is a hardening gap, not a live vulnerability.** It requires operator
+  misconfiguration, and no shipped configuration is affected — both
+  `config/registry.example.toml` and `docker/config.docker.toml` leave
+  `admin_tokens` commented out, i.e. an empty *list*, which correctly means
+  "admin routes disabled" and remains valid. What makes it worth closing is
+  the direction of the failure: templating from an unset environment variable
+  **fails open rather than closed**, which is the wrong direction for a
+  security gate.
+
+  The guard is in `validate_config`, beside the existing `auth.jwt_secret`
+  checks — the same class of shared secret, already guarded three ways (empty,
+  the `changeme` placeholder, and a decoded-length floor) while `admin_tokens`
+  entries were not inspected at all. Failing at startup rather than per request
+  keeps a misconfiguration from presenting as a client-side 403.
+
+  The constant-time comparison itself (`ct_eq`, `#23`) is correct and
+  unchanged; the gap was strictly upstream of it, in what reached the
+  allowlist.
+
+<!-- end REG-11 #161 -->
+
 - **`chacha20` bumped 0.10.1 → 0.10.2** (`REG-11` Phase 2 ride-along;
   lockfile-only version bump, not a `deny.toml` ignore): `0.10.1` is
   yanked from crates.io. It sits behind `rand::rng()` on the

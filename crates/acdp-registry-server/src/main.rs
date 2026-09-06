@@ -109,6 +109,56 @@ fn validate_config(cfg: &RegistryConfig) -> anyhow::Result<()> {
         let _ = JwtSecret::from_base64(&cfg.auth.jwt_secret)
             .map_err(|e| anyhow::anyhow!("auth.jwt_secret: {e}"))?;
     }
+    // #161: an EMPTY `admin_tokens` list means "admin routes disabled" and is
+    // the shipped default in both `config/registry.example.toml` and
+    // `docker/config.docker.toml` — that stays valid. It is a padded or blank
+    // ENTRY that is refused.
+    //
+    // The failure that matters is a list of several working tokens where ONE
+    // templated from an unset variable. The match folds over every entry
+    // without early return (deliberately — constant time), so
+    // `["tok-a", "tok-b", ""]` admits the empty token *alongside* the real
+    // ones: every genuine token still works, the list is non-empty, and
+    // nothing looks wrong. Hence every entry is checked, not the list.
+    //
+    // How an empty entry is reached: `require_admin_bearer` strips `"Bearer "`
+    // and does NOT trim, so `Authorization: Bearer ` yields `""`, which
+    // `ct_eq` matches against an empty entry. That path is reachable over
+    // **HTTP/2**, which preserves trailing whitespace in header values; on
+    // HTTP/1.1 `httparse` strips trailing SP/HTAB/CR/LF before the value ever
+    // reaches the handler, so the same request arrives as `"Bearer"` and is
+    // rejected. This server speaks both. The compare itself is correct; the
+    // gap is upstream of it, in what reaches the allowlist.
+    //
+    // Padded entries are refused too, not just blank ones: `"tok "` is matched
+    // only over HTTP/2, because HTTP/1.1 trims the request header but not the
+    // configured value. That yields a credential which works on one protocol
+    // and 403s on the other — it fails closed, so it is not a hole, but it is
+    // the same templating accident and it is indistinguishable from a typo.
+    //
+    // Mirrors how `auth.jwt_secret` is already guarded (empty, `changeme`
+    // placeholder, decoded length) — same class of shared secret, and this one
+    // gates the live pinned-keys reload and the registry-attested lifecycle
+    // routes.
+    for (i, token) in cfg.auth.admin_tokens.iter().enumerate() {
+        if token.trim().is_empty() {
+            anyhow::bail!(
+                "auth.admin_tokens[{i}] is empty or whitespace-only. Over HTTP/2, which \
+                 preserves trailing header whitespace, a bare 'Authorization: Bearer ' header \
+                 would then pass the /admin/* gate — and one such entry opens it even when \
+                 every other entry is a real token. Remove the entry, or leave \
+                 auth.admin_tokens = [] to disable the admin routes entirely."
+            );
+        }
+        if token != token.trim() {
+            anyhow::bail!(
+                "auth.admin_tokens[{i}] has leading or trailing whitespace. HTTP/1.1 strips \
+                 trailing whitespace from the request header but not from this configured \
+                 value, so the token would authenticate over HTTP/2 and be refused over \
+                 HTTP/1.1. Remove the surrounding whitespace."
+            );
+        }
+    }
     if cfg.webhook.enabled {
         if cfg.webhook.url.is_empty() {
             anyhow::bail!("webhook.enabled but webhook.url is empty");
@@ -1489,6 +1539,87 @@ mod tests {
 
         // The same tenancy config on a durable backend still starts.
         cfg.storage.backend = StorageBackend::Sqlite;
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    // #161 — an empty or whitespace-only admin token would be matched by a
+    // bare `Authorization: Bearer ` header, opening /admin/* to anyone.
+    #[test]
+    fn empty_or_whitespace_admin_token_is_rejected() {
+        for bad in ["", " ", "  ", "\t", "\n"] {
+            let mut cfg = RegistryConfig::defaults();
+            cfg.auth.admin_tokens = vec![bad.to_string()];
+            let err = validate_config(&cfg)
+                .expect_err("an empty or whitespace-only admin token must be refused");
+            assert!(
+                err.to_string().contains("admin_tokens[0]"),
+                "{bad:?}: {err}"
+            );
+        }
+    }
+
+    // #161 — the three negatives that must NOT change. An empty LIST is the
+    // shipped default in `config/registry.example.toml` and
+    // `docker/config.docker.toml` and means "admin routes disabled"; breaking
+    // it would break every default deployment.
+    #[test]
+    fn admin_tokens_empty_list_and_real_tokens_still_start() {
+        let mut cfg = RegistryConfig::defaults();
+        assert!(
+            cfg.auth.admin_tokens.is_empty(),
+            "defaults() should ship no admin tokens"
+        );
+        assert!(
+            validate_config(&cfg).is_ok(),
+            "an empty admin_tokens list means 'admin routes disabled' and must still start"
+        );
+
+        cfg.auth.admin_tokens = vec!["s3cret-admin-token".into()];
+        assert!(
+            validate_config(&cfg).is_ok(),
+            "a real admin token must start"
+        );
+
+        cfg.auth.admin_tokens = vec!["tok-a".into(), "tok-b".into()];
+        assert!(
+            validate_config(&cfg).is_ok(),
+            "multiple real tokens must start"
+        );
+    }
+
+    // #161 — one bad entry poisons the whole list. This is the failure that
+    // matters: several working tokens where one templated from an unset
+    // variable. `require_admin_bearer` folds over every entry without early
+    // return, so the empty token is admitted alongside the real ones while
+    // the list looks populated and healthy.
+    #[test]
+    fn one_empty_admin_token_among_valid_ones_is_rejected() {
+        let mut cfg = RegistryConfig::defaults();
+        cfg.auth.admin_tokens = vec!["tok-a".into(), "tok-b".into(), "".into()];
+        let err = validate_config(&cfg)
+            .expect_err("an empty entry must be refused even beside valid ones");
+        assert!(err.to_string().contains("admin_tokens[2]"), "{err}");
+    }
+
+    // #161 — a padded entry authenticates over HTTP/2 but not HTTP/1.1:
+    // `httparse` trims trailing whitespace from the request header, while the
+    // configured value keeps it. Fails closed, but it is the same templating
+    // accident and behaves differently per protocol, so refuse it too.
+    #[test]
+    fn whitespace_padded_admin_token_is_rejected() {
+        for bad in ["tok ", " tok", "tok\t", "\ttok"] {
+            let mut cfg = RegistryConfig::defaults();
+            cfg.auth.admin_tokens = vec![bad.to_string()];
+            let err = validate_config(&cfg).expect_err("a padded admin token must be refused");
+            assert!(
+                err.to_string().contains("leading or trailing whitespace"),
+                "{bad:?}: {err}"
+            );
+        }
+
+        // The trimmed form of the same token is accepted.
+        let mut cfg = RegistryConfig::defaults();
+        cfg.auth.admin_tokens = vec!["tok".into()];
         assert!(validate_config(&cfg).is_ok());
     }
 
