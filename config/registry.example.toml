@@ -72,6 +72,11 @@ anonymous_public_reads = true
 # authenticated caller's tenant is taken ONLY from the JWT `tenant` claim, so
 # an unbound token can't assert a tenant via the X-Tenant-Id header.
 require_tenant = false
+# Bearer tokens accepted by every /admin/* route (require_admin_bearer).
+# Empty (the default) disables all /admin/* routes, including
+# GET /admin/contexts (playground feature) — there is no working admin
+# surface without at least one token configured here.
+# admin_tokens = ["<generate out of band>"]
 
 [webhook]
 enabled         = false

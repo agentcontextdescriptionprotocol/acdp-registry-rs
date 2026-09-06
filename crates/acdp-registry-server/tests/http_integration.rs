@@ -1152,7 +1152,12 @@ async fn search_filters_by_tenant() {
 #[tokio::test]
 async fn admin_list_filters_by_tenant() {
     // The playground-mode admin endpoint also honors the tenant header.
-    let h = harness(true).await;
+    // REG-11 Phase 3: `/admin/contexts` is now admin-bearer gated like every
+    // other `/admin/*` route, so the harness must configure a token and the
+    // request must present it.
+    let mut cfg = config(true);
+    cfg.auth.admin_tokens = vec!["secret-admin".into()];
+    let h = harness_from_config(cfg).await;
     let req_a = producer(15)
         .publish_request()
         .title("admin-alpha")
@@ -1177,6 +1182,7 @@ async fn admin_list_filters_by_tenant() {
             Request::builder()
                 .uri("/admin/contexts")
                 .header("X-Tenant-Id", "tenant-a")
+                .header("authorization", "Bearer secret-admin")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1198,7 +1204,12 @@ async fn admin_list_paginates_past_fully_hidden_pages() {
     // caller). A small page whose rows are all hidden must still advance the
     // cursor so the public row stays reachable — not stranded behind a
     // premature next_cursor:null. Mirrors search_paginates_past_fully_hidden_pages.
-    let h = harness(true).await;
+    // REG-11 Phase 3: `/admin/contexts` is now admin-bearer gated — every
+    // request in the pagination loop below must carry the header, not just
+    // the first.
+    let mut cfg = config(true);
+    cfg.auth.admin_tokens = vec!["secret-admin".into()];
+    let h = harness_from_config(cfg).await;
     let app = &h.router;
 
     let pubreq = producer(70)
@@ -1238,7 +1249,13 @@ async fn admin_list_paginates_past_fully_hidden_pages() {
         };
         let resp = app
             .clone()
-            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .header("authorization", "Bearer secret-admin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1259,6 +1276,239 @@ async fn admin_list_paginates_past_fully_hidden_pages() {
         seen.len(),
         1,
         "exactly the one public ctx should surface to anonymous; saw {seen:?}"
+    );
+}
+
+/// REG-11 Phase 3 (#133): `config()`/`config(bool)` hardcode
+/// `anonymous_public_reads: true` for every other test in this file's
+/// convenience. The exit-gate test below needs the real shipped default
+/// (`false`, SEC-07) instead — mutate a copy rather than the shared
+/// default, which would perturb every other test in this file.
+#[cfg(feature = "playground")]
+fn config_shipped_disclosure_default(playground: bool) -> RegistryConfig {
+    let mut cfg = config(playground);
+    cfg.auth.anonymous_public_reads = false;
+    cfg
+}
+
+/// REG-11 Phase 3 (#133): `config()`/`config(bool)` hardcode
+/// `auth.enabled: false`. The test proving `caller_from_headers` was NOT
+/// reintroduced onto this path needs `auth.enabled = true` — mutate a copy
+/// rather than the shared default.
+#[cfg(feature = "playground")]
+fn config_with_auth_enabled(playground: bool) -> RegistryConfig {
+    let mut cfg = config(playground);
+    cfg.auth.enabled = true;
+    cfg
+}
+
+/// REG-11 Phase 3 (#133): no `Authorization` header at all → 403
+/// `admin-only`, matching the other five `/admin/*` routes. Distinct from
+/// [`admin_list_requires_admin_tokens_configured`], which covers the
+/// "token configured but sent no/wrong header" cell; this covers "header
+/// entirely absent".
+#[cfg(feature = "playground")]
+#[tokio::test]
+async fn admin_list_requires_bearer_when_no_header_present() {
+    let mut cfg = config(true);
+    cfg.auth.admin_tokens = vec!["secret-admin".into()];
+    let h = harness_from_config(cfg).await;
+
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/admin/contexts")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let v = body_to_json(resp).await;
+    assert_eq!(v["error"], "admin-only", "body = {v}");
+}
+
+/// REG-11 Phase 3 (#133): an empty `auth.admin_tokens` disables the route
+/// regardless of what bearer the caller presents — matching the other five
+/// `/admin/*` routes, all of which are dead-by-default until an operator
+/// configures at least one token.
+#[cfg(feature = "playground")]
+#[tokio::test]
+async fn admin_list_requires_admin_tokens_configured() {
+    // Default `config(true)` leaves `admin_tokens` empty.
+    let h = harness(true).await;
+
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/admin/contexts")
+                .header("authorization", "Bearer anything-at-all")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let v = body_to_json(resp).await;
+    assert_eq!(v["error"], "admin-only", "body = {v}");
+}
+
+/// REG-11 Phase 3 (#133) exit gate: a valid admin token against the SHIPPED
+/// DEFAULT `anonymous_public_reads = false` (SEC-07) still returns 200 with
+/// rows. This is the criterion the first draft of the plan got wrong —
+/// passing `requester: None` straight through with the real config value
+/// would 500-empty the listing for every admin on a default-configured
+/// registry.
+#[cfg(feature = "playground")]
+#[tokio::test]
+async fn admin_list_returns_rows_under_the_shipped_disclosure_default() {
+    let mut cfg = config_shipped_disclosure_default(true);
+    cfg.auth.admin_tokens = vec!["secret-admin".into()];
+    let h = harness_from_config(cfg).await;
+
+    let req = producer(17)
+        .publish_request()
+        .title("admin-under-default-disclosure")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (status, v) = publish(&h.router, &req, None).await;
+    assert_eq!(status, StatusCode::OK, "publish body = {v}");
+
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/admin/contexts")
+                .header("authorization", "Bearer secret-admin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_to_json(resp).await;
+    let items = v["items"].as_array().unwrap();
+    assert_eq!(
+        items.len(),
+        1,
+        "admin bearer must still see public rows under anonymous_public_reads=false; body = {v}"
+    );
+    assert_eq!(items[0]["body"]["title"], "admin-under-default-disclosure");
+}
+
+/// REG-11 Phase 3 (#133): the second trap the first draft missed. With
+/// `auth.enabled = true` (exactly the registries that configure admin
+/// tokens), a naive re-parse of the same header via `caller_from_headers`
+/// would hand the admin token to `validate_bearer`, which fails on a
+/// non-JWT and returns 403. `admin_list` no longer calls
+/// `caller_from_headers` at all, so this must stay 200 with rows.
+#[cfg(feature = "playground")]
+#[tokio::test]
+async fn admin_list_returns_rows_when_auth_enabled() {
+    let mut cfg = config_with_auth_enabled(true);
+    cfg.auth.admin_tokens = vec!["secret-admin".into()];
+    let h = harness_from_config(cfg).await;
+
+    let req = producer(18)
+        .publish_request()
+        .title("admin-under-auth-enabled")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (status, v) = publish(&h.router, &req, None).await;
+    assert_eq!(status, StatusCode::OK, "publish body = {v}");
+
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/admin/contexts")
+                .header("authorization", "Bearer secret-admin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "an admin bearer must not be rejected as a malformed JWT"
+    );
+    let v = body_to_json(resp).await;
+    let items = v["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "body = {v}");
+    assert_eq!(items[0]["body"]["title"], "admin-under-auth-enabled");
+}
+
+/// REG-11 Phase 3 (#133): the frozen disclosure rule, proven directly. An
+/// admin bearer is an authenticated-but-unnamed caller for the
+/// RFC-ACDP-0008 §4.5 public arm — it must NOT see another producer's
+/// restricted or private bodies. (It sees public rows regardless of
+/// producer; that is covered by the two tests above.)
+#[cfg(feature = "playground")]
+#[tokio::test]
+async fn admin_list_never_discloses_restricted_or_private_rows() {
+    let mut cfg = config(true);
+    cfg.auth.admin_tokens = vec!["secret-admin".into()];
+    let h = harness_from_config(cfg).await;
+
+    let restricted = producer(19)
+        .publish_request()
+        .title("admin-must-not-see-restricted")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Restricted)
+        .audience(vec![AgentDid::new("did:web:agents.test:nobody")])
+        .build()
+        .unwrap();
+    let (status, v) = publish(&h.router, &restricted, None).await;
+    assert_eq!(status, StatusCode::OK, "publish body = {v}");
+
+    let private = producer(20)
+        .publish_request()
+        .title("admin-must-not-see-private")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Private)
+        .build()
+        .unwrap();
+    let (status, v) = publish(&h.router, &private, None).await;
+    assert_eq!(status, StatusCode::OK, "publish body = {v}");
+
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/admin/contexts")
+                .header("authorization", "Bearer secret-admin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_to_json(resp).await;
+    let titles: Vec<String> = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|it| it["body"]["title"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        !titles.contains(&"admin-must-not-see-restricted".to_string()),
+        "admin listing must never disclose a restricted body; saw {titles:?}"
+    );
+    assert!(
+        !titles.contains(&"admin-must-not-see-private".to_string()),
+        "admin listing must never disclose a private body; saw {titles:?}"
     );
 }
 

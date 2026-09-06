@@ -3,10 +3,9 @@
 //! `admin_status` ships in every build (auth-gated by `auth.admin_tokens`).
 //! `admin_list` (read-only tenant-scoped listing) and `reload_pinned_keys`
 //! (the one mutating helper here — hot-swaps the `[playground]` config
-//! section) are compiled only with the `playground` feature. Unlike every
-//! other `/admin/*` handler, `admin_list` does NOT call
-//! `require_admin_bearer` / check `auth.admin_tokens` — see its doc comment
-//! below and `docs/HTTP-API.md`'s `## Admin` section.
+//! section) are compiled only with the `playground` feature. `admin_list`
+//! calls `require_admin_bearer` like every other `/admin/*` handler; see its
+//! doc comment below and `docs/HTTP-API.md`'s `## Admin` section.
 
 use std::sync::Arc;
 
@@ -24,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::state::AppState;
 
 #[cfg(feature = "playground")]
-use crate::handlers::context::{caller_from_headers, tenant_for_request};
+use crate::handlers::context::tenant_for_request;
 #[cfg(feature = "playground")]
 use axum::extract::Query;
 
@@ -44,44 +43,56 @@ pub struct AdminListResponse {
 
 /// Paginated tenant-scoped context listing (playground feature).
 ///
-/// NOT admin-bearer gated: resolves the caller/tenant via
-/// `caller_from_headers`/`tenant_for_request`, the same helpers the regular
-/// read routes use, and never calls `require_admin_bearer` or checks
-/// `auth.admin_tokens`. See `docs/HTTP-API.md`'s `## Admin` section.
+/// Admin-bearer gated, like every other `/admin/*` handler: the caller must
+/// present `Authorization: Bearer <token>` matching `auth.admin_tokens`
+/// (`require_admin_bearer`, checked first). `caller_from_headers` is
+/// deliberately **not** called on this path — the admin gate has already
+/// answered "who is calling", and re-parsing the same header under
+/// `caller_from_headers`'s rules would hand the admin token to
+/// `validate_bearer`, which fails on a non-JWT and returns 403 whenever
+/// `auth.enabled = true` (exactly the registries that configure admin
+/// tokens). `tenant_for_request` is still called — it is a separate
+/// resolution step, deliberately tolerant of a non-JWT bearer.
+///
+/// An admin bearer authenticates the caller but names no agent DID, so the
+/// RFC-ACDP-0008 §4.5 predicate sees an **authenticated but unnamed**
+/// requester: public rows only. Restricted and private bodies are never
+/// disclosed to the admin listing — their SQL arms both require a non-NULL
+/// requester DID (`LIST_VISIBILITY_SQLITE` in `acdp-registry-sqlite`, and
+/// its Postgres twin), which a `None` requester can never supply.
 #[cfg(feature = "playground")]
 pub async fn admin_list<S: ExtendedRegistryStore + 'static>(
     State(state): State<Arc<AppState<S>>>,
     headers: HeaderMap,
     Query(q): Query<AdminListQuery>,
-) -> Result<Json<AdminListResponse>, RegistryError> {
-    let requester = caller_from_headers(&state, &headers)?;
+) -> Result<Json<AdminListResponse>, AdminLifecycleError> {
+    require_admin_bearer(&state.config, &headers)?;
+
     let requested_tenant = tenant_for_request(&state, &headers)?;
+    // An admin bearer authenticates the CALLER but names no agent, so the
+    // §4.5 predicate sees an authenticated-but-unnamed requester: public
+    // rows only. Restricted/private stay producer/audience-gated — their
+    // SQL arms require a non-NULL requester DID, which an admin token
+    // never supplies.
+    let admin_requester: Option<&acdp::types::primitives::AgentDid> = None;
+    let admin_sees_public_arm = true;
     // Plan §7: push the tenant filter into SQL so the page-size invariant
     // holds — a caller asking for `?limit=50` now gets up to 50 rows for
     // their tenant, not "≤50 across all tenants, then in-Rust retain
     // trims to ~3". The prior post-query `tenants_of_ctxs` filter is
     // gone — its job is now done by the WHERE clause in the store.
-    // REG-11 Phase 2: pass literal `true`, NOT
-    // `state.config.auth.anonymous_public_reads`. This restores the
-    // dropped §4.5 disclosure term to `list_contexts` at the SQL level
-    // without changing this route's observable behavior in this phase —
-    // `true` reproduces today's "public rows always listed" outcome
-    // byte-for-byte. Wiring the real config value here belongs to a later
-    // phase that flips the gate (`require_admin_bearer`) and the exposure
-    // together, atomically; doing it now would ship an anonymous-behavior
-    // break (403/empty listings for admins) inside a phase whose
-    // CHANGELOG entry is not the BREAKING one.
     let page = state
         .server
         .store()
         .list_contexts(
             q.limit.unwrap_or(50),
             q.cursor.as_deref(),
-            requester.as_ref(),
+            admin_requester,
             requested_tenant.as_deref(),
-            true,
+            admin_sees_public_arm,
         )
-        .await?;
+        .await
+        .map_err(RegistryError::from)?;
     Ok(Json(AdminListResponse {
         items: page.items,
         next_cursor: page.next_cursor,
