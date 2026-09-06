@@ -6986,6 +6986,44 @@ const KNOWN_FAMILIES: &[&str] = &[
     "wit",
 ];
 
+/// REG-11 Phase 6 anti-regression ratchet: an in-file mirror, by family, of
+/// the pinned spec's `acdp-registry-core` profile obligations -- every
+/// family that appears in `required_fixtures` or anywhere in
+/// `conditional_fixtures` (`registries/profiles.json` at the pin named in
+/// `ci.yml`'s `conformance` job), sorted and deduped. Mirrors the *family*
+/// footprint, not coverage status: `can`, `idem`, `pub`, `ret`, and `vis`
+/// are already `COVERED`, and the other thirteen (`body`, `caps`,
+/// `data-ref`, `did-ssrf`, `dk`, `err`, `lin`, `meta`, `rate`, `rev`,
+/// `schema`, `sig`, `status`) are currently `DEFERRED` -- both groups are
+/// spec-required all the same, so both must be unexcusable.
+///
+/// Deliberately NOT filtered down to only the currently-`DEFERRED` subset:
+/// doing that would make this list implicitly depend on `COVERED`'s
+/// contents, and a `DEFERRED` -> `COVERED` move (the good-path direction
+/// coverage work takes) would then shrink the spec-derived set out from
+/// under this mirror and fail `core_inexcusable_families_are_never_excused_or_unclassified`
+/// for a reason that has nothing to do with an actual regression. Keying
+/// only off family membership in the spec's required/conditional fixture
+/// lists means a `DEFERRED` -> `COVERED` move requires zero edits here --
+/// see the module doc-comment's "Coverage completeness ratchet" section for
+/// why that property matters.
+///
+/// Checked two ways: unconditionally (no spec on disk needed) by
+/// `core_inexcusable_families_are_never_excused_or_unclassified` below, which
+/// proves every family here is in `COVERED` union `DEFERRED` and never in
+/// `EXCUSED`, using only this file's own `KNOWN_FAMILIES`/`COVERED`/
+/// `EXCUSED`/`DEFERRED` data; and, spec-gated, by
+/// `no_excused_family_is_required_by_our_profile`'s trailing `assert_eq!`,
+/// which recomputes this exact family set from the live pinned spec and
+/// fails if this literal has rotted against it. Update this list only when
+/// the spec pin moves AND that bump changes which families
+/// `required_fixtures`/`conditional_fixtures` bucket into -- both are then
+/// compiler- and CI-forced, not discretionary.
+const CORE_INEXCUSABLE_FAMILIES: &[&str] = &[
+    "body", "can", "caps", "data-ref", "did-ssrf", "dk", "err", "idem", "lin", "meta", "pub",
+    "rate", "ret", "rev", "schema", "sig", "status", "vis",
+];
+
 /// Families excused from needing HTTP-replay coverage, each with a prose
 /// reason. An excuse is legitimate only when BOTH hold: (1) spec-grounded —
 /// no fixture in the family appears in `acdp-registry-core`'s
@@ -7183,8 +7221,11 @@ const DEFERRED: &[(&str, &str, u32)] = &[
     ),
     (
         "data-ref",
-        "DataRef openness vectors; consumer-leaning obligations, needs its own look \
-         before committing to a coverage shape.",
+        "DataRef publish-path rejections (RFC-ACDP-0002 \u{a7}6): all 8 data-ref-* fixtures \
+         are registry-side publish validation -- neither/both location+embedded, a \
+         credentialed URI, a missing structured scheme, an oversized/non-UTF-8/hash- \
+         mismatched embedded payload -- not a consumer-leaning obligation. Needs a \
+         direct-vector or replayed pass against the publish validation path.",
         130,
     ),
     (
@@ -7204,36 +7245,50 @@ const DEFERRED: &[(&str, &str, u32)] = &[
     ),
     (
         "rate",
-        "rate-limiting obligations; needs a clock/limiter seam this harness doesn't have \
-         yet.",
+        "rate-limiting obligations (RFC-ACDP-0008 \u{a7}4.3); not a missing seam -- \
+         `limits.publish_rate_per_minute` (config.rs:560-561) is a live config knob \
+         enforced by the in-process fixed-window `AgentRateLimiter` \
+         (rate_limit.rs, wired at state.rs:87-88) emitting 429 `rate_limited` with \
+         `Retry-After` (error.rs:42,61,75) -- already proven end-to-end for the sibling \
+         challenge limiter (http_integration.rs:843-873). Needs a direct/replayed pass \
+         exercising the publish-path limiter the same way, not a new mechanism.",
         130,
     ),
     (
         "status",
-        "lifecycle status transitions; no direct or replayed coverage yet.",
+        "response-field grammar for the `status` string (RFC-ACDP-0004 \u{a7}4.1) -- \
+         valid pattern vs. invalid (uppercase, embedded space, empty) -- not lifecycle \
+         state transitions. No direct or replayed coverage yet.",
         130,
     ),
     (
         "rcpt",
-        "receipt verification (RFC-ACDP-0010); a verification-side family needing a new \
-         seam.",
+        "receipt verification (RFC-ACDP-0010); the harness advertises only the \
+         acdp-registry-core profile (HARNESS_PROFILES, conformance.rs:425), not that a \
+         seam is missing.",
         130,
     ),
     (
         "lhr",
-        "lineage-head receipts (RFC-ACDP-0011); a verification-side family needing a new \
-         seam.",
+        "lineage-head receipts (RFC-ACDP-0011); the harness advertises only the \
+         acdp-registry-core profile (HARNESS_PROFILES, conformance.rs:425), not that a \
+         seam is missing.",
         130,
     ),
     (
         "log",
-        "transparency-log verification (RFC-ACDP-0012); a verification-side family \
-         needing a new seam.",
+        "transparency-log verification (RFC-ACDP-0012); the emission side is implemented \
+         and always mounted (/log/checkpoint, /log/proof, /log/entries, lib.rs:86-88) -- \
+         the harness advertises only the acdp-registry-core profile (HARNESS_PROFILES, \
+         conformance.rs:425), not that a seam is missing.",
         130,
     ),
     (
         "rev",
-        "key revocation (RFC-ACDP-0014); a verification-side family needing a new seam.",
+        "key revocation (RFC-ACDP-0014 \u{a7}4/\u{a7}5) -- the registry side: accepting \
+         and publishing a key-revocation context and its before/after compromise-boundary \
+         semantics, not a verification-side obligation. No direct or replayed coverage \
+         yet.",
         130,
     ),
 ];
@@ -7366,6 +7421,49 @@ fn known_families_partition_into_covered_excused_or_deferred() {
         assert!(
             KNOWN_FAMILIES.contains(family),
             "\"{family}\" appears in COVERED/EXCUSED/DEFERRED but is not in KNOWN_FAMILIES"
+        );
+    }
+}
+
+/// REG-11 Phase 6: the anti-regression ratchet's unconditional half. Runs in
+/// the required `tests` job with no `ACDP_SPEC_DIR` needed -- unlike
+/// `no_excused_family_is_required_by_our_profile` below, which proves the
+/// same property against the live pinned spec but only when the spec is
+/// reachable, and which is itself gated behind the `conformance (spec
+/// fixtures)` CI job staying a required status check (see the module
+/// doc-comment and `CORE_INEXCUSABLE_FAMILIES`'s doc comment for why that
+/// job's required-ness is not fully within this repo's control, and why
+/// this half is what survives if it is ever dropped).
+///
+/// For every family the pinned spec requires of this profile
+/// (`CORE_INEXCUSABLE_FAMILIES`): it must be in `COVERED` or `DEFERRED`
+/// (never silently unclassified -- `known_families_partition_into_covered_
+/// excused_or_deferred` above already proves that for every `KNOWN_FAMILIES`
+/// entry, so this is belt-and-suspenders for the subset that matters most),
+/// and it must never be in `EXCUSED`. A spec-required family moved into
+/// `EXCUSED` fails both this test and, when the spec is reachable,
+/// `no_excused_family_is_required_by_our_profile`'s fixture-level check --
+/// two independent jobs, not one.
+#[test]
+fn core_inexcusable_families_are_never_excused_or_unclassified() {
+    let covered: std::collections::BTreeSet<&str> =
+        COVERED.iter().map(|(family, _)| *family).collect();
+    let deferred: std::collections::BTreeSet<&str> =
+        DEFERRED.iter().map(|(family, _, _)| *family).collect();
+    let excused: std::collections::BTreeSet<&str> =
+        EXCUSED.iter().map(|(family, _)| *family).collect();
+
+    for family in CORE_INEXCUSABLE_FAMILIES {
+        assert!(
+            !excused.contains(family),
+            "\"{family}\" is in CORE_INEXCUSABLE_FAMILIES (the pinned spec requires it of \
+             acdp-registry-core) but has been moved into EXCUSED -- a spec-required family \
+             can never be excused, in every CI job, spec present or not"
+        );
+        assert!(
+            covered.contains(family) || deferred.contains(family),
+            "\"{family}\" is in CORE_INEXCUSABLE_FAMILIES but is classified in neither \
+             COVERED nor DEFERRED"
         );
     }
 }
@@ -7703,6 +7801,16 @@ fn assert_no_id_buckets_into_excused_family(
 /// relying on a human re-reading the spec by hand every time `EXCUSED`
 /// grows; a failure names both the offending fixture id and which of the two
 /// spec keys (`required_fixtures` vs `conditional_fixtures`) caught it.
+///
+/// REG-11 Phase 6 also asserts, at the end, that `CORE_INEXCUSABLE_FAMILIES`
+/// equals -- as a set, not by fixture count -- the family-level union of
+/// `required_fixtures` and `conditional_fixtures` recomputed here from the
+/// live pinned spec. This is what makes the unconditional mirror provably
+/// non-rotting: it can only diverge from the spec by a spec-pin bump that
+/// changes which families those two keys bucket into, and that divergence
+/// is caught right here, in this required CI job, rather than trusted to a
+/// human keeping two lists in sync by hand.
+///
 /// Skips when the spec isn't reachable.
 #[tokio::test(flavor = "multi_thread")]
 async fn no_excused_family_is_required_by_our_profile() {
@@ -7748,6 +7856,35 @@ async fn no_excused_family_is_required_by_our_profile() {
         &spec_fam_refs,
         &excused_families,
         "conditional_fixtures",
+    );
+
+    // REG-11 Phase 6: `CORE_INEXCUSABLE_FAMILIES` must equal, as a set, the
+    // family-level union of `required_fixtures` and `conditional_fixtures`
+    // -- recomputed from the live pinned spec, not trusted from the last
+    // time a human updated the literal. Bucketing failures panic with the
+    // same message shape `assert_no_id_buckets_into_excused_family` uses,
+    // since an id that doesn't bucket into any spec-declared family is a
+    // spec-data problem, not a ratchet problem.
+    let mut spec_required_families: std::collections::BTreeSet<&str> = Default::default();
+    for id in required.iter().chain(conditional.iter()) {
+        let fam = bucket_family(id, &spec_fam_refs).unwrap_or_else(|| {
+            panic!(
+                "acdp-registry-core required/conditional fixture \"{id}\" does not bucket \
+                 into any spec-declared family"
+            )
+        });
+        spec_required_families.insert(fam);
+    }
+    let mut mirror: Vec<&str> = CORE_INEXCUSABLE_FAMILIES.to_vec();
+    mirror.sort_unstable();
+    mirror.dedup();
+    let spec_derived: Vec<&str> = spec_required_families.into_iter().collect();
+    assert_eq!(
+        mirror, spec_derived,
+        "CORE_INEXCUSABLE_FAMILIES has rotted against the pinned spec's acdp-registry-core \
+         required_fixtures/conditional_fixtures family set -- update the const in \
+         tests/conformance.rs to match, and only because the spec pin (ci.yml) moved and \
+         changed which families those two keys bucket into"
     );
 }
 
