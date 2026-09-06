@@ -657,8 +657,20 @@ struct ShapeDScenario {
     want_matches_count: Option<u64>,
     want_match_summary_contains: Option<Value>,
     /// REG-10 Phase 9b: asserted, not merely recognized -- see
-    /// [`replay_shape_d`].
+    /// [`replay_shape_d`]. `None` for a scenario whose `expected` carries
+    /// `total_estimate_constraints` instead of a literal `total_estimate`
+    /// (spec b8601e2, `vis-005` scenario index 2, spec issue #41) -- see
+    /// `want_total_estimate_constraints` below for that scenario's actual
+    /// assertion.
     want_total_estimate: Option<u64>,
+    /// Spec b8601e2 (spec issue #41): `expected.total_estimate_constraints`
+    /// read verbatim off the fixture (never hardcoded), asserted by
+    /// [`replay_shape_d`] in place of an exact-value `total_estimate`
+    /// check. Mutually exclusive with `want_total_estimate` in practice --
+    /// no observed fixture scenario carries both keys -- but the two
+    /// fields are independent so a future fixture combining them would
+    /// still get both checks rather than one silently shadowing the other.
+    want_total_estimate_constraints: Option<TotalEstimateConstraints>,
     /// REG-10 Phase 9b: fixture-literal ctx_ids, translated through the
     /// plan's ctx_id substitution map at replay time (they aren't known
     /// yet at parse time) -- see [`replay_shape_d`].
@@ -883,38 +895,40 @@ struct ParsedExpected {
     match_summary_contains: Option<Value>,
     /// REG-10 Phase 9b: `total_estimate` is now genuinely ASSERTED (not
     /// merely recognized-and-ignored) — see [`replay_shape_d`]'s
-    /// `want_total_estimate` check. Across `vis-002` (3), `vis-005` (4),
-    /// `vis-007` (1, direct coverage — see
+    /// `want_total_estimate` check. Across `vis-002` (3), `vis-005` (3, as
+    /// of spec b8601e2 -- see below), `vis-007` (1, direct coverage — see
     /// `vis007_search_match_restricted_visibility_disposition`), and
-    /// `vis-009` (2), the pinned spec fixtures carry exactly 10
-    /// `expected.total_estimate` occurrences; 9 of those 10 are asserted
-    /// here, alongside `matches_count` — the spec's own leak-prevention
-    /// framing (RFC-ACDP-0008 §6.3) treats the two as the SAME disclosure
-    /// surface, so scoping `matches[]` while leaving `total_estimate`
-    /// unscoped would leak existence via the count alone. The tenth —
-    /// `vis-005` scenario 2, a `derived_from`-filtered search — is
-    /// exempted from EXACT-VALUE assertion (carved out where the value is
-    /// actually consumed, `parse_scenarios_array`, not here), because
-    /// this registry's own `total_estimate` (`DESIGN-01`, both storage
-    /// crates) is a documented pre-refinement upper bound that does not
-    /// reflect the post-SQL `derived_from` filter. This is NOT a
-    /// conformance gap: the fixture's literal `0` is one of several
-    /// spec-conformant values, not the only one — `total_estimate` "May
-    /// be approximate; not guaranteed to be exact"
-    /// (`schemas/json/acdp-search-response.schema.json`), "SHOULD NOT be
-    /// relied upon for exact counts" (`rfcs/RFC-ACDP-0005-discovery.md:219`,
-    /// §5 Security Considerations), and the spec's
-    /// own `examples/search/empty-page-post-filter-response.json` ships
-    /// the identical shape — an empty post-filtered `matches[]` alongside
-    /// a non-zero `total_estimate`. What scenario 2 loses in exact-value
-    /// assertion it regains in a LEAK-INVARIANCE assertion instead (RFC-
-    /// ACDP-0005 §2.5.5 Q2's MUST): see
+    /// `vis-009` (2), the pinned spec fixtures carry exactly 9
+    /// `expected.total_estimate` occurrences, ALL of them asserted here,
+    /// alongside `matches_count` — the spec's own leak-prevention framing
+    /// (RFC-ACDP-0008 §6.3) treats the two as the SAME disclosure surface,
+    /// so scoping `matches[]` while leaving `total_estimate` unscoped
+    /// would leak existence via the count alone.
+    ///
+    /// `vis-005` scenario index 2 (the `derived_from`-filtered search) used
+    /// to carry a tenth, exempted `expected.total_estimate: 0` here — spec
+    /// commit `6dce8d0` (spec issue #41) REPLACED that exact-value pin with
+    /// `expected.total_estimate_constraints` instead (see
+    /// [`TotalEstimateConstraints`] / `want_total_estimate_constraints`):
+    /// the spec itself now agrees an exact value can't be pinned here (
+    /// `total_estimate` "May be approximate; not guaranteed to be exact",
+    /// `schemas/json/acdp-search-response.schema.json`; "SHOULD NOT be
+    /// relied upon for exact counts", RFC-ACDP-0005 §5) and pins the
+    /// LEAK-INVARIANCE property instead (RFC-ACDP-0005 §2.5.5 Q2's MUST).
+    /// This struct's own `total_estimate` field is therefore `None` for
+    /// that scenario — see `total_estimate_constraints` below for what
+    /// replaces it — and separately,
     /// `vis005_private_audience_search_excluded_via_derived_from`'s
-    /// `total_estimate_for` block, which proves the audience member and
-    /// an outsider get the identical value on the same `derived_from`
-    /// query, strictly below the producer's — the one thing that
-    /// genuinely MUST hold regardless of exactness.
+    /// `total_estimate_for` block proves the audience member and an
+    /// outsider get the identical value on the same `derived_from` query,
+    /// strictly below the producer's.
     total_estimate: Option<u64>,
+    /// Spec b8601e2 (spec issue #41): `expected.total_estimate_constraints`
+    /// — the leak-invariance property that replaced `vis-005` scenario
+    /// index 2's exact-value `total_estimate` pin. `None` for every other
+    /// scenario in the corpus. See [`TotalEstimateConstraints`] and
+    /// [`parse_total_estimate_constraints`].
+    total_estimate_constraints: Option<TotalEstimateConstraints>,
     /// REG-10 Phase 9b: `matches_ctx_ids`, genuinely asserted (translated
     /// through the fixture's ctx_id substitution map at replay time — see
     /// [`replay_shape_d`]). Catches an identity mixup (right COUNT, wrong
@@ -929,6 +943,86 @@ struct ParsedExpected {
     ctx_id: Option<String>,
     /// REG-10 Phase 9c: `expected.registry_state.status`, nested one level.
     registry_state_status: Option<String>,
+}
+
+/// Spec b8601e2 (spec issue #41, spec commit `6dce8d0`): the leak-invariance
+/// property `expected.total_estimate_constraints` pins in place of an
+/// exact-value `total_estimate`, for a search whose result depends on a
+/// POST-SQL refinement (`vis-005` scenario index 2's `derived_from`
+/// filter) that this registry's `total_estimate` (`DESIGN-01`, both
+/// storage crates) legitimately does not reflect. Every field here is read
+/// straight off the fixture by [`parse_total_estimate_constraints`] rather
+/// than hardcoded, so a future spec reword of the conformant/non-conformant
+/// sets fails the PARSE (loudly, via Shape D's parse-all-or-nothing rule)
+/// instead of this harness silently drifting out of sync with the spec's
+/// own numbers.
+#[derive(Debug, Clone)]
+struct TotalEstimateConstraints {
+    /// `conformant_values_for_this_setup`: an observed `total_estimate`
+    /// MUST be one of these values.
+    conformant_values: Vec<u64>,
+    /// `non_conformant_values_for_this_setup`: an observed `total_estimate`
+    /// MUST NOT be any of these values. Checked independently of (and
+    /// before) `conformant_values` so a value absent from BOTH lists still
+    /// fails loudly rather than passing by omission from the non-conformant
+    /// side alone.
+    non_conformant_values: Vec<u64>,
+    /// `MAY_be_omitted_entirely`: when `true`, a response body with no
+    /// `total_estimate` key at all is itself conformant — the response
+    /// need not be checked against `conformant_values` in that case.
+    may_be_omitted: bool,
+}
+
+/// Parse `expected.total_estimate_constraints`. `None` when the object
+/// carries any key outside the recognized set, or when any of the three
+/// asserted sub-keys (`MAY_be_omitted_entirely`,
+/// `conformant_values_for_this_setup`, `non_conformant_values_for_this_setup`)
+/// is missing or the wrong shape — the same parse-all-or-nothing discipline
+/// [`parse_expected`] applies to its own top-level allowlist.
+/// `exact_value_not_pinned`, `MUST_NOT_count_the_private_context`, and
+/// `MUST_be_invariant_across_non_producer_requesters` are recognized but
+/// purely descriptive here: the first restates why this key exists at all
+/// instead of a literal `total_estimate`; the second is covered by
+/// `conformant_values_for_this_setup` excluding the count that would
+/// include the private context (`2`, for this fixture's two-context setup)
+/// via `non_conformant_values_for_this_setup`; the third — cross-requester
+/// invariance — is asserted separately, on live registry responses, by
+/// `vis005_private_audience_search_excluded_via_derived_from`'s
+/// `total_estimate_for` block (audience member vs. outsider on the
+/// identical `derived_from` query), since no second corpus scenario issues
+/// the same `derived_from` query as a different non-producer requester for
+/// this per-scenario struct to compare against.
+fn parse_total_estimate_constraints(v: &Value) -> Option<TotalEstimateConstraints> {
+    let obj = v.as_object()?;
+    const KNOWN: &[&str] = &[
+        "exact_value_not_pinned",
+        "MUST_NOT_count_the_private_context",
+        "MUST_be_invariant_across_non_producer_requesters",
+        "MAY_be_omitted_entirely",
+        "conformant_values_for_this_setup",
+        "non_conformant_values_for_this_setup",
+    ];
+    if obj.keys().any(|k| !KNOWN.contains(&k.as_str())) {
+        return None;
+    }
+    let may_be_omitted = obj.get("MAY_be_omitted_entirely")?.as_bool()?;
+    let conformant_values = obj
+        .get("conformant_values_for_this_setup")?
+        .as_array()?
+        .iter()
+        .map(Value::as_u64)
+        .collect::<Option<Vec<_>>>()?;
+    let non_conformant_values = obj
+        .get("non_conformant_values_for_this_setup")?
+        .as_array()?
+        .iter()
+        .map(Value::as_u64)
+        .collect::<Option<Vec<_>>>()?;
+    Some(TotalEstimateConstraints {
+        conformant_values,
+        non_conformant_values,
+        may_be_omitted,
+    })
 }
 
 /// Parse an `expected` object shared by both scenario forms. Returns
@@ -947,7 +1041,9 @@ struct ParsedExpected {
 /// `search_excludes_private_with_audience_member_listed` (`vis-005`) is
 /// recognized but purely descriptive — it restates, rather than adds to,
 /// the `matches_count`/`matches_ctx_ids` assertion already scoping that
-/// same scenario.
+/// same scenario. As of spec b8601e2, `total_estimate_constraints`
+/// (`vis-005` scenario index 2) is ALSO recognized and asserted — see
+/// [`TotalEstimateConstraints`] and [`parse_total_estimate_constraints`].
 fn parse_expected(expected: &Value) -> Option<ParsedExpected> {
     let obj = expected.as_object()?;
     const RECOGNIZED: &[&str] = &[
@@ -956,6 +1052,10 @@ fn parse_expected(expected: &Value) -> Option<ParsedExpected> {
         "error_code",
         "matches_count",
         "total_estimate",
+        // Spec b8601e2 (spec issue #41): the leak-invariance replacement
+        // for an exact-value `total_estimate` pin -- see
+        // [`TotalEstimateConstraints`].
+        "total_estimate_constraints",
         "matches_ctx_ids",
         "search_excludes_private_with_audience_member_listed",
         "match_summary_contains",
@@ -1008,12 +1108,21 @@ fn parse_expected(expected: &Value) -> Option<ParsedExpected> {
             Some(rs_obj.get("status")?.as_str()?.to_string())
         }
     };
+    // `expected.total_estimate_constraints` is recognized only in the
+    // shape [`parse_total_estimate_constraints`] understands -- any other
+    // shape fails the whole parse, same discipline as `body`/
+    // `registry_state` above.
+    let total_estimate_constraints = match obj.get("total_estimate_constraints") {
+        None => None,
+        Some(v) => Some(parse_total_estimate_constraints(v)?),
+    };
     Some(ParsedExpected {
         status,
         error_code: want_error_code(expected),
         matches_count: expected.get("matches_count").and_then(Value::as_u64),
         match_summary_contains: expected.get("match_summary_contains").cloned(),
         total_estimate: expected.get("total_estimate").and_then(Value::as_u64),
+        total_estimate_constraints,
         matches_ctx_ids,
         body_empty_array,
         ctx_id,
@@ -1046,6 +1155,7 @@ fn parse_single_exchange_scenario(fx: &Value) -> Option<ShapeDScenario> {
         want_matches_count: expected.matches_count,
         want_match_summary_contains: expected.match_summary_contains,
         want_total_estimate: expected.total_estimate,
+        want_total_estimate_constraints: expected.total_estimate_constraints,
         want_matches_ctx_ids: expected.matches_ctx_ids,
         contributors_for_seed: Vec::new(),
         want_body_empty_array: expected.body_empty_array,
@@ -1122,41 +1232,44 @@ fn parse_scenarios_array(scenarios: &[Value]) -> Option<Vec<ShapeDScenario>> {
                 }
             };
             let expected = parse_expected(sc.get("expected")?)?;
-            // REG-10 Phase 9b DESIGN-01 carve-out: `total_estimate` is
-            // recognized and EXACT-VALUE-asserted everywhere EXCEPT a
-            // `derived_from`-filtered search. Both `SqliteStore::search`
-            // and `PgStore::search` compute `total_estimate` from
+            // REG-10 Phase 9b DESIGN-01 carve-out, UPDATED for spec b8601e2
+            // (spec issue #41): `total_estimate` is recognized and
+            // EXACT-VALUE-asserted everywhere EXCEPT a `derived_from`-
+            // filtered search. Both `SqliteStore::search` and
+            // `PgStore::search` compute `total_estimate` from
             // `COUNT(*) OVER ()` riding the SAME SQL scan that applies
             // RFC-ACDP-0008 §4.5 visibility -- but `derived_from` (like
             // `status`/`tags`) is a documented POST-SQL refinement applied
             // in Rust afterward (see the `DESIGN-01` comments in
             // `acdp-registry-sqlite`/`acdp-registry-pg`'s `store.rs`), so
             // `total_estimate` is an intentional pre-refinement UPPER BOUND
-            // for such a search, not the post-filter count `vis-005`
-            // scenario 2 (`derived_from=<private ctx_id>`) pins at 0. This
-            // is NOT a conformance divergence -- the spec explicitly
-            // licenses the approximation: `total_estimate` "May be
-            // approximate; not guaranteed to be exact"
+            // for such a search, not the post-filter count. This is NOT a
+            // conformance divergence -- the spec itself now agrees: spec
+            // commit `6dce8d0` replaced `vis-005` scenario index 2's old
+            // exact-value `total_estimate: 0` pin with
+            // `expected.total_estimate_constraints` (parsed above, inside
+            // `expected`, into `expected.total_estimate_constraints`) --
+            // a LEAK-INVARIANCE property, not an exact count. `total_estimate`
+            // "May be approximate; not guaranteed to be exact"
             // (`schemas/json/acdp-search-response.schema.json`), "SHOULD
             // NOT be relied upon for exact counts"
             // (`rfcs/RFC-ACDP-0005-discovery.md:219`), and the spec's own
             // `examples/search/empty-page-post-filter-response.json` ships
             // the identical shape (`{"matches": [], "total_estimate": 12}`)
-            // -- an empty post-filtered page with a non-zero estimate. The
-            // fixture's literal `0` is one of several conformant values
-            // for this scenario; this registry emits another. Confirmed
-            // empirically: `matches` correctly scopes to empty (proving the
-            // `derived_from` filter and the ctx_id substitution both
-            // work), while `total_estimate` reflects the (harmless --
-            // already `q`-visible) pre-refinement scan count. Fixing it to
-            // match the fixture's literal value would mean pushing
-            // `derived_from` into SQL alongside visibility -- a store-crate
-            // change, out of this phase's `conformance.rs`-only scope, and
-            // not required by the spec. EXACT VALUE is never asserted for
-            // a `derived_from`-filtered scenario; every other scenario
-            // keeps the full assertion. What this carve-out does NOT
-            // excuse: LEAK-INVARIANCE (RFC-ACDP-0005 §2.5.5 Q2's MUST) is
-            // asserted separately, on the live registry, in
+            // -- an empty post-filtered page with a non-zero estimate.
+            // Confirmed empirically: `matches` correctly scopes to empty
+            // (proving the `derived_from` filter and the ctx_id
+            // substitution both work), while `total_estimate` reflects the
+            // (harmless -- already `q`-visible) pre-refinement scan count,
+            // one of `total_estimate_constraints.conformant_values_for_this_setup`.
+            // EXACT VALUE is never asserted for a `derived_from`-filtered
+            // scenario; every other scenario keeps the full assertion.
+            // What this carve-out does NOT excuse: the constraint object's
+            // own conformant/non-conformant bounds ARE asserted below
+            // (`want_total_estimate_constraints`, checked in
+            // [`replay_shape_d`]), and LEAK-INVARIANCE proper (RFC-ACDP-0005
+            // §2.5.5 Q2's MUST) is asserted separately, on the live
+            // registry, in
             // `vis005_private_audience_search_excluded_via_derived_from`.
             // This substring match is a CLASS rule (any future fixture
             // path containing `derived_from=` inherits the same exemption)
@@ -1178,6 +1291,7 @@ fn parse_scenarios_array(scenarios: &[Value]) -> Option<Vec<ShapeDScenario>> {
                 want_matches_count: expected.matches_count,
                 want_match_summary_contains: expected.match_summary_contains,
                 want_total_estimate,
+                want_total_estimate_constraints: expected.total_estimate_constraints,
                 want_matches_ctx_ids: expected.matches_ctx_ids,
                 contributors_for_seed,
                 want_body_empty_array: expected.body_empty_array,
@@ -1870,6 +1984,61 @@ async fn replay_shape_d(name: &str, plan: &ShapeDPlan) -> ShapeDResult {
                     mismatch = Some(format!(
                         "{name}: total_estimate {got:?} != {want}; body = {body_json}"
                     ));
+                }
+            }
+        }
+        // Spec b8601e2 (spec issue #41): `expected.total_estimate_constraints`
+        // — the leak-invariance property that replaced an exact-value
+        // `total_estimate` pin for a `derived_from`-filtered search
+        // (`vis-005` scenario index 2). Every bound here is read off the
+        // fixture itself ([`parse_total_estimate_constraints`]), not
+        // hardcoded, so a future spec reword of the conformant/
+        // non-conformant sets changes what THIS check enforces rather than
+        // silently going stale. Checked in this order: (1) an absent
+        // `total_estimate` is conformant iff `MAY_be_omitted_entirely`; (2)
+        // a present value MUST NOT be one of `non_conformant_values`; (3) a
+        // present value MUST be one of `conformant_values`. This does not
+        // re-derive the cross-requester (`MUST_be_invariant_across_non_
+        // producer_requesters`) half of the leak-invariance property —
+        // that needs a second, same-query request from a different
+        // requester, which no single scenario here carries in isolation;
+        // it is asserted separately, on live registry responses, in
+        // `vis005_private_audience_search_excluded_via_derived_from`'s
+        // `total_estimate_for` block.
+        if mismatch.is_none() {
+            if let Some(constraints) = &sc.want_total_estimate_constraints {
+                let got = body_json.get("total_estimate").and_then(Value::as_u64);
+                match got {
+                    None if !constraints.may_be_omitted => {
+                        mismatch = Some(format!(
+                            "{name}: total_estimate is absent from the response body, but this \
+                             fixture's total_estimate_constraints does not set \
+                             MAY_be_omitted_entirely -- a value is required here; body = \
+                             {body_json}"
+                        ));
+                    }
+                    None => {
+                        // Conformant: omission is explicitly licensed.
+                    }
+                    Some(v) if constraints.non_conformant_values.contains(&v) => {
+                        mismatch = Some(format!(
+                            "{name}: total_estimate {v} is a NON-CONFORMANT value for this \
+                             setup per total_estimate_constraints.non_conformant_values_for_this_setup \
+                             {:?}; body = {body_json}",
+                            constraints.non_conformant_values
+                        ));
+                    }
+                    Some(v) if !constraints.conformant_values.contains(&v) => {
+                        mismatch = Some(format!(
+                            "{name}: total_estimate {v} is not among \
+                             total_estimate_constraints.conformant_values_for_this_setup {:?}; \
+                             body = {body_json}",
+                            constraints.conformant_values
+                        ));
+                    }
+                    Some(_) => {
+                        // Conformant: a listed value, not a forbidden one.
+                    }
                 }
             }
         }
@@ -3329,8 +3498,11 @@ async fn vis005_private_audience_search_excluded_via_derived_from() {
     // to check).
     assert_eq!(plan.scenarios[2].want_status, 200);
     assert_eq!(plan.scenarios[2].want_matches_count, Some(0));
-    // NOT asserting total_estimate's EXACT VALUE here, deliberately: the
-    // fixture pins it at 0, but this registry's `total_estimate` (both
+    // NOT asserting total_estimate's EXACT VALUE here, deliberately: spec
+    // commit `6dce8d0` (spec issue #41) replaced this scenario's old
+    // exact-value `total_estimate: 0` pin with
+    // `expected.total_estimate_constraints` -- a leak-invariance property,
+    // not an exact count. This registry's `total_estimate` (both
     // `acdp-registry-sqlite` and `acdp-registry-pg`, `DESIGN-01`) is a
     // pre-refinement upper bound computed from the same SQL scan that
     // applies §4.5 visibility -- `derived_from` (like `status`/`tags`) is a
@@ -3338,27 +3510,74 @@ async fn vis005_private_audience_search_excluded_via_derived_from() {
     // `total_estimate` legitimately does not reflect it (verified live:
     // `matches` correctly scopes to empty -- proving substitution AND the
     // derived_from filter both work -- while `total_estimate` returns the
-    // harmless pre-refinement scan count, 1, not 0). This is NOT a
-    // conformance divergence: the spec explicitly licenses the
-    // approximation -- `total_estimate` "May be approximate; not
-    // guaranteed to be exact" (`acdp-search-response.schema.json`),
-    // "SHOULD NOT be relied upon for exact counts"
-    // (`rfcs/RFC-ACDP-0005-discovery.md:219`), and the spec's own
-    // `examples/search/empty-page-post-filter-response.json` ships the
-    // identical shape (empty `matches[]`, non-zero `total_estimate`). The
-    // fixture's literal `0` is one of several conformant values here; this
-    // registry emits another. Fixing it to match the fixture's literal
-    // value would require pushing `derived_from` into SQL, a store-crate
-    // change out of this phase's `conformance.rs`-only scope AND not
-    // required by the spec. See the `want_total_estimate` carve-out in
-    // `parse_scenarios_array`. What this carve-out does NOT excuse:
-    // LEAK-INVARIANCE (RFC-ACDP-0005 §2.5.5 Q2's MUST) is still asserted
-    // below, on a live registry response, regardless of exact value.
+    // harmless pre-refinement scan count, 1). This is NOT a conformance
+    // divergence: the spec itself now agrees -- `total_estimate` "May be
+    // approximate; not guaranteed to be exact"
+    // (`acdp-search-response.schema.json`), "SHOULD NOT be relied upon for
+    // exact counts" (`rfcs/RFC-ACDP-0005-discovery.md:219`), and the
+    // spec's own `examples/search/empty-page-post-filter-response.json`
+    // ships the identical shape (empty `matches[]`, non-zero
+    // `total_estimate`). `1` is one of `total_estimate_constraints`'s own
+    // `conformant_values_for_this_setup` (checked below, read off the
+    // fixture, not hardcoded here). Fixing this registry to instead emit
+    // the exact post-filter count would require pushing `derived_from`
+    // into SQL, a store-crate change out of this phase's
+    // `conformance.rs`-only scope AND not required by the spec. See the
+    // `want_total_estimate` carve-out in `parse_scenarios_array`. What
+    // this carve-out does NOT excuse: `total_estimate_constraints`'s own
+    // conformant/non-conformant bounds ARE asserted by `replay_shape_d`
+    // below, and cross-requester LEAK-INVARIANCE (RFC-ACDP-0005 §2.5.5
+    // Q2's MUST) is asserted separately, further below, on live registry
+    // responses, regardless of exact value.
     assert_eq!(
         plan.scenarios[2].want_total_estimate, None,
         "the derived_from-filtered scenario must carry NO EXACT-VALUE total_estimate \
          assertion -- see the DESIGN-01 carve-out comment above; leak-invariance is still \
          asserted separately, below"
+    );
+    // Spec b8601e2 (spec issue #41): confirm the fixture's own
+    // total_estimate_constraints parsed exactly as the fixture states it --
+    // NOT hardcoded here, read back from the parsed plan, which itself read
+    // it off the fixture in `parse_total_estimate_constraints`. A future
+    // spec reword of these values changes this assertion's failure message
+    // (and, more importantly, changes what `replay_shape_d` actually
+    // enforces above) rather than this test silently asserting stale
+    // numbers.
+    let constraints = plan.scenarios[2]
+        .want_total_estimate_constraints
+        .as_ref()
+        .expect(
+            "vis-005 scenario index 2 must carry expected.total_estimate_constraints as of \
+             spec b8601e2",
+        );
+    let fixture_constraints = &raw_scenarios[2]["expected"]["total_estimate_constraints"];
+    let fixture_conformant: Vec<u64> = fixture_constraints["conformant_values_for_this_setup"]
+        .as_array()
+        .expect("fixture carries conformant_values_for_this_setup")
+        .iter()
+        .map(|v| v.as_u64().expect("conformant value must be a u64"))
+        .collect();
+    let fixture_non_conformant: Vec<u64> = fixture_constraints
+        ["non_conformant_values_for_this_setup"]
+        .as_array()
+        .expect("fixture carries non_conformant_values_for_this_setup")
+        .iter()
+        .map(|v| v.as_u64().expect("non-conformant value must be a u64"))
+        .collect();
+    let fixture_may_be_omitted = fixture_constraints["MAY_be_omitted_entirely"]
+        .as_bool()
+        .expect("fixture carries MAY_be_omitted_entirely");
+    assert_eq!(
+        constraints.conformant_values, fixture_conformant,
+        "parsed conformant_values must match the fixture verbatim"
+    );
+    assert_eq!(
+        constraints.non_conformant_values, fixture_non_conformant,
+        "parsed non_conformant_values must match the fixture verbatim"
+    );
+    assert_eq!(
+        constraints.may_be_omitted, fixture_may_be_omitted,
+        "parsed may_be_omitted must match the fixture verbatim"
     );
     assert!(
         plan.scenarios[2]
@@ -6489,7 +6708,14 @@ fn fixture_family_panics_naming_file_when_id_missing() {
 /// pre-refinement-upper-bound carve-out (`DESIGN-01`, see the comment in
 /// `parse_scenarios_array`); leak-invariance is asserted there instead, and
 /// `derived_from_carve_out_matches_exactly_one_corpus_scenario` guards the
-/// carve-out from silently widening to a second fixture. And
+/// carve-out from silently widening to a second fixture. As of spec
+/// b8601e2 (spec issue #41), that exception is no longer merely a
+/// registry-side carve-out: the spec's own fixture replaced `vis-005`
+/// scenario 2's exact-value `total_estimate: 0` pin with
+/// `expected.total_estimate_constraints`, a leak-invariance property this
+/// harness now asserts directly (`want_total_estimate_constraints`,
+/// [`TotalEstimateConstraints`], checked in [`replay_shape_d`]) — bounds
+/// read off the fixture itself, not hardcoded. And
 /// two further Shape D capabilities are exercised for the first time
 /// against real fixtures rather than only the Phase 8 synthetic proof:
 /// per-scenario router rebuild on `registry_capabilities_subset.
