@@ -133,9 +133,9 @@ pub fn build_router<S: ExtendedRegistryStore + 'static>(state: AppState<S>) -> R
         // events): admin-gated retract/republish attributed to the
         // registry's own DID — the policy/legal takedown lever for when a
         // producer is unavailable. Auth-gated by `auth.admin_tokens`, same as
-        // `/admin/status` and `/admin/lineages/{id}/audit` above — but NOT
-        // every `/admin/*` route: `GET /admin/contexts` (in `admin_router`
-        // below) never checks `auth.admin_tokens` at all. Requires
+        // `/admin/status` and `/admin/lineages/{id}/audit` above — and the
+        // same as `GET /admin/contexts` (in `admin_router` below): every
+        // `/admin/*` route checks `auth.admin_tokens`. Requires
         // `[lifecycle] enabled` (501 otherwise). Ships in every build.
         .route(
             "/admin/contexts/{ctx_id}/retract",

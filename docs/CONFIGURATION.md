@@ -139,7 +139,7 @@ values for illustration. Env var = `ACDP_REGISTRY_` + the bracketed path.
 | `token_leeway_seconds` | u64 | `30` | Clock-skew tolerance for `exp`. |
 | `anonymous_public_reads` | bool | `false` | Allow unauthenticated reads of `public` contexts. Opt in for discovery hubs. |
 | `require_tenant` | bool | `false` | Strict multi-tenancy: requests resolving to no tenant are denied. See [MULTI-TENANCY.md](MULTI-TENANCY.md). |
-| `admin_tokens` | string[] | `[]` | Bearer tokens for `/admin/*`. Empty disables the admin-bearer-gated routes (`/admin/status`, `/admin/lineages/{id}/audit`, `/admin/contexts/{id}/retract`, `/admin/contexts/{id}/republish`, `/admin/pinned-keys/reload`) — it does **not** disable `GET /admin/contexts`, which never checks `admin_tokens`. See [HTTP-API.md#admin](HTTP-API.md#admin). |
+| `admin_tokens` | string[] | `[]` | Bearer tokens for `/admin/*`. Empty disables every admin-bearer-gated route: `/admin/status`, `/admin/lineages/{id}/audit`, `/admin/contexts/{id}/retract`, `/admin/contexts/{id}/republish`, `GET /admin/contexts`, `/admin/pinned-keys/reload`. See [HTTP-API.md#admin](HTTP-API.md#admin). |
 
 #### `[[auth.tenant_agents]]`
 
