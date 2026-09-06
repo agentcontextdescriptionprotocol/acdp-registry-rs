@@ -740,6 +740,29 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **BREAKING** (`REG-11` Phase 3, `#133`): `GET /admin/contexts` is now
+  gated behind `require_admin_bearer`, like every other `/admin/*` route.
+  A registry with an empty `auth.admin_tokens` (the shipped default in both
+  `config/registry.example.toml` and `docker/config.docker.toml`) now
+  answers 403 `admin-only` where it previously served rows to anyone —
+  operators who rely on this route MUST configure at least one entry in
+  `auth.admin_tokens` and send it as `Authorization: Bearer <token>`.
+  `caller_from_headers` was deliberately removed from this handler: the
+  admin gate has already resolved "who is calling", and re-parsing the same
+  header a second time under `caller_from_headers`'s rules would hand the
+  admin token to `validate_bearer`, which fails on a non-JWT and returns 403
+  whenever `auth.enabled = true` — precisely the registries that configure
+  admin tokens. `tenant_for_request` is still called; it is a separate
+  resolution step, deliberately tolerant of a non-JWT bearer. The frozen
+  disclosure rule: an admin bearer counts as an **authenticated but
+  unnamed** caller for the RFC-ACDP-0008 §4.5 public arm. Restricted and
+  private bodies are never disclosed to the admin listing — the SQL
+  predicate's restricted/private arms both require a non-NULL requester DID
+  (`LIST_VISIBILITY_SQLITE`, `crates/acdp-registry-sqlite/src/store.rs:423-436`,
+  and its Postgres twin, `crates/acdp-registry-pg/src/store.rs:171-175`),
+  which a `None` requester can never reach. Both shipped configs gained a
+  commented `# admin_tokens = ["<generate out of band>"]` under `[auth]` so
+  the now-mandatory setting is discoverable.
 - **Restored the RFC-ACDP-0008 §4.5 `anonymous_public_reads` disjunct to
   `list_contexts`** (`REG-11` Phase 2, `#133`): the pg/sqlite list-visibility
   predicate was a bit-for-bit copy of `search`'s disclosure predicate MINUS
@@ -750,8 +773,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   mirroring `RegistryStore::search`'s parameter of the same name; both SQL
   backends' visibility predicate now reads
   `Public => anonymous_public_reads || requester.is_some()`, arm-for-arm
-  with `search` (`acdp-registry-pg/src/store.rs:167-171`,
-  `acdp-registry-sqlite/src/store.rs:419-427`; the SQLite `LIST_VISIBILITY_SQLITE`
+  with `search` (`acdp-registry-pg/src/store.rs:171-175`,
+  `acdp-registry-sqlite/src/store.rs:423-436`; the SQLite `LIST_VISIBILITY_SQLITE`
   const grows from three `?` placeholders, all bound to the requester, to
   five: `?req`, `?anon`, `?req`×3).
   **Observable behavior is unchanged in this release**: the sole production

@@ -4449,6 +4449,12 @@ fn json_contains(got: &Value, want: &Value) -> Result<(), String> {
 /// flag is off, the admin route must be mounted AND the publish path must
 /// still perform full verification. This guards the "compile-on / runtime-
 /// off" matrix cell that's documented but otherwise untested.
+///
+/// REG-11 Phase 3 (#133): `GET /admin/contexts` is now admin-bearer gated,
+/// so proving the route is MOUNTED requires a valid token and an assertion
+/// of exactly 200 — a naive `!= 200` would pass identically for a 403
+/// (gated-but-mounted) and a 404 (never mounted), proving nothing about
+/// mounting either way.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(feature = "playground")]
 async fn playground_compiled_in_but_runtime_disabled_keeps_admin_route() {
@@ -4468,19 +4474,23 @@ async fn playground_compiled_in_but_runtime_disabled_keeps_admin_route() {
     ));
     let mut cfg = config();
     cfg.playground.enabled = false;
+    cfg.auth.admin_tokens = vec!["secret-admin".into()];
     let state = AppStateInner::new(server, auth, None, cfg, None);
     let app = build_router(state);
     let resp = app
         .oneshot(
             Request::builder()
                 .uri("/admin/contexts")
+                .header("authorization", "Bearer secret-admin")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
     // The admin route is wired in at compile time; the playground flag
-    // only affects whether `publish` skips DID verification.
+    // only affects whether `publish` skips DID verification. A valid admin
+    // bearer must still reach it and get a real listing (200), not 403
+    // (gated) or 404 (unmounted) — both would trivially satisfy `!= 200`.
     assert_eq!(resp.status(), StatusCode::OK);
 }
 

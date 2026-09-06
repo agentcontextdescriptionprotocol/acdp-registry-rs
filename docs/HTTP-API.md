@@ -31,16 +31,12 @@ The complete inbound surface of `acdp-registry`. Routes are assembled in
 | GET  | `/admin/lineages/{lineage_id}/audit` | admin bearer | always |
 | POST | `/admin/contexts/{ctx_id}/retract`   | admin bearer | always (501 unless `lifecycle.enabled`) |
 | POST | `/admin/contexts/{ctx_id}/republish` | admin bearer | always (501 unless `lifecycle.enabled`) |
-| GET  | `/admin/contexts`                | optional bearer\* | `playground` feature |
+| GET  | `/admin/contexts`                | admin bearer | `playground` feature |
 | POST | `/admin/pinned-keys/reload`      | admin bearer | `playground` feature |
 
 The `/auth/*` routes are mounted at runtime only when `auth.enabled = true`. The
 two `/admin/{contexts,pinned-keys}` routes are compiled in only with the
 `playground` Cargo feature; `/admin/status` always ships.
-
-\* Despite living under `/admin/`, `GET /admin/contexts` is **not** gated by
-the admin bearer (`auth.admin_tokens`) — see [Admin](#admin) below for what it
-actually checks.
 
 ## Media types and middleware
 

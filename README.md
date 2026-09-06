@@ -146,7 +146,7 @@ Selected routes (the full surface, including request/response shapes, is in
 | GET    | `/admin/lineages/{id}/audit`      | On-demand lineage integrity audit (admin bearer). |
 | POST   | `/admin/contexts/{id}/retract`    | Admin retraction (admin bearer). |
 | POST   | `/admin/contexts/{id}/republish`  | Admin republish (admin bearer). |
-| GET    | `/admin/contexts`                 | Compile-gated by `playground`; **not** admin-bearer gated — see [docs/HTTP-API.md#admin](docs/HTTP-API.md#admin). |
+| GET    | `/admin/contexts`                 | Compile-gated by `playground` (admin bearer). |
 | POST   | `/admin/pinned-keys/reload`       | Compile-gated by `playground` (admin bearer). |
 
 Visibility (`public` / `restricted` / `private`) is enforced server-side per
