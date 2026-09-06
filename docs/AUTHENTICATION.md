@@ -105,6 +105,99 @@ On every bearer-authenticated request the registry checks the signature, `exp`
 `acdp.registry` binding, and the revocation store. A revoked or expired `jti` is
 rejected with `403 not_authorized`.
 
+## Presenting a bearer
+
+Two bearer parsers coexist and they do not agree. Both are deliberate and both
+are locked by tests; the difference is undocumented rather than accidental, and
+it is what this section exists to state.
+
+| Route group | Parser | Unrecognised header shape |
+|---|---|---|
+| `/contexts/*`, `/lineages/*`, and the other ordinary read/publish routes | `extract_bearer` (`crates/acdp-registry-auth/src/service.rs:400-405`) | treated as **anonymous** |
+| `/admin/*` | `require_admin_bearer` (`crates/acdp-registry-core/src/handlers/admin.rs:679-693`) | rejected with **403** |
+
+### Unrecognised means anonymous on the ordinary routes
+
+`caller_from_headers` (`crates/acdp-registry-core/src/handlers/context.rs:1348-1365`)
+returns `Ok(None)` — an anonymous caller — in three cases:
+
+- `auth.enabled = false`, regardless of what the client sent;
+- no `Authorization` header, or a value the HTTP layer will not hand over as a
+  string — `HeaderValue::to_str` rejects any byte outside visible ASCII, which
+  is broader than "not valid UTF-8" (`Bearer café` is valid UTF-8 and still
+  fails);
+- any value `extract_bearer` does not recognise, including a non-`Bearer` scheme.
+
+Only a **well-formed** bearer whose token then fails validation is rejected, with
+`403 not_authorized` — auth failures on this registry are `403`, never `401`, and
+no `WWW-Authenticate` challenge is emitted (see
+[HTTP-API.md](HTTP-API.md#error-envelope)). A client whose token merely expired sees that
+explicitly rather than being silently downgraded.
+
+The consequence worth knowing when debugging: **a typo in the scheme is not an
+auth failure at all.** `Authorizaton: Bearer …` (misspelled header name),
+`Basic …`, or `BEARER …` do not reach token validation — the request simply
+proceeds as anonymous.
+
+What the caller then sees depends on the route and on
+`auth.anonymous_public_reads`, which ships as `false`. Anonymous access is
+subject to the RFC-ACDP-0008 §4.5 visibility rules, so the same malformed header
+can surface as a refusal on one route and as a short, successfully-filtered
+result set on another. The invariant to hold onto while debugging is upstream of
+that: the auth layer did not reject the header, it classified the caller as
+anonymous. If a caller reports missing rows, or an authorization error that
+names anonymity rather than a bad token, suspect the header shape before
+suspecting the token.
+
+On `/admin/*` the same inputs return `403` — absent, non-UTF-8, and unrecognised
+headers are all refused, and an empty `auth.admin_tokens` list disables the routes
+outright (`admin.rs:684`).
+
+### What each parser accepts
+
+`extract_bearer` strips `"Bearer "` or `"bearer "` and then trims the remaining
+token. `require_admin_bearer` strips `"Bearer "` only, and does not trim.
+
+Neither is case-insensitive: both hard-code their prefixes, so `BEARER` and
+`BeArEr` are rejected by both.
+
+| `Authorization` value | `/contexts/*` | `/admin/*` |
+|---|---|---|
+| `Bearer <token>` | `<token>` | `<token>` |
+| `bearer <token>` | `<token>` | **403** |
+| `Bearer  <token>` (two spaces) | `<token>` | token is `" <token>"`, so **403** |
+| `Bearer <token>` + trailing space | `<token>` | **depends on protocol — see below** |
+| `BEARER <token>`, `BeArEr <token>` | anonymous | 403 |
+| `Bearer<TAB><token>` | anonymous | 403 |
+| `Basic <token>`, bare `<token>`, empty | anonymous | 403 |
+
+Both behaviours on the admin side are pinned by tests, so loosening either is a
+deliberate reviewed change rather than a refactor: `bearer_scheme_is_case_sensitive`
+(`admin.rs:854-863`) and `rejects_token_with_extra_whitespace` (`admin.rs:866-873`).
+
+#### Trailing whitespace depends on the HTTP version
+
+Trailing whitespace in the header *value* never reaches either parser over
+HTTP/1.1: `httparse` strips trailing SP/HTAB/CR/LF from every header value while
+parsing the request. Over HTTP/2, HPACK carries the value verbatim and nothing
+strips it. The registry serves both.
+
+So `Authorization: Bearer <token> ` (one trailing space) is accepted everywhere
+over HTTP/1.1 — the space is gone before any handler sees it — and on HTTP/2 it
+is accepted by `/contexts/*` (which trims) but **rejected by `/admin/*`** (which
+does not). Only the *trailing* case is protocol-dependent; the two-space case
+above is internal to the value and behaves identically on both.
+
+The practical consequence is that an admin token configured with stray trailing
+whitespace can appear to work in one environment and fail in another, depending
+on whether a proxy or client negotiated HTTP/2. Startup validation now refuses
+such entries outright — see [#161](https://github.com/agentcontextdistributionprotocol/acdp-registry-rs/issues/161)
+and the admin-token rules in [CONFIGURATION.md](CONFIGURATION.md).
+
+**Practical rule: send exactly `Authorization: Bearer <token>`, one space, no
+surrounding whitespace.** That form is accepted everywhere. Any other spelling
+works on some routes and not others.
+
 ## Signing algorithms
 
 JWT signing is selected by `auth.jwt_signing_alg`:

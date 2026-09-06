@@ -31,7 +31,24 @@ issue. We aim to acknowledge reports within 72 hours.
   resolves to no tenant is denied rather than served unscoped
   (see [docs/MULTI-TENANCY.md](docs/MULTI-TENANCY.md)).
 - Set `auth.admin_tokens` to gate `/admin/*`; an empty list disables those
-  routes entirely. Distribute admin tokens out of band.
+  routes entirely. Distribute admin tokens out of band. Every entry must be
+  non-blank and free of surrounding whitespace — startup refuses otherwise
+  (#161). This matters because the allowlist compare folds over **every**
+  entry, so a single blank entry is admitted alongside real tokens, leaving a
+  deployment that looks correctly configured. Reaching it requires
+  `Authorization: Bearer ` to keep its trailing space, which happens over
+  HTTP/2 but not HTTP/1.1 (where the request parser strips it) — so the
+  exposure is protocol-dependent, and the registry serves both. If you template
+  this list from environment variables, make sure an unset variable fails your
+  deploy rather than producing an empty entry.
+- A non-`Bearer` or malformed `Authorization` header is treated as **anonymous**
+  on the ordinary read/publish routes, not refused — a typo'd scheme never
+  reaches token validation. What the caller then sees depends on the route and
+  on `auth.anonymous_public_reads` (default `false`), so it may be a refusal or
+  a filtered result set; either way the auth layer did not reject the header.
+  `/admin/*` refuses the same input with `403`. See
+  [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md) for the exact rules; do not
+  rely on a malformed header producing an authentication error.
 - Leave the per-agent rate limits (`limits.publish_rate_per_minute`,
   `limits.challenge_rate_per_minute`) enabled; front multi-replica deployments
   with a shared/proxy limiter for a global bound.
