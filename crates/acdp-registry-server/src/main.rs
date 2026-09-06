@@ -135,6 +135,30 @@ fn validate_config(cfg: &RegistryConfig) -> anyhow::Result<()> {
              auth.require_tenant=true."
         );
     }
+    // #137: tenancy on the memory backend serves nothing, so refuse the
+    // combination rather than starting a registry that answers every read
+    // with zero rows. The guard above forces `require_tenant=true` whenever
+    // `tenant_agents` is set, so this config is always strict. `MemoryStore`
+    // (`memory_ext.rs`) overrides none of the three tenancy methods on
+    // `ExtendedRegistryStore`, so it inherits their untenanted defaults:
+    // `set_tenant_of_ctx` is a no-op and `tenant_of_ctx`/`tenants_of_ctxs`
+    // report `"default"` for every row. `"default"` is `RESERVED_TENANT`,
+    // which `reject_reserved_tenant` refuses to accept from a header or a
+    // token claim — so no caller can ever assert the one tenant every row
+    // reports, and every tenant-scoped read matches nothing. Publishes still
+    // succeed — they just record no tenant — so a warning would have nothing
+    // working to preserve on the read path. Note this keys on `tenant_agents`
+    // only; `require_tenant` alone on this backend is the same failure and is
+    // not yet refused (#156).
+    if !cfg.auth.tenant_agents.is_empty() && matches!(cfg.storage.backend, StorageBackend::Memory) {
+        anyhow::bail!(
+            "auth.tenant_agents is configured (multi-tenant) but storage.backend=memory, \
+             which is not tenancy-aware: it records no tenant for a published context and \
+             reports the reserved 'default' tenant for every row, which no caller is \
+             permitted to assert. Every tenant-scoped read would return zero rows. Use \
+             the sqlite or postgres backend for a multi-tenant deployment."
+        );
+    }
 
     // ACDP 0.2.0: validate the DID methods this registry will advertise.
     // The publish validator gates on `supported_did_methods`, so an entry
@@ -1428,6 +1452,29 @@ mod tests {
             "tenant_agents without require_tenant must be refused"
         );
         cfg.auth.require_tenant = true;
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    // #137 — the memory backend is not tenancy-aware, so a multi-tenant
+    // config on it would serve zero rows rather than fail.
+    #[test]
+    fn multitenant_on_memory_backend_is_rejected() {
+        use acdp_registry_types::config::TenantAgentBinding;
+        let mut cfg = RegistryConfig::defaults();
+        cfg.auth.tenant_agents = vec![TenantAgentBinding {
+            agent_did: "did:web:agents.example:a".into(),
+            tenant_id: "tenant-a".into(),
+        }];
+        // Set the strict flag explicitly: without it the #17 guard above
+        // fires first and this test would pass for the wrong reason.
+        cfg.auth.require_tenant = true;
+        cfg.storage.backend = StorageBackend::Memory;
+        let err = validate_config(&cfg)
+            .expect_err("the memory backend cannot host a multi-tenant deployment");
+        assert!(err.to_string().contains("tenancy-aware"), "{err}");
+
+        // The same tenancy config on a durable backend still starts.
+        cfg.storage.backend = StorageBackend::Sqlite;
         assert!(validate_config(&cfg).is_ok());
     }
 

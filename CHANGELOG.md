@@ -740,6 +740,40 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+<!-- REG-11 Phase 8 (Lane B) -->
+
+- **BREAKING** (`REG-11` Phase 8, `#137`): `storage.backend = "memory"`
+  combined with a non-empty `[[auth.tenant_agents]]` is now refused at
+  startup. `validate_config` runs before migrations and before the socket
+  is bound, so the process exits with a message naming both the backend and
+  tenancy instead of starting a registry that serves nothing. A deployment
+  that set both previously started cleanly and answered every tenant-scoped
+  read with zero rows; it must now move to the `sqlite` or `postgres`
+  backend, which are tenancy-aware.
+
+  A warning would have nothing working to preserve on the read path.
+  `MemoryStore` (`crates/acdp-registry-server/src/memory_ext.rs`) overrides
+  none of the three tenancy methods on `ExtendedRegistryStore`, so it
+  inherits their untenanted defaults: `set_tenant_of_ctx` is a no-op, and
+  `tenant_of_ctx` / `tenants_of_ctxs` report `default` for every row.
+  `default` is `RESERVED_TENANT`, which `reject_reserved_tenant`
+  (`crates/acdp-registry-core/src/handlers/context.rs`) refuses from both
+  `X-Tenant-Id` and the token claim — so the one tenant every row reports is
+  the one tenant no caller may assert, and the filter matches nothing.
+
+  The new check sits immediately after the existing `#17` guard that
+  refuses `tenant_agents` with `require_tenant = false`, keeping the two
+  tenancy refusals together; because that guard forces strict mode whenever
+  `tenant_agents` is set, the rejected configuration is always the strict
+  one. Every other backend/tenancy combination is unaffected — including
+  `require_tenant = true` with an empty `tenant_agents` on the memory
+  backend, which fails the same way and is **not** refused by this change;
+  that gap is tracked in `#156` and documented in `docs/MULTI-TENANCY.md`.
+  Documented in `docs/MULTI-TENANCY.md` (new "Backend support" section)
+  and `docs/CONFIGURATION.md`.
+
+<!-- end REG-11 Phase 8 -->
+
 - **BREAKING** (`REG-11` Phase 3, `#133`): `GET /admin/contexts` is now
   gated behind `require_admin_bearer`, like every other `/admin/*` route.
   A registry with an empty `auth.admin_tokens` (the shipped default in both

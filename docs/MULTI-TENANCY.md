@@ -43,6 +43,9 @@ On an enforced multi-tenant deployment:
   An unbound token (no claim) may **not** assert a tenant via `X-Tenant-Id`.
 - Configuring any `[[auth.tenant_agents]]` requires `require_tenant = true`;
   startup validation enforces this so tenancy can't be half-enabled.
+- Configuring any `[[auth.tenant_agents]]` also requires a tenancy-aware
+  storage backend (`sqlite` or `postgres`); startup validation refuses
+  `storage.backend = "memory"`. See [Backend support](#backend-support).
 
 In lax mode (`require_tenant = false`) an unbound caller's `X-Tenant-Id` is
 still honored, preserving V0 behavior.
@@ -54,6 +57,26 @@ explicitly-asserted tenant from any source — header or token claim. Allowing a
 caller to assert `default` would alias the entire untenanted bucket, a
 cross-boundary read/write. Untenanted rows remain reachable only through the
 *absence* of any tenant assertion (`None`).
+
+## Backend support
+
+Tenancy requires the `sqlite` or `postgres` backend. The `memory` backend is
+**not** tenancy-aware: configuring any `[[auth.tenant_agents]]` alongside
+`storage.backend = "memory"` is refused at startup.
+
+`MemoryStore` overrides none of the three tenancy methods below, so it inherits
+their untenanted defaults: `set_tenant_of_ctx` is a no-op, and `tenant_of_ctx` /
+`tenants_of_ctxs` report `default` for every row. Because `default` is the
+reserved sentinel above and cannot be asserted by any caller, no tenant a caller
+*can* assert would ever match a row — every tenant-scoped **read** returns zero
+rows. (Publishes still succeed; they simply record no tenant, which is what makes
+the reads empty.) A warning would therefore have nothing working to preserve on
+the read path: the registry would start cleanly and then serve nothing.
+
+> **Known gap (#156).** The refusal keys on `[[auth.tenant_agents]]` being
+> non-empty. `require_tenant = true` with an *empty* `tenant_agents` — tenancy
+> driven entirely by an external issuer's `tenant` claim — is **not** currently
+> refused on the memory backend, and is broken in the same way.
 
 ## How the binding is stored and filtered
 
