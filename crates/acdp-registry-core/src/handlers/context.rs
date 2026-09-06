@@ -287,7 +287,14 @@ pub(crate) fn reconcile_tenant_sources(
 ///
 /// The publish pipeline already carries the producer's signature over
 /// `content_hash`, so this endpoint does NOT require a bearer token.
-/// `Idempotency-Key` is honored when the registry advertises support.
+/// `Idempotency-Key` handling differs by branch: the did:key, pinned-verified,
+/// and production branches delegate to the SDK's `commit_via_store`, which
+/// consults `supports_idempotency_key` itself. The playground unpinned branch
+/// cannot delegate this decision — it too ends up inside `commit_via_store`
+/// (via `publish_unverified_for_tests`), but only after hardcoding `None` for
+/// the idempotency key, so `commit_via_store`'s own gate is a no-op for this
+/// path — so it gates its own manual lookup/record dance on
+/// `supports_idempotency_key` directly (see the `idem_key` binding below).
 pub async fn publish<S: ExtendedRegistryStore + 'static>(
     state: State<Arc<AppState<S>>>,
     headers: HeaderMap,
@@ -488,7 +495,21 @@ async fn publish_inner<S: ExtendedRegistryStore + 'static>(
             .await
             .map_err(|e| RegistryError::Internal(format!("join: {e}")))??
         } else {
-            if let Some(key) = idempotency_key.as_deref() {
+            // #128: `publish_unverified_for_tests` (unlike the SDK's
+            // `commit_via_store`, which the other three branches ride) does
+            // not consult `supports_idempotency_key` on its own, so this
+            // branch must gate itself. Computed once, before the lookup, and
+            // reused at the record site below — NOT two separate `&&`
+            // conditions on `idempotency_key.as_deref()`. Splitting it would
+            // let the lookup and the record disagree: gating only the lookup
+            // still writes a record that a later `supports_idempotency_key =
+            // true` would start replaying against, and gating only the
+            // record still replays today. One binding makes that divergence
+            // unrepresentable.
+            let idem_key = idempotency_key
+                .as_deref()
+                .filter(|_| state.server.capabilities().supports_idempotency_key);
+            if let Some(key) = idem_key {
                 let server2 = server.clone();
                 let agent2 = req.agent_id.clone();
                 let key2 = key.to_string();
@@ -521,7 +542,7 @@ async fn publish_inner<S: ExtendedRegistryStore + 'static>(
             })
             .await
             .map_err(|e| RegistryError::Internal(format!("join: {e}")))??;
-            if let Some(key) = idempotency_key.as_deref() {
+            if let Some(key) = idem_key {
                 let server2 = server.clone();
                 let agent2 = req.agent_id.clone();
                 let key2 = key.to_string();
