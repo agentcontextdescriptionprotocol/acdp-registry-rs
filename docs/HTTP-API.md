@@ -617,10 +617,13 @@ Admin-bearer gated, like every other `/admin/*` route (see the note at the
 top of [Admin](#admin)). The admin bearer authenticates the caller but names
 no agent DID, so under the RFC-ACDP-0008 §4.5 predicate it reaches the
 **public arm only**: `visibility = 'public'` rows are always included, and
-restricted/private rows are never disclosed to this listing — independent of
-`auth.anonymous_public_reads`, which instead governs whether an anonymous
-(no-bearer) caller of `GET /contexts/search` sees public rows. That flag is
-carried on the `CapabilitiesDocument`, and `RegistryServer::search` reads it
+restricted/private rows are never disclosed to this listing — because
+`admin_list` passes `anonymous_public_reads = true` unconditionally
+(`crates/acdp-registry-core/src/handlers/admin.rs:86`), independent of the
+configured `auth.anonymous_public_reads`, which instead governs whether an
+anonymous (no-bearer) caller of `GET /contexts/search` sees public rows. That
+flag is carried on the `CapabilitiesDocument`, and `RegistryServer::search`
+reads it
 off `self.caps`. The tenant filter applies only when a tenant is asserted (an
 `X-Tenant-Id` header or a JWT `tenant` claim); with none, the listing spans
 every tenant rather than defaulting to one.

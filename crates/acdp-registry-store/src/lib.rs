@@ -41,10 +41,14 @@ pub trait ExtendedRegistryStore: RegistryStore + Send + Sync {
     /// results are unaffected by this flag either way.
     ///
     /// `GET /admin/contexts` requires an `auth.admin_tokens` bearer; the
-    /// admin caller is authenticated but unnamed (`requester = None`), so it
-    /// reaches the §4.5 **public arm only** — restricted and private bodies
-    /// are never disclosed to it. The tenant filter below applies when a
-    /// tenant is asserted; otherwise the listing spans tenants.
+    /// admin caller is authenticated but unnamed (`requester = None`). It
+    /// reaches the §4.5 **public arm only** because `admin_list` passes
+    /// `anonymous_public_reads = true` unconditionally
+    /// (`crates/acdp-registry-core/src/handlers/admin.rs:86`), not because a
+    /// `None` requester alone implies that arm — the restricted and private
+    /// arms remain unreachable to it regardless. The tenant filter below
+    /// applies when a tenant is asserted; otherwise the listing spans
+    /// tenants.
     ///
     /// `tenant` (plan §7): when `Some`, the backend MUST filter rows
     /// at the storage layer so the returned page contains only that

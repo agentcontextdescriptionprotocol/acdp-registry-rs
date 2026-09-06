@@ -1203,10 +1203,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Documentation sweep for the `#133` fix** (`REG-11` Phase 4): removed every
   doc statement and source comment describing `GET /admin/contexts` as
   ungated or as "the one exception" among `/admin/*` routes — `docs/HTTP-API.md`
-  (the route-table footnote, the "Most `/admin/*` routes" paragraph, the "one
-  exception" paragraph, and the route's own "Not admin-bearer gated"
-  paragraph), `docs/OPERATIONS.md` (two "is an exception" / "is not" gated
-  statements), `docs/CONFIGURATION.md` (the `admin_tokens` row's "does not
+  (the "Most `/admin/*` routes" paragraph, the "one exception" paragraph,
+  and the route's own "Not admin-bearer gated" paragraph — the route-table
+  footnote had already been removed in an earlier phase), `docs/OPERATIONS.md`
+  (two "is an exception" / "is not" gated statements),
+  `docs/CONFIGURATION.md` (the `admin_tokens` row's "does not
   disable `GET /admin/contexts`" clause), `crates/acdp-registry-core/src/lib.rs`'s
   route comment ("but NOT every `/admin/*` route"), and
   `crates/acdp-registry-types/src/config.rs`'s `admin_tokens` doc (which named
@@ -1216,16 +1217,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   doc (`crates/acdp-registry-store/src/lib.rs`), the one file this correction
   belongs in that no phase's file list had named.
   **This explicitly supersedes the "Documentation-accuracy pass (`REG-10`
-  docs follow-up)" entry above** (the one claiming `HTTP-API.md`'s "requires
-  the admin bearer... it does not" and describing the gap as "a pre-existing
-  gap... not a behavior change") — that entry was correct when written (PR
+  docs follow-up)" entry under the Documentation section below** (the one
+  claiming `HTTP-API.md`'s "requires the admin bearer... it does not" and
+  describing the gap as "a pre-existing gap... not a behavior change") —
+  that entry was correct when written (PR
   #132, before Phases 2-3 shipped the fix) and is now the opposite of current
   behavior. Read it as history, not as the current contract.
   This is the sentence [SECURITY.md](SECURITY.md)'s "Keep
   `auth.anonymous_public_reads = false` unless the registry is meant to serve
-  every context anonymously" was really about: it needed no edit here, but it
-  only became fully true with this fix — before Phase 3, `GET /admin/contexts`
-  disclosed public contexts to anonymous callers regardless of that setting.
+  world-readable public contexts" was really about: it needed no edit here,
+  but it only became fully true with this fix — before Phase 3,
+  `GET /admin/contexts` disclosed public contexts to anonymous callers
+  regardless of that setting.
   Docs-only; no behavior change. Not compiled locally — `rustdoc` (`docs`
   CI job) is the verification signal for this phase.
 
