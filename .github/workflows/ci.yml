@@ -161,10 +161,13 @@ jobs:
           # without a commit here. Bump deliberately when adopting new
           # fixtures; bump-spec.yml rewrites this line in place.
           #
-          # Deliberately no `repository:`/`path:` here even though both would
-          # only restate the action's own defaults: bump-spec-ref.yml counts a
-          # `repository: <spec>` line as a second pin anchor and then refuses
-          # to bump the file at all rather than rewrite only the first.
+          # Deliberately no `repository:` override, even though it would
+          # only restate the action's own default: bump-spec-ref.yml counts a
+          # `repository: <spec>` line as a SECOND pin anchor alongside the
+          # `checkout-spec@` line above, and then refuses to bump the file at
+          # all rather than rewrite only the first. `path:` is NOT counted by
+          # that matcher and would be harmless here; it is omitted only
+          # because it restates the default.
           ref: d1f06d0d49b73d411a3983d3877321ccaccd38e7
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:

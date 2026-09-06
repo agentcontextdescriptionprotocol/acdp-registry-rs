@@ -789,7 +789,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   while replaying nothing, logging `ACDP_SPEC_DIR unset or no fixtures
   resolvable; skipping`. That second control is why the pin-and-require design
   exists, and why the CI job log — not the check mark — is the acceptance
-  artifact. CI on this PR's head reproduced the local tally line for line.
+  artifact. CI reproduced the local tally line for line.
   Note that `MIN_REPLAYED_EXCHANGES` (derived from source as 30) is met
   *exactly*, with no headroom: losing one replayed exchange turns the required
   job red.

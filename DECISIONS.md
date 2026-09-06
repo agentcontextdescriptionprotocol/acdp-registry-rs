@@ -94,6 +94,24 @@ closes out `ASSUMPTIONS.md`'s 8 `UNCONFIRMED` entries logged during implementati
   inline (`.github/workflows/ci.yml:161`), just not via `checkout-spec@v1`.
   Part (b) of the original follow-up (correcting the status line) was never
   filed and remains outstanding.
+- **Superseded (2026-09-06, `#155`):** this repo now uses the shared action.
+  `.github/workflows/ci.yml`'s `conformance` job calls
+  `agentcontextdistributionprotocol/acdp-ci/actions/checkout-spec@015910153b61c32abbe018afe85d44868897bf3b # v1`,
+  so the inline `actions/checkout` spec step this entry describes — and the
+  `.github/workflows/ci.yml:161` line the 2026-09-01 correction cites — no
+  longer exist. The original "confirm as-is" is left standing above on purpose:
+  it was correct on 2026-08-29, when `v1` genuinely did not contain the action.
+  Only its premise changed, and the 2026-09-01 correction had already recorded
+  that change. The pinned spec ref is untouched
+  (`d1f06d0d49b73d411a3983d3877321ccaccd38e7`); the action itself is pinned at
+  the commit `v1` dereferences to — `v1` is an annotated tag, so `refs/tags/v1`
+  → tag object `82b2a25…` → commit `0159101…`, which is why `@v1` would not
+  have been a pin at all. That matches `acdp-verifier-py`'s call site verbatim
+  and `REG-8`/`REG-10`'s rule that non-`actions/*` refs resolve at an immutable
+  SHA. Part (b) above is unchanged by this and is now *worse* than stale:
+  `DELIVERY-STANDARD.md`'s status line says this repo is "scheduled to adopt"
+  the action and that "until they do, their CI does not enforce this rule" —
+  flatly false once `#155` lands. Still not filed; still owed.
 
 ### 2. `bump-spec.yml` scope
 - **Assumption:** no `bump-spec.yml` in this repo; the pinned spec SHA will never
@@ -119,6 +137,15 @@ closes out `ASSUMPTIONS.md`'s 8 `UNCONFIRMED` entries logged during implementati
   hardcoded `repo: [acdp-rs, acdp-verifier-py]` — `acdp-registry-rs` has not been added,
   verified directly against that file. **Status:** part (a) DONE, part (b) still
   NEEDS-FOLLOWUP.
+- **Note (2026-09-06, `#155`):** the compatibility argument in the recommendation
+  above still holds, but this repo now exercises the *other* branch of that
+  matcher. `bump-spec-ref.yml@v1` anchors on either a `repository: <spec>` line
+  or an `acdp-ci/actions/checkout-spec@` line; since `#155` this repo matches on
+  the latter. Verified by running that workflow's own anchor-count `awk`, its
+  `perl` rewriter and its post-rewrite assertion against the new `ci.yml`: one
+  anchor, and a simulated bump rewrote exactly one line, the spec `ref:`. Note
+  for future editors: adding an explicit `repository:` to the `checkout-spec`
+  step would create a second anchor and make `bump-spec.yml` fail every run.
 
 ### 4. REG-1 acceptance criterion — the "as applicable" reading
 - **Assumption:** REG-1's acceptance criterion named six families (`pub-, vis-, idem-,

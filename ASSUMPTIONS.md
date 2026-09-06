@@ -9,6 +9,10 @@ full recommendation + human decision on each. This file is kept as the original 
 
 1. **Inline `actions/checkout@v4` vs `checkout-spec@v1`.** CONFIRMED as-is — the `v1`
    tag doesn't even contain the shared action yet. Follow-up: file an `acdp-ci` issue.
+   *Superseded 2026-09-06 (`#155`): `v1` has since been re-tagged and does contain the
+   action; this repo adopted `checkout-spec` and the inline form is gone. The original
+   entry stands as written — its premise changed, it was not wrong. See `DECISIONS.md`
+   § "1. `checkout-spec@v1` vs inline checkout".*
 
 2. **`bump-spec.yml` out of scope.** Changed to NEEDS-FOLLOWUP — add it as a near-term
    follow-up (inert until dispatched), paired with a cross-repo spec-matrix item.
