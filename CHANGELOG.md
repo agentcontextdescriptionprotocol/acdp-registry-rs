@@ -8,6 +8,41 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+<!-- REG-11 Phase 7 -->
+
+- **`lin` and `caps` move from `DEFERRED` to `COVERED`** (`REG-11` Phase 7,
+  `#115`): two new direct-vector tests in
+  `crates/acdp-registry-server/tests/conformance.rs`.
+  - `lin_vectors_reproduce_lineage_derivation` reuses the existing
+    `assert_lineage_vector` helper (previously exercised only via
+    can-001) against `lin-001-lineage-derivation-golden`'s 3 vectors.
+    `lin-001` carries `applies_to_profiles: ["acdp-registry-core",
+    "acdp-consumer"]`, but this is a pure-function check of
+    `derive_lineage_id` with no HTTP leg, so it deliberately bypasses the
+    runtime profile gate rather than adding one.
+  - `caps_vectors_validate_capabilities_document` runs all 7 caps-*
+    fixtures' `input.response_body` through
+    `acdp::validation::validate_capabilities`, plus caps-007's 3
+    `reject_variants` (hand-applied against the single dotted path they
+    override, `limits.max_publish_per_minute`). Measured against the
+    fixtures directly: caps-001/006/007(base) accept and
+    caps-002/003/004/005 plus caps-007's 3 variants reject — 4 rejecting
+    base fixtures, not 6. caps-006 in particular is an *accept* case:
+    the `CapabilitiesDocument` schema tolerates unknown top-level fields
+    (only its `limits` sub-object is closed). Rejection is accepted from
+    either serde deserialization or `validate_capabilities` itself, since
+    both are `schema_violation` and indistinguishable to a real consumer.
+    No HTTP leg here either: `acdp-registry-server` is bin-only, so this
+    crate cannot import its own `build_capabilities` for an HTTP-level
+    comparison.
+
+  `lc` (the third family originally filed under `#115`) remains
+  `DEFERRED` — it is profile-gated, not closeable by a direct-vector pass.
+  `MIN_REPLAYED_EXCHANGES` (30) and the exchange replay count are
+  unaffected: both new tests are non-HTTP vector passes.
+
+<!-- end REG-11 Phase 7 -->
+
 <!-- REG-11 Phase 9 (Lane B) -->
 
 - **`GET /healthz` now reports the running build** (`REG-11` Phase 9,
