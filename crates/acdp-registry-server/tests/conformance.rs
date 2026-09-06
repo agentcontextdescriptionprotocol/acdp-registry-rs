@@ -5530,36 +5530,36 @@ async fn idem001_004_publish_idempotency_key_lifecycle_and_restart_durability() 
 /// capability by reading it back off `GET /.well-known/acdp.json`, not by
 /// assuming the local `CapabilitiesDocument` construction was honored.
 ///
-/// **Deliberately NOT playground** (unlike `idem-001`..`004` above), and
-/// this is itself a finding worth recording plainly rather than papering
-/// over: `acdp-registry-core`'s OWN playground publish branch
+/// **Deliberately NOT playground** (unlike `idem-001`..`004` above): a
+/// did:key producer (offline-verifiable, no network resolver needed)
+/// against a NON-playground harness, routed through
+/// `RegistryServer::publish_verified_did_key_in_tenant` ->
+/// `commit_via_store` (`registry/server.rs:587`,
+/// `let idempotency = if self.caps.supports_idempotency_key { ... } else
+/// { None }`), which every SDK-routed publish path (verified did:web,
+/// did:key, pinned-verified) shares and which gates correctly.
+///
+/// That leaves a second, independent enforcement point for the SAME rule:
+/// `acdp-registry-core`'s OWN playground publish branch
 /// (`crates/acdp-registry-core/src/handlers/context.rs`, the manual
 /// idempotency lookup/record dance around `publish_unverified_for_tests`)
-/// honors ANY `Idempotency-Key` header whenever one is present, with no
-/// check of `state.server.capabilities().supports_idempotency_key`
-/// anywhere in that branch -- unlike the upstream `acdp-server` SDK's own
-/// `RegistryServer::commit_via_store` (`registry/server.rs:587`,
-/// `let idempotency = if self.caps.supports_idempotency_key { ... } else
-/// { None }`), which every OTHER publish path (verified did:web, did:key,
-/// pinned-verified) routes through and which gates correctly. A first
-/// attempt at this test, built on the shared playground harness like
-/// `idem-001`..`004`, demonstrated this directly: two identical publishes
-/// with the same key came back with the SAME ctx_id even with
-/// `supports_idempotency_key: false` on the capabilities document --
-/// because the playground branch never consulted it. That is a real
-/// behavioral gap in this repo's TEST-ONLY playground shortcut, not a
-/// production-conformance failure (an operator serving real traffic uses
-/// the did:web/did:key verified paths, which gate correctly), and fixing
-/// production code is out of this phase's scope (`crates/
-/// acdp-registry-server/tests/conformance.rs` and `CHANGELOG.md` only) --
-/// so this test instead exercises the path that actually pins `idem-005`'s
-/// contract: a did:key producer (offline-verifiable, no network resolver
-/// needed) against a NON-playground harness, which routes through
-/// `RegistryServer::publish_verified_did_key_in_tenant` ->
-/// `commit_via_store` and therefore genuinely respects
-/// `supports_idempotency_key: false`. Recorded here, and in the section's
-/// CHANGELOG entry, as an honest finding rather than silently worked
-/// around.
+/// never goes through `commit_via_store` at all --
+/// `publish_unverified_for_tests` takes no idempotency key -- so it cannot
+/// inherit this gate and must consult
+/// `state.server.capabilities().supports_idempotency_key` itself. Before
+/// REG-11 Phase 5 (#128) it did not: a first attempt at this test, built
+/// on the shared playground harness like `idem-001`..`004`, demonstrated
+/// the gap directly -- two identical publishes with the same key came
+/// back with the SAME ctx_id even with `supports_idempotency_key: false`
+/// on the capabilities document, because the playground branch never
+/// consulted it. That branch now carries the same gate (the `idem_key`
+/// binding computed once in `publish_inner`'s playground `else` arm and
+/// reused at both the lookup and record call sites) and its own direct
+/// coverage immediately below --
+/// `idem_playground_branch_honors_supports_idempotency_key_gate` and
+/// `idem_playground_branch_writes_no_idempotency_record_when_gated_off`
+/// -- so this test and that pair now read as both routes, same
+/// obligation, rather than one route fixed and the other merely observed.
 #[tokio::test(flavor = "multi_thread")]
 async fn idem005_no_support_ignores_idempotency_key_header() {
     let Some(fixtures) = spec_fixtures() else {
@@ -5650,6 +5650,179 @@ async fn idem005_no_support_ignores_idempotency_key_header() {
     // reason) and never duplicate_publish (the header has no semantics at
     // all here, so same-key-same-hash can never collide) -- s2 == OK (not
     // CONFLICT) already rules the latter out.
+}
+
+/// REG-11 Phase 5 (#128): the playground publish branch's own
+/// `supports_idempotency_key` gate, exercised directly.
+///
+/// `idem-005` above proves the SDK-routed paths (verified did:web,
+/// did:key, pinned-verified) respect `supports_idempotency_key` because
+/// they all go through `RegistryServer::commit_via_store`. It
+/// deliberately does NOT exercise the playground's own manual idempotency
+/// lookup/record dance around `publish_unverified_for_tests`
+/// (`context.rs`'s `publish_inner`, the unpinned arm of the
+/// `playground_snapshot.enabled` branch) -- that code path never calls
+/// `commit_via_store` at all, so it cannot inherit the gate, and had none
+/// of its own until this phase added the `idem_key` binding (computed
+/// once, reused at both the lookup and the record call sites).
+///
+/// The producer here **must be did:web, not did:key**. `publish_inner`
+/// siphons off every did:key agent BEFORE the playground branch is ever
+/// reached (`context.rs:414`, `req.agent_id.as_str().starts_with(
+/// "did:key:")`), routing it through
+/// `publish_verified_did_key_in_tenant` -> `commit_via_store` instead --
+/// exactly the already-gated path `idem-005` covers. A did:key producer
+/// here would silently re-run `idem-005` under a different name and would
+/// have passed on unfixed `main`, proving nothing about the playground
+/// branch this test exists to pin. `common::producer` mints did:web
+/// identities (`common/mod.rs`, `AgentDid::new(format!("did:web:..."))`),
+/// so using it -- rather than `Producer::new_did_key`, as `idem-005` does
+/// -- is the load-bearing choice, not an incidental one.
+///
+/// Capability read-back technique borrowed from `idem-005` above: read
+/// `supports_idempotency_key` back off this harness's own
+/// `GET /.well-known/acdp.json`, not off the local `CapabilitiesDocument`
+/// construction -- proves the harness genuinely serves what the test
+/// thinks it configured, in case a future edit to `caps()` or
+/// `build_harness_with_webhook` silently changes what gets advertised.
+///
+/// `config()` already enables the playground with an empty `pinned_keys`
+/// (`PlaygroundConfig::default()`), which is exactly the "unpinned"
+/// precondition that routes a publish into the branch under test -- see
+/// `enforce_pinned_signature`'s `PinOutcome::Skipped` arm
+/// (`playground.rs:109-111`) for the empty-`pinned_keys` case.
+///
+/// Fails on unfixed `main`: two publishes of the same body with the same
+/// `Idempotency-Key` come back with the SAME `ctx_id` there, because the
+/// manual dance replays unconditionally. After the fix they differ,
+/// because `idem_key` is `None` once the capability is `false`, so the
+/// lookup never runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn idem_playground_branch_honors_supports_idempotency_key_gate() {
+    let mut no_support_caps = caps();
+    no_support_caps.supports_idempotency_key = false;
+    let no_support_cfg = config();
+    let app = common::build_harness_with_webhook(
+        no_support_cfg,
+        no_support_caps,
+        AUTHORITY,
+        common::StoreMode::Memory,
+        None,
+        None,
+    )
+    .await
+    .router;
+
+    // Proof this harness genuinely does not advertise the capability --
+    // read it back off the wire (same technique as idem-005 above).
+    let (caps_status, caps_body) = anc_get(&app, "/.well-known/acdp.json").await;
+    assert_eq!(caps_status, StatusCode::OK, "body = {caps_body}");
+    assert_eq!(
+        caps_body["supports_idempotency_key"], false,
+        "harness must genuinely NOT advertise idempotency support: {caps_body}"
+    );
+
+    // did:web, NOT did:key -- see the doc comment above for why.
+    let p = common::producer("idem-playground-gate", 217);
+    let req = p
+        .publish_request()
+        .title("REG-11 Phase 5: playground branch honors the no-support gate")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+
+    let (s1, v1) = common::publish(&app, &req, Some("idem-playground-gate-key")).await;
+    assert_eq!(s1, StatusCode::OK, "first publish; body = {v1}");
+    let (s2, v2) = common::publish(&app, &req, Some("idem-playground-gate-key")).await;
+    assert_eq!(s2, StatusCode::OK, "second publish; body = {v2}");
+    assert_ne!(
+        v1["ctx_id"], v2["ctx_id"],
+        "playground branch must ignore Idempotency-Key when the capability isn't \
+         advertised, exactly like the SDK-routed paths idem-005 covers -- a shared \
+         ctx_id here means the branch replayed despite supports_idempotency_key: false"
+    );
+}
+
+/// REG-11 Phase 5 (#128): the playground branch's RECORD half of the same
+/// gate.
+///
+/// A fix that only skipped the *lookup* half of the manual dance
+/// (`context.rs`'s `idempotency_lookup` call) but still ran the *record*
+/// half (`idempotency_record`) would still make the sibling test above
+/// pass -- two publishes would still get different `ctx_id`s, since
+/// nothing ever looks the first one up. But it would leave a landmine
+/// behind: an idempotency record for a key the capability says isn't
+/// supported, silently waiting to be replayed the moment an operator
+/// later flips `supports_idempotency_key` to `true` -- resurrecting
+/// replays from records that should never have existed. This is why the
+/// plan calls for ONE `idem_key` binding used at both call sites rather
+/// than two independent `&&` conditions: only a shared binding makes
+/// "lookup gated, record not" unrepresentable. This test is the half of
+/// the contract that actually catches a lookup-only fix.
+///
+/// Record-count technique: `GET /admin/status`'s `idempotency.records`
+/// field (precedent: `http_integration.rs`'s
+/// `admin_status_requires_token_and_reports_health`), NOT
+/// `pg_integration.rs`'s direct `store.count_idempotency_records()` call
+/// (precedent there: `pg_receipt_atomicity_and_round_trip`). The latter
+/// doesn't fit this file's harness: `pg_integration.rs`'s test builds its
+/// own bare `PgStore` and calls the method on it directly, but
+/// `conformance.rs` only ever gets a `common::Harness` back from
+/// `build_harness_with_webhook`, which exposes `router` (and, for
+/// `StoreMode::File`, a tempfile path) and nothing else -- there is no
+/// handle to the underlying `SqliteStore` to call
+/// `count_idempotency_records()` on directly. `/admin/status` is not
+/// playground-gated (`admin.rs`: "Ships in every build") and needs only
+/// an admin token, both readily available through the harness's own
+/// `Router`, so it proves the same fact through the harness's public
+/// surface instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn idem_playground_branch_writes_no_idempotency_record_when_gated_off() {
+    let mut no_support_caps = caps();
+    no_support_caps.supports_idempotency_key = false;
+    let mut no_support_cfg = config();
+    no_support_cfg.auth.admin_tokens = vec!["idem-playground-record-admin".into()];
+    let app = common::build_harness_with_webhook(
+        no_support_cfg,
+        no_support_caps,
+        AUTHORITY,
+        common::StoreMode::Memory,
+        None,
+        None,
+    )
+    .await
+    .router;
+
+    // did:web, NOT did:key -- see the sibling test's doc comment above.
+    let p = common::producer("idem-playground-record", 218);
+    let req = p
+        .publish_request()
+        .title("REG-11 Phase 5: playground branch writes no record when gated off")
+        .context_type(ContextType::DataSnapshot)
+        .visibility(Visibility::Public)
+        .build()
+        .unwrap();
+    let (s1, v1) = common::publish(&app, &req, Some("idem-playground-record-key")).await;
+    assert_eq!(s1, StatusCode::OK, "publish; body = {v1}");
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/admin/status")
+                .header("authorization", "Bearer idem-playground-record-admin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let status = body_to_json(resp).await;
+    assert_eq!(
+        status["idempotency"]["records"], 0,
+        "a lookup-only fix would still leave the record half unguarded; body = {status}"
+    );
 }
 
 // ─── REG-3 Phase 7 (plans/reg3-anchors.md): anc-001/002/003 direct,
