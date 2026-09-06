@@ -9,7 +9,34 @@ no-default-features = false
 [advisories]
 version = 2
 yanked = "warn"
-ignore = []
+ignore = [
+    # RUSTSEC-2023-0071 "Marvin" — RSA private-key timing side channel; no
+    # upstream patch exists. `rsa` enters the build graph solely because
+    # jsonwebtoken 11's `rust_crypto` provider feature enables it
+    # unconditionally. Unreachable AND inapplicable, on independent grounds:
+    #   1. Every JWT verification pins exactly one algorithm:
+    #      `Validation::new(self.material.algorithm())`, HS256 or EdDSA only
+    #      (crates/acdp-registry-auth/src/jwt.rs:224). jsonwebtoken 11 rejects
+    #      a token whose header `alg` is not in `validation.algorithms`
+    #      (InvalidAlgorithm) BEFORE constructing any crypto verifier
+    #      (jsonwebtoken-11.0.0 src/decoding.rs:278-282), so an
+    #      attacker-supplied `alg: RS256` executes zero `rsa` code. We use no
+    #      `jsonwebtoken::jwk` and no RSA DecodingKey constructors; the DID
+    #      challenge path whitelists ed25519/ecdsa-p256 by name before key
+    #      resolution (crates/acdp-registry-auth/src/service.rs:150).
+    #   2. Marvin recovers an RSA PRIVATE key via timing of private-key
+    #      operations. This registry holds no RSA private key material at all
+    #      (signing is HS256/EdDSA only) — there is no key to recover.
+    # RE-REVIEW (remove or re-justify) if ANY of these change:
+    #   - `Validation.algorithms` widens beyond the signer's single algorithm,
+    #     or we start verifying third-party-issued JWTs (e.g. federation
+    #     peers' tokens against their JWKS);
+    #   - any `jsonwebtoken::jwk` / RSA key-import / remote-JWKS path appears;
+    #   - sqlx's `mysql` feature (the other latent `rsa` edge) is enabled;
+    #   - jsonwebtoken major bump: re-confirm the `alg` allowlist check still
+    #     precedes provider/verifier construction in `decode()`.
+    { id = "RUSTSEC-2023-0071", reason = "rsa crate unreachable (alg pinned pre-dispatch, decoding.rs:278) and no RSA private key exists to recover; see comment" },
+]
 
 [licenses]
 version = 2

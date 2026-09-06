@@ -10,7 +10,7 @@ use acdp_registry_types::{
     AuthChallenge, AuthConfig, BearerClaims, TenantAgentBinding, TokenRequest, TokenResponse,
 };
 use chrono::{Duration, Utc};
-use rand::RngCore;
+use rand::Rng;
 use uuid::Uuid;
 
 use crate::challenge_store::{ChallengeRecord, ChallengeStore};
@@ -74,7 +74,7 @@ impl AuthService {
             return Err(AuthError::UnsupportedDidMethod(agent_id.to_string()));
         }
         let mut bytes = [0u8; 24];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        rand::rng().fill_bytes(&mut bytes);
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
         let nonce = URL_SAFE_NO_PAD.encode(bytes);
         let expires_at = Utc::now() + Duration::seconds(self.config.challenge_ttl_seconds as i64);
