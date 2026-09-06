@@ -777,13 +777,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   from `acdp-ci` at `v1` — against the new file: one anchor, `d1f06d0…`
   resolved as the current pin, and a simulated bump rewrote exactly one line,
   the spec `ref:`, leaving the action's own `@0159101…` pin alone.
-  Not verified locally: the job itself. `cargo` cannot run in this environment,
-  so CI on this PR is the gate — and for this job green alone is not the check.
-  Under `ACDP_REQUIRE_CONFORMANCE` a broken spec checkout panics rather than
-  skips (`spec_root`/`spec_fixtures` in `tests/conformance.rs`) and
-  `MIN_REPLAYED_EXCHANGES` (derived from source as 30) floors the replay count,
-  so acceptance is reading the job log for `conformance: fixtures dir = …`, the
-  `ran by family` tally, and `conformance: replayed N exchange(s)`.
+  For this job, a green result is not by itself evidence — so acceptance was two
+  negative controls plus the replay tally, not colour. Measured with
+  `cargo test -p acdp-registry-server --features storage-sqlite,playground
+  --test conformance --test conformance_gate` against a spec worktree detached
+  at the pinned `d1f06d0…`: `replayed 30 exchange(s); failures=0`,
+  `ran by family` of `pub: 3` / `ret: 1` / `vis: 26`, `43 passed; 0 failed`
+  and `1 passed; 0 failed`. Re-pointed at a nonexistent `ACDP_SPEC_DIR` with
+  `ACDP_REQUIRE_CONFORMANCE=1` the same command panics at
+  `conformance.rs:2549` and exits 101; with neither variable set it exits **0**
+  while replaying nothing, logging `ACDP_SPEC_DIR unset or no fixtures
+  resolvable; skipping`. That second control is why the pin-and-require design
+  exists, and why the CI job log — not the check mark — is the acceptance
+  artifact. CI on this PR's head reproduced the local tally line for line.
+  Note that `MIN_REPLAYED_EXCHANGES` (derived from source as 30) is met
+  *exactly*, with no headroom: losing one replayed exchange turns the required
+  job red.
 
 - **BREAKING** (`REG-11` Phase 3, `#133`): `GET /admin/contexts` is now
   gated behind `require_admin_bearer`, like every other `/admin/*` route.
